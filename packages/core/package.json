@@ -3,10 +3,46 @@
   "version": "0.1.0",
   "description": "Signal-level E2E encryption primitives — X25519, XSalsa20-Poly1305, Double Ratchet",
   "license": "Apache-2.0",
+  "author": "Encra (https://encra.dev)",
+  "homepage": "https://github.com/adityayaduvanshi/encra#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adityayaduvanshi/encra.git",
+    "directory": "packages/core"
+  },
+  "bugs": {
+    "url": "https://github.com/adityayaduvanshi/encra/issues"
+  },
+  "keywords": [
+    "encryption",
+    "e2e",
+    "end-to-end",
+    "double-ratchet",
+    "signal",
+    "x25519",
+    "libsodium",
+    "crypto",
+    "chat"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build && npm test",
     "test": "vitest run --coverage",
     "test:watch": "vitest"
   },

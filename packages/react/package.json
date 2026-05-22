@@ -3,17 +3,51 @@
   "version": "0.1.0",
   "description": "React hook for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
+  "author": "Encra (https://encra.dev)",
+  "homepage": "https://github.com/adityayaduvanshi/encra#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adityayaduvanshi/encra.git",
+    "directory": "packages/react"
+  },
+  "bugs": {
+    "url": "https://github.com/adityayaduvanshi/encra/issues"
+  },
+  "keywords": [
+    "encryption",
+    "e2e",
+    "react",
+    "hook",
+    "chat",
+    "double-ratchet",
+    "signal"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build && npm test",
     "test": "vitest run --coverage"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
   },
   "dependencies": {
-    "@encra/core": "*"
+    "@encra/core": "^0.1.0"
   },
   "devDependencies": {
     "@testing-library/react": "^14.0.0",
