@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts.map
+.env
+.env.local
+.env.*.local
+coverage/
+CLAUDE.md
+.claude
+# Build artifacts from gen-vectors scripts
+packages/core/dist2/
+packages/core/dist_test/
+packages/core/test_emit.ts
+packages/core/scripts/gen-vectors.cjs
+packages/core/scripts/gen-vectors.mjs

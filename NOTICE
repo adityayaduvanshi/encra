@@ -1,0 +1,8 @@
+e2e-chat-crypto
+Copyright 2026 Encra
+
+This product includes software developed at Encra (https://encra.vercel.app).
+
+This software uses libsodium (https://libsodium.org), licensed under the
+ISC License. libsodium is a portable, cross-compilable, installable,
+packageable fork of NaCl, with a compatible API.

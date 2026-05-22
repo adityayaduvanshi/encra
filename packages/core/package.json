@@ -1,0 +1,23 @@
+{
+  "name": "@encra/core",
+  "version": "0.1.0",
+  "description": "Signal-level E2E encryption primitives — X25519, XSalsa20-Poly1305, Double Ratchet",
+  "license": "Apache-2.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "libsodium-wrappers": "^0.7.15"
+  },
+  "devDependencies": {
+    "@types/libsodium-wrappers": "^0.7.14",
+    "@types/node": "^20.0.0",
+    "@vitest/coverage-v8": "^1.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0"
+  }
+}
