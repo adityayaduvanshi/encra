@@ -16,10 +16,12 @@ export interface Message {
   timestamp: number
 }
 
+export const ENCRA_SERVER_URL = 'https://api.encra.dev'
+
 export interface UseE2EChatOptions {
   apiKey: string
   userId: string
-  serverUrl: string
+  serverUrl?: string  // defaults to Encra managed server
 }
 
 export interface UseE2EChatResult {
@@ -56,7 +58,7 @@ interface WireMessage {
  *   serverUrl: 'https://api.example.com',
  * })
  */
-export function useE2EChat({ apiKey, userId, serverUrl }: UseE2EChatOptions): UseE2EChatResult {
+export function useE2EChat({ apiKey, userId, serverUrl = ENCRA_SERVER_URL }: UseE2EChatOptions): UseE2EChatResult {
   const [messages, setMessages] = useState<Message[]>([])
   const [isReady, setIsReady] = useState(false)
   const [error, setError] = useState<Error | null>(null)
@@ -85,12 +87,14 @@ export function useE2EChat({ apiKey, userId, serverUrl }: UseE2EChatOptions): Us
   )
 
   /**
-   * Returns the existing ratchet for `peerId`, or initialises one as sender.
+   * Returns the existing sender ratchet for `peerId`, or initialises one.
    * Called when WE initiate a message to someone we haven't talked to before.
+   * Keyed as `s:<peerId>` to avoid collision with the receiver ratchet.
    */
   const getOrInitSenderRatchet = useCallback(
     async (peerId: string): Promise<DoubleRatchet> => {
-      const existing = ratchetsRef.current.get(peerId)
+      const key      = `s:${peerId}`
+      const existing = ratchetsRef.current.get(key)
       if (existing) return existing
 
       const myKP     = keyPairRef.current
@@ -99,19 +103,21 @@ export function useE2EChat({ apiKey, userId, serverUrl }: UseE2EChatOptions): Us
       const peerPub  = await fetchPeerPublicKey(peerId)
       const shared   = await deriveSharedSecret(myKP.privateKey, peerPub)
       const ratchet  = await DoubleRatchet.initSender(shared, peerPub)
-      ratchetsRef.current.set(peerId, ratchet)
+      ratchetsRef.current.set(key, ratchet)
       return ratchet
     },
     [fetchPeerPublicKey]
   )
 
   /**
-   * Returns the existing ratchet for `peerId`, or initialises one as receiver.
+   * Returns the existing receiver ratchet for `peerId`, or initialises one.
    * Called when we receive the FIRST message from someone we haven't talked to.
+   * Keyed as `r:<peerId>` to avoid collision with the sender ratchet.
    */
   const getOrInitReceiverRatchet = useCallback(
     async (peerId: string): Promise<DoubleRatchet> => {
-      const existing = ratchetsRef.current.get(peerId)
+      const key      = `r:${peerId}`
+      const existing = ratchetsRef.current.get(key)
       if (existing) return existing
 
       const myKP     = keyPairRef.current
@@ -120,7 +126,7 @@ export function useE2EChat({ apiKey, userId, serverUrl }: UseE2EChatOptions): Us
       const peerPub  = await fetchPeerPublicKey(peerId)
       const shared   = await deriveSharedSecret(myKP.privateKey, peerPub)
       const ratchet  = await DoubleRatchet.initReceiver(shared, myKP)
-      ratchetsRef.current.set(peerId, ratchet)
+      ratchetsRef.current.set(key, ratchet)
       return ratchet
     },
     [fetchPeerPublicKey]

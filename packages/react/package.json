@@ -1,6 +1,6 @@
 {
   "name": "@encra/react",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "React hook for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
@@ -30,6 +30,7 @@
   "exports": {
     ".": {
       "require": "./dist/index.js",
+      "default": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
@@ -47,7 +48,7 @@
     "react": ">=18.0.0"
   },
   "dependencies": {
-    "@encra/core": "^0.1.0"
+    "@encra/core": "^0.1.1"
   },
   "devDependencies": {
     "@testing-library/react": "^14.0.0",

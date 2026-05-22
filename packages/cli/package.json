@@ -1,6 +1,6 @@
 {
   "name": "encra",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Developer CLI for Encra — Signal-level encryption for any app",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
@@ -38,7 +38,7 @@
     "test": "vitest run --coverage"
   },
   "dependencies": {
-    "@encra/core": "^0.1.0",
+    "@encra/core": "^0.1.1",
     "chalk": "^5.3.0",
     "commander": "^12.0.0",
     "fs-extra": "^11.2.0",

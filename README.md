@@ -36,7 +36,7 @@ function Chat({ currentUser, recipient }) {
   const { messages, isReady, sendMessage } = useE2EChat({
     apiKey: process.env.REACT_APP_E2E_API_KEY,
     userId: currentUser,
-    serverUrl: 'https://keys.encra.dev',  // or your self-hosted URL
+    // serverUrl optional — defaults to Encra managed server
   })
 
   return (

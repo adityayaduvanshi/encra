@@ -12,8 +12,8 @@ const { WebSocket } = require('./node_modules/ws/index.js')
 // Load compiled ratchet from packages/core dist
 const { DoubleRatchet } = require('./packages/core/dist/crypto/ratchet.js')
 
-const SERVER = 'http://13.232.240.64:3000'
-const WS_SERVER = 'ws://13.232.240.64:3000'
+const SERVER = process.env.ENCRA_SERVER_URL ?? 'http://localhost:3000'
+const WS_SERVER = SERVER.replace(/^http/, 'ws')
 const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-secret-change-in-prod'
 const TOKEN = jwt.sign({ developerId: 'e2e-test' }, JWT_SECRET)
 
