@@ -10,8 +10,9 @@ import {
 } from '@encra/core'
 import type { KeyPair, MessageHeader } from '@encra/core'
 import {
-  loadKeyPair, saveKeyPair,
-  loadRatchet,  saveRatchet,
+  loadKeyPair,   saveKeyPair,
+  loadRatchet,   saveRatchet,
+  loadMessages,  saveMessages,
 } from './ratchetStore.js'
 
 export interface Message {
@@ -233,8 +234,10 @@ export function useE2EChat({
           await saveRatchet(userId, `r:${msg.from}`, ratchet.export())
           if (!cancelled) {
             setMessages((prev) => {
-              const next = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
-              return next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+              const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
+              const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+              void saveMessages(userId, capped)
+              return capped
             })
           }
         } catch (err) {
@@ -274,6 +277,10 @@ export function useE2EChat({
           keyPairRef.current = kp
           await saveKeyPair(userId, { pub: exportKey(kp.publicKey), priv: exportKey(kp.privateKey) })
         }
+
+        // Restore message history before opening the WebSocket
+        const storedMsgs = await loadMessages(userId)
+        if (!cancelled && storedMsgs.length > 0) setMessages(storedMsgs)
 
         if (cancelled) return
 
@@ -328,6 +335,14 @@ export function useE2EChat({
         ciphertext: ctB64,
         nonce:      nB64,
         timestamp:  Date.now(),
+      })
+
+      // Add sent message to local state and persist so it survives page reloads
+      setMessages((prev) => {
+        const next   = [...prev, { from: userId, text, timestamp: Date.now() }]
+        const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+        void saveMessages(userId, capped)
+        return capped
       })
     },
     [userId, getOrInitSenderRatchet]

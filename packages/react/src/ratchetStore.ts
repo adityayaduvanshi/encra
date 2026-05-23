@@ -1,19 +1,30 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import type { RatchetStateExport } from '@encra/core'
 
+/** Shape of a single persisted chat message. */
+export interface StoredMessage {
+  from:      string
+  text:      string
+  timestamp: number
+}
+
 interface EncraSchema extends DBSchema {
   keypairs: {
-    key: string
+    key:   string
     value: { pub: string; priv: string }
   }
   ratchets: {
-    key: string
+    key:   string
     value: RatchetStateExport
+  }
+  messages: {
+    key:   string        // userId
+    value: StoredMessage[]
   }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 1
+const DB_VERSION = 2
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -26,6 +37,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
       upgrade(db) {
         if (!db.objectStoreNames.contains('keypairs')) db.createObjectStore('keypairs')
         if (!db.objectStoreNames.contains('ratchets')) db.createObjectStore('ratchets')
+        if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
       },
     })
   }
@@ -54,4 +66,16 @@ export async function saveRatchet(userId: string, peerKey: string, state: Ratche
   try {
     await (await getDB()).put('ratchets', state, `${userId}:${peerKey}`)
   } catch { /* non-fatal: ratchet still works in-memory */ }
+}
+
+export async function loadMessages(userId: string): Promise<StoredMessage[]> {
+  try {
+    return (await getDB()).get('messages', userId) ?? []
+  } catch { return [] }
+}
+
+export async function saveMessages(userId: string, messages: StoredMessage[]): Promise<void> {
+  try {
+    await (await getDB()).put('messages', messages, userId)
+  } catch { /* non-fatal: messages still visible in-memory */ }
 }
