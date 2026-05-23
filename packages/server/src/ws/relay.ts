@@ -10,10 +10,14 @@ interface RelayMessage {
   from?: string
   ciphertext?: string
   nonce?: string
-  header?: unknown  // Opaque ratchet header — forwarded as-is to recipient
+  header?: unknown     // Opaque ratchet header — forwarded as-is to recipient
+  senderName?: string  // Display name set by the sender client — forwarded as-is
 }
 
 const clients = new Map<string, WebSocket>()
+
+/** Maximum allowed size for a single WebSocket message (64 KB). */
+const MAX_MESSAGE_BYTES = 64 * 1024
 
 function authenticateWs(req: IncomingMessage): string | null {
   const url = new URL(req.url ?? '', 'http://localhost')
@@ -35,13 +39,15 @@ async function queueOfflineMessage(
   recipientId: string,
   senderId: string,
   ciphertext: string,
-  nonce: string
+  nonce: string,
+  header: unknown,
+  senderName: string | undefined,
 ): Promise<void> {
   const pool = getPool()
   await pool.query(
-    `INSERT INTO message_queue (recipient_id, sender_id, ciphertext, nonce)
-     VALUES ($1, $2, $3, $4)`,
-    [recipientId, senderId, ciphertext, nonce]
+    `INSERT INTO message_queue (recipient_id, sender_id, ciphertext, nonce, header, sender_name)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [recipientId, senderId, ciphertext, nonce, JSON.stringify(header ?? {}), senderName ?? null]
   )
 }
 
@@ -52,15 +58,22 @@ async function flushQueuedMessages(userId: string, socket: WebSocket): Promise<v
     sender_id: string
     ciphertext: string
     nonce: string
+    header: unknown
+    sender_name: string | null
   }>(
     `DELETE FROM message_queue WHERE recipient_id = $1
-     RETURNING id, sender_id, ciphertext, nonce`,
+     RETURNING id, sender_id, ciphertext, nonce, header, sender_name`,
     [userId]
   )
   for (const row of result.rows) {
-    socket.send(
-      JSON.stringify({ type: 'message', from: row.sender_id, ciphertext: row.ciphertext, nonce: row.nonce })
-    )
+    socket.send(JSON.stringify({
+      type:       'message',
+      from:       row.sender_id,
+      ciphertext: row.ciphertext,
+      nonce:      row.nonce,
+      header:     row.header,
+      ...(row.sender_name !== null && { senderName: row.sender_name }),
+    }))
   }
 }
 
@@ -77,6 +90,11 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
     let registeredUserId: string | null = null
 
     socket.on('message', (raw) => {
+      if (Buffer.byteLength(raw as Buffer) > MAX_MESSAGE_BYTES) {
+        socket.send(JSON.stringify({ type: 'error', message: 'Message too large (max 64 KB).' }))
+        return
+      }
+
       let msg: RelayMessage
       try {
         msg = JSON.parse(raw.toString()) as RelayMessage
@@ -115,13 +133,14 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           from: registeredUserId,
           ciphertext: msg.ciphertext,
           nonce: msg.nonce,
-          ...(msg.header !== undefined && { header: msg.header }),
+          ...(msg.header      !== undefined && { header:     msg.header }),
+          ...(msg.senderName  !== undefined && { senderName: msg.senderName }),
         })
 
         if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
           recipientSocket.send(payload)
         } else {
-          queueOfflineMessage(msg.to, registeredUserId, msg.ciphertext, msg.nonce).catch(() => {
+          queueOfflineMessage(msg.to, registeredUserId, msg.ciphertext, msg.nonce, msg.header, msg.senderName).catch(() => {
             socket.send(JSON.stringify({ type: 'error', message: 'Failed to queue message for offline recipient.' }))
           })
         }

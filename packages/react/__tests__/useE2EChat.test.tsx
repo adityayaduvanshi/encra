@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { useE2EChat } from '../src/useE2EChat.js'
+import * as ratchetStore from '../src/ratchetStore.js'
 import {
   sodiumReady,
   generateKeyPair,
-  deriveSharedSecret,
+  DoubleRatchet,
   exportKey,
   importKey,
 } from '@encra/core'
@@ -195,11 +196,12 @@ describe('useE2EChat', () => {
     expect(result.current.isReady).toBe(false)
   })
 
-  it('sets error and marks not ready on WebSocket error', async () => {
+  it('calls onError callback on WebSocket error and does not set fatal error state', async () => {
     setupMocks()
 
+    const onError = vi.fn()
     const { result } = renderHook(() =>
-      useE2EChat({ apiKey: 'test-key', userId: 'eve', serverUrl: 'http://localhost:3000' })
+      useE2EChat({ apiKey: 'test-key', userId: 'eve', serverUrl: 'http://localhost:3000', onError })
     )
 
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
@@ -208,7 +210,9 @@ describe('useE2EChat', () => {
       mockWs.simulateError()
     })
 
-    await waitFor(() => expect(result.current.error).not.toBeNull())
+    await waitFor(() => expect(onError).toHaveBeenCalledWith(expect.any(Error)))
+    // WS errors are recoverable (reconnect); the fatal error state stays null
+    expect(result.current.error).toBeNull()
   })
 
   it('sendMessage throws when WebSocket is not connected', async () => {
@@ -259,5 +263,156 @@ describe('useE2EChat', () => {
 
     expect(result.current.messages).toHaveLength(0)
     expect(result.current.error).toBeNull()
+  })
+
+  it('calls onWireMessage with direction "received" on every incoming message', async () => {
+    setupMocks()
+
+    const ivyKP = await generateKeyPair()
+    keyStore.set('ivy', exportKey(ivyKP.publicKey))
+
+    const onWireMessage = vi.fn()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'jack', serverUrl: 'http://localhost:3000', onWireMessage })
+    )
+
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    const wireMsg = JSON.stringify({
+      type: 'message',
+      from: 'ivy',
+      ciphertext: exportKey(new Uint8Array(48).fill(0xcc)),
+      nonce: exportKey(new Uint8Array(24).fill(0xdd)),
+      header: { dh: exportKey(ivyKP.publicKey), pn: 0, n: 0 },
+    })
+
+    await act(async () => {
+      mockWs.simulateMessage(wireMsg)
+      await new Promise((r) => setTimeout(r, 200))
+    })
+
+    expect(onWireMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ direction: 'received' })
+    )
+  })
+
+  it('sets isConnecting true and schedules reconnect after WebSocket closes', async () => {
+    setupMocks()
+
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'karen', serverUrl: 'http://localhost:3000' })
+    )
+
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    await act(async () => { mockWs.close() })
+
+    await waitFor(() => expect(result.current.isConnecting).toBe(true))
+    expect(result.current.isReady).toBe(false)
+  })
+
+  it('restores key pair from IndexedDB without generating a new one', async () => {
+    setupMocks()
+
+    const storedKP = await generateKeyPair()
+    vi.spyOn(ratchetStore, 'loadKeyPair').mockResolvedValue({
+      pub:  exportKey(storedKP.publicKey),
+      priv: exportKey(storedKP.privateKey),
+    })
+    const saveKeyPairSpy = vi.spyOn(ratchetStore, 'saveKeyPair').mockResolvedValue()
+
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'leo', serverUrl: 'http://localhost:3000' })
+    )
+
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    // Key was loaded from IDB so no new key should be saved
+    expect(saveKeyPairSpy).not.toHaveBeenCalled()
+  })
+
+  it('sendMessage encrypts and routes the payload, fires onWireMessage with direction sent', async () => {
+    setupMocks()
+
+    // Register the peer's key so fetchPeerPublicKey succeeds
+    const peerKP = await generateKeyPair()
+    keyStore.set('mallory', exportKey(peerKP.publicKey))
+
+    // Spy on DoubleRatchet.initSender so ratchet.encrypt() does not call
+    // crypto_secretbox_easy — that function has a cross-realm Uint8Array issue
+    // in jsdom.  We just need to verify the hook wires things up correctly.
+    const fakeRatchet = {
+      encrypt: vi.fn().mockResolvedValue({
+        header:     { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
+        ciphertext: new Uint8Array(48).fill(0x01),
+        nonce:      new Uint8Array(24).fill(0x02),
+      }),
+      export: vi.fn().mockReturnValue({ version: 1 }),
+    }
+    vi.spyOn(DoubleRatchet, 'initSender').mockResolvedValue(
+      fakeRatchet as unknown as InstanceType<typeof DoubleRatchet>
+    )
+
+    const onWireMessage = vi.fn()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'nina', serverUrl: 'http://localhost:3000', onWireMessage })
+    )
+
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    await act(async () => {
+      // First call — creates the sender ratchet from scratch
+      await result.current.sendMessage('mallory', 'hello encrypted world')
+      // Second call — hits the in-memory ratchet cache (covers the `if (existing)` true branch)
+      await result.current.sendMessage('mallory', 'second message')
+    })
+
+    // The socket should have received two 'message' frames addressed to mallory
+    const sentFrames = mockWs.sentMessages.filter((m) => {
+      const p = JSON.parse(m) as { type: string; to?: string }
+      return p.type === 'message' && p.to === 'mallory'
+    })
+    expect(sentFrames).toHaveLength(2)
+
+    // onWireMessage should have fired with direction 'sent' for each message
+    const sentEvents = onWireMessage.mock.calls.filter(
+      (c) => (c[0] as { direction: string }).direction === 'sent'
+    )
+    expect(sentEvents).toHaveLength(2)
+  })
+
+  it('reuses the cached receiver ratchet on subsequent messages from the same sender', async () => {
+    setupMocks()
+
+    const senderKP = await generateKeyPair()
+    keyStore.set('oscar', exportKey(senderKP.publicKey))
+
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'pat', serverUrl: 'http://localhost:3000' })
+    )
+
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    const wireMsg = JSON.stringify({
+      type: 'message',
+      from: 'oscar',
+      ciphertext: exportKey(new Uint8Array(48).fill(0xee)),
+      nonce: exportKey(new Uint8Array(24).fill(0xff)),
+      header: { dh: exportKey(senderKP.publicKey), pn: 0, n: 0 },
+    })
+
+    await act(async () => {
+      // First message — creates the receiver ratchet
+      mockWs.simulateMessage(wireMsg)
+      await new Promise((r) => setTimeout(r, 50))
+      // Second message from the same sender — exercises the `if (existing)` true
+      // branch in getOrInitReceiverRatchet (cache hit path)
+      mockWs.simulateMessage(wireMsg)
+      await new Promise((r) => setTimeout(r, 100))
+    })
+
+    // Both decryptions fail (wrong bytes) — hook must stay ready and not crash
+    expect(result.current.isReady).toBe(true)
+    expect(result.current.messages).toHaveLength(0)
   })
 })
