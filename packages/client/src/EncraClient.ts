@@ -264,7 +264,7 @@ export class EncraClient {
   async encryptFile(file: File | Blob, to: string): Promise<EncryptedFile> {
     if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
     if (file.size > MAX_FILE_BYTES) {
-      throw new Error(
+      throw new RangeError(
         `File too large: ${file.size} bytes exceeds the ${MAX_FILE_BYTES}-byte limit.`
       )
     }
@@ -275,7 +275,9 @@ export class EncraClient {
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    const shared     = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+    // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
+    // This produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
+    const shared     = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
     const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
     const ciphertext = sodium.crypto_secretbox_easy(bytes, nonce, shared)
 
@@ -309,9 +311,9 @@ export class EncraClient {
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
 
-    let plainBytes: Uint8Array | null
+    let plainBytes: Uint8Array
     try {
       plainBytes = sodium.crypto_secretbox_open_easy(
         encrypted.ciphertext.slice(),
@@ -320,10 +322,6 @@ export class EncraClient {
       )
     } catch {
       throw new DecryptionFailedError(`decryptFile: decryption failed for file "${encrypted.name}".`)
-    }
-
-    if (!plainBytes) {
-      throw new DecryptionFailedError(`decryptFile: authentication failed for file "${encrypted.name}".`)
     }
 
     const buf = plainBytes.buffer.slice(
@@ -365,7 +363,7 @@ export class EncraClient {
     await sodium.ready
     const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
 
-    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
 
     const result: EncryptedFields = {}
 
@@ -409,7 +407,7 @@ export class EncraClient {
     await sodium.ready
     const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
 
-    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
 
     const result: Record<string, string> = {}
 
@@ -423,15 +421,11 @@ export class EncraClient {
         throw new DecryptionFailedError(`decryptFields: invalid base64 for field "${key}".`)
       }
 
-      let plainBytes: Uint8Array | null
+      let plainBytes: Uint8Array
       try {
         plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
       } catch {
         throw new DecryptionFailedError(`decryptFields: decryption failed for field "${key}".`)
-      }
-
-      if (!plainBytes) {
-        throw new DecryptionFailedError(`decryptFields: authentication failed for field "${key}".`)
       }
 
       result[key] = sodium.to_string(plainBytes)

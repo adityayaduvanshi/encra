@@ -1,11 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   generateKeyPair,
-  deriveSharedSecret,
   exportKey,
   importKey,
   sodiumReady,
-  InvalidKeyError,
   DecryptionFailedError,
 } from '@encra/core'
 import type { KeyPair } from '@encra/core'
@@ -211,17 +209,19 @@ export function useE2EFile({
     const size     = file.size
 
     if (size > MAX_FILE_BYTES) {
-      throw new InvalidKeyError(
+      throw new RangeError(
         `File too large: ${size} bytes. Maximum supported size is ${MAX_FILE_BYTES} bytes (50 MB).`
       )
     }
 
     const peerPub = await fetchPeerKey(to)
-    const shared  = await deriveSharedSecret(keyPairRef.current.privateKey, peerPub)
 
-    // Import sodium lazily (already ready from init)
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
+
+    // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
+    // Produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
+    const shared = sodium.crypto_box_beforenm(peerPub.slice(), keyPairRef.current.privateKey.slice())
 
     const fileBytes  = await readFileBytes(file)
     const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
@@ -238,20 +238,17 @@ export function useE2EFile({
     }
 
     const peerPub = await fetchPeerKey(from)
-    const shared  = await deriveSharedSecret(keyPairRef.current.privateKey, peerPub)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    let plainBytes: Uint8Array | null
+    const shared = sodium.crypto_box_beforenm(peerPub.slice(), keyPairRef.current.privateKey.slice())
+
+    let plainBytes: Uint8Array
     try {
       plainBytes = sodium.crypto_secretbox_open_easy(encrypted.ciphertext, encrypted.nonce, shared)
     } catch {
       throw new DecryptionFailedError('File decryption failed — wrong key or corrupted data.')
-    }
-
-    if (!plainBytes) {
-      throw new DecryptionFailedError('File decryption failed — authentication check failed.')
     }
 
     // Slice to a plain ArrayBuffer so TypeScript's BlobPart type is satisfied
