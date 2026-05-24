@@ -7,16 +7,34 @@ import {
   DecryptionFailedError,
 } from '@encra/core'
 import type { KeyPair } from '@encra/core'
-import { loadKeyPair, saveKeyPair } from './ratchetStore.js'
+import {
+  loadKeyPair, saveKeyPair,
+  getOrCreateDeviceId,
+} from './ratchetStore.js'
+import type { DeviceKey } from './useE2EChat.js'
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /**
- * A map of field names to their encrypted values, ready to submit or store.
- * Each field is independently encrypted with the same derived shared secret
- * and a unique random nonce — compromising one field's nonce doesn't affect others.
+ * Encrypted form fields produced by `encryptFields`.
+ *
+ * Each device of the recipient gets a separate set of encrypted field values
+ * so they can independently decrypt the form on any of their devices. Store
+ * or transmit the entire object together with the plaintext field names.
  */
-export type EncryptedFields = Record<string, { ciphertext: string; nonce: string }>
+export interface EncryptedFields {
+  /**
+   * One envelope per recipient device.
+   * Each device's fields are encrypted with the shared secret derived from
+   * the sender's key and that device's public key.
+   */
+  devices: Array<{
+    /** The recipient's device UUID. */
+    deviceId: string
+    /** Field name → `{ ciphertext, nonce }` (base64url, no padding). */
+    fields: Record<string, { ciphertext: string; nonce: string }>
+  }>
+}
 
 export interface UseE2EFormOptions {
   apiKey: string
@@ -35,9 +53,12 @@ export interface UseE2EFormResult {
    * (keys) are **not** encrypted — only the values are. If you need key
    * privacy, hash the field names before passing them in.
    *
+   * Encrypts once per registered device of the recipient so the form is
+   * accessible on all their devices.
+   *
    * @param fields - Plain object of `{ fieldName: plaintext }`.
    * @param to     - The recipient's `userId`. They must have registered a public key.
-   * @returns `EncryptedFields` — an object with the same keys, values replaced by `{ ciphertext, nonce }`.
+   * @returns `EncryptedFields` — one device envelope per registered device.
    * @throws {Error} If the hook is not yet ready or the recipient's key cannot be fetched.
    *
    * @example
@@ -49,10 +70,13 @@ export interface UseE2EFormResult {
   /**
    * Decrypt an `EncryptedFields` object — the inverse of `encryptFields`.
    *
+   * Finds the envelope for the current device, then tries each of the sender's
+   * device keys until decryption succeeds.
+   *
    * @param encrypted - The object returned by `encryptFields`.
    * @param from      - The sender's `userId`.
    * @returns The original `{ fieldName: plaintext }` object.
-   * @throws {DecryptionFailedError} If any field fails to decrypt.
+   * @throws {DecryptionFailedError} If no matching key is found or any field fails to decrypt.
    */
   decryptFields: (encrypted: EncryptedFields, from: string) => Promise<Record<string, string>>
 
@@ -75,6 +99,9 @@ const ENCRA_SERVER_URL = 'https://api.encra.dev'
  * Each field is encrypted independently with XSalsa20-Poly1305 and a fresh random
  * nonce, using an X25519 shared secret derived from the sender and recipient's key
  * pairs. Field names are sent in plaintext; only the values are encrypted.
+ *
+ * Multi-device: if the recipient has multiple registered devices, the fields are
+ * encrypted once per device so every device can decrypt them independently.
  *
  * Ideal for HIPAA forms, private surveys, secure feedback, or any scenario where
  * your server must store data but must not be able to read it.
@@ -108,9 +135,10 @@ export function useE2EForm({
   const [isReady, setIsReady] = useState(false)
   const [error,   setError]   = useState<Error | null>(null)
 
-  const keyPairRef   = useRef<KeyPair | null>(null)
-  const peerKeyCache = useRef<Map<string, Uint8Array>>(new Map())
-  const httpBase     = serverUrl.replace(/\/$/, '')
+  const keyPairRef      = useRef<KeyPair | null>(null)
+  const deviceIdRef     = useRef<string>('')
+  const peerKeyCacheRef = useRef<Map<string, DeviceKey[]>>(new Map())
+  const httpBase        = serverUrl.replace(/\/$/, '')
 
   // ── Init ────────────────────────────────────────────────────────────────────
 
@@ -120,6 +148,10 @@ export function useE2EForm({
     async function init() {
       try {
         await sodiumReady()
+
+        // Get or create a stable device ID for this browser/device
+        const deviceId = await getOrCreateDeviceId(userId)
+        deviceIdRef.current = deviceId
 
         // Restore or generate stable key pair (shared with useE2EChat, useE2EFile)
         const stored = await loadKeyPair(userId)
@@ -137,11 +169,15 @@ export function useE2EForm({
           })
         }
 
-        // Register public key (idempotent upsert)
+        // Register public key + deviceId (idempotent upsert)
         const res = await fetch(`${httpBase}/v1/keys`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body:    JSON.stringify({ userId, publicKey: exportKey(keyPairRef.current.publicKey) }),
+          body:    JSON.stringify({
+            userId,
+            publicKey: exportKey(keyPairRef.current.publicKey),
+            deviceId,
+          }),
         })
         if (!res.ok) throw new Error(`Key registration failed: ${res.status}`)
 
@@ -161,8 +197,15 @@ export function useE2EForm({
 
   // ── Peer key helper ──────────────────────────────────────────────────────────
 
-  const fetchPeerKey = useCallback(async (peerId: string): Promise<Uint8Array> => {
-    const cached = peerKeyCache.current.get(peerId)
+  /**
+   * Fetches all registered device keys for `peerId` and caches them in memory.
+   *
+   * @param peerId - The target user's identifier.
+   * @returns Array of DeviceKey (one per registered device).
+   * @throws {Error} If the server request fails.
+   */
+  const fetchPeerDeviceKeys = useCallback(async (peerId: string): Promise<DeviceKey[]> => {
+    const cached = peerKeyCacheRef.current.get(peerId)
     if (cached) return cached
 
     const res = await fetch(`${httpBase}/v1/keys/${peerId}`, {
@@ -170,18 +213,35 @@ export function useE2EForm({
     })
     if (!res.ok) {
       throw new Error(
-        `Could not fetch public key for '${peerId}': ${res.status}. ` +
+        `Could not fetch public keys for '${peerId}': ${res.status}. ` +
         `Make sure ${peerId} has registered.`
       )
     }
-    const { publicKey: b64 } = (await res.json()) as { publicKey: string }
-    const key = importKey(b64)
-    peerKeyCache.current.set(peerId, key)
-    return key
+    const { devices } = (await res.json()) as {
+      userId:  string
+      devices: Array<{ deviceId: string; publicKey: string }>
+    }
+    const deviceKeys: DeviceKey[] = devices.map((d) => ({
+      deviceId:  d.deviceId,
+      publicKey: importKey(d.publicKey),
+    }))
+    peerKeyCacheRef.current.set(peerId, deviceKeys)
+    return deviceKeys
   }, [httpBase, apiKey])
 
   // ── encryptFields ────────────────────────────────────────────────────────────
 
+  /**
+   * Encrypts each field value for every registered device of `to`.
+   *
+   * Uses `crypto_box_beforenm` (X25519 + HSalsa20) to derive a per-device
+   * symmetric key. Each field gets a unique random nonce. The result contains
+   * one complete set of encrypted fields per recipient device.
+   *
+   * @param fields - Plain object of string field values.
+   * @param to     - The recipient's `userId`.
+   * @returns `EncryptedFields` with one `devices` entry per registered device.
+   */
   const encryptFields = useCallback(async (
     fields: Record<string, string>,
     to: string,
@@ -193,45 +253,63 @@ export function useE2EForm({
       throw new TypeError('encryptFields: fields must be a plain object of string values.')
     }
 
-    const peerPub = await fetchPeerKey(to)
+    const peerDevices = await fetchPeerDeviceKeys(to)
+    if (peerDevices.length === 0) {
+      throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
+    }
 
     // Single dynamic import so ECDH and secretbox run in the same libsodium
     // instance — avoids Uint8Array cross-realm rejection when modules are
     // inlined separately (e.g. jsdom/Vitest environment with server.deps.inline).
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
-    const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
+    const B64       = sodium.base64_variants.URLSAFE_NO_PADDING
+    const myPrivKey = keyPairRef.current.privateKey.slice()
 
-    // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
-    // Produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
-    // .slice() copies WASM-heap bytes into plain ArrayBuffers so this sodium
-    // instance accepts key material originating from @encra/core's instance.
-    const shared = sodium.crypto_box_beforenm(
-      peerPub.slice(),
-      keyPairRef.current.privateKey.slice(),
-    )
+    const deviceEnvelopes: EncryptedFields['devices'] = []
 
-    const result: EncryptedFields = {}
+    for (const device of peerDevices) {
+      // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
+      // Produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
+      // .slice() copies WASM-heap bytes into plain ArrayBuffers so this sodium
+      // instance accepts key material originating from @encra/core's instance.
+      const shared = sodium.crypto_box_beforenm(device.publicKey.slice(), myPrivKey)
 
-    for (const [key, value] of Object.entries(fields)) {
-      if (typeof value !== 'string') {
-        throw new TypeError(`encryptFields: field "${key}" must be a string, got ${typeof value}.`)
+      const encryptedFields: Record<string, { ciphertext: string; nonce: string }> = {}
+
+      for (const [key, value] of Object.entries(fields)) {
+        if (typeof value !== 'string') {
+          throw new TypeError(`encryptFields: field "${key}" must be a string, got ${typeof value}.`)
+        }
+        const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+        // Pass the value as a string — libsodium converts it internally with its
+        // own from_string(), avoiding jsdom's TextEncoder cross-realm Uint8Array issue.
+        const ciphertext = sodium.crypto_secretbox_easy(value, nonce, shared)
+        encryptedFields[key] = {
+          ciphertext: sodium.to_base64(ciphertext, B64),
+          nonce:      sodium.to_base64(nonce, B64),
+        }
       }
-      const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
-      // Pass the value as a string — libsodium converts it internally with its
-      // own from_string(), avoiding jsdom's TextEncoder cross-realm Uint8Array issue.
-      const ciphertext = sodium.crypto_secretbox_easy(value, nonce, shared)
-      result[key] = {
-        ciphertext: sodium.to_base64(ciphertext, B64),
-        nonce:      sodium.to_base64(nonce, B64),
-      }
+
+      deviceEnvelopes.push({ deviceId: device.deviceId, fields: encryptedFields })
     }
 
-    return result
-  }, [isReady, fetchPeerKey])
+    return { devices: deviceEnvelopes }
+  }, [isReady, fetchPeerDeviceKeys])
 
   // ── decryptFields ────────────────────────────────────────────────────────────
 
+  /**
+   * Decrypts `encrypted` using the current device's field envelope.
+   *
+   * Finds the `devices` entry matching this device's ID, then tries each of
+   * the sender's registered public keys until one successfully decrypts all fields.
+   *
+   * @param encrypted - The `EncryptedFields` produced by `encryptFields`.
+   * @param from      - The sender's `userId`.
+   * @returns The original `{ fieldName: plaintext }` object.
+   * @throws {DecryptionFailedError} If no matching key is found or any field fails.
+   */
   const decryptFields = useCallback(async (
     encrypted: EncryptedFields,
     from: string,
@@ -240,41 +318,46 @@ export function useE2EForm({
       throw new Error('useE2EForm is not ready yet. Wait for isReady before calling decryptFields.')
     }
 
-    const peerPub = await fetchPeerKey(from)
+    // Find the envelope addressed to this device
+    const myDeviceId = deviceIdRef.current
+    const myEnvelope = encrypted.devices.find((d) => d.deviceId === myDeviceId)
+    if (!myEnvelope) {
+      throw new DecryptionFailedError(
+        `No envelope found for device '${myDeviceId}'. ` +
+        `These fields were not encrypted for this device.`
+      )
+    }
+
+    // Fetch all of the sender's device keys and try each one
+    const senderDevices = await fetchPeerDeviceKeys(from)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
-    const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
+    const B64       = sodium.base64_variants.URLSAFE_NO_PADDING
+    const myPrivKey = keyPairRef.current.privateKey.slice()
 
-    const shared = sodium.crypto_box_beforenm(
-      peerPub.slice(),
-      keyPairRef.current.privateKey.slice(),
-    )
-
-    const result: Record<string, string> = {}
-
-    for (const [key, { ciphertext, nonce }] of Object.entries(encrypted)) {
-      let ctBytes: Uint8Array
-      let nonceBytes: Uint8Array
+    for (const senderDevice of senderDevices) {
       try {
-        ctBytes    = sodium.from_base64(ciphertext, B64)
-        nonceBytes = sodium.from_base64(nonce, B64)
-      } catch {
-        throw new DecryptionFailedError(`decryptFields: invalid base64 for field "${key}".`)
-      }
+        const shared  = sodium.crypto_box_beforenm(senderDevice.publicKey.slice(), myPrivKey)
+        const result: Record<string, string> = {}
 
-      let plainBytes: Uint8Array
-      try {
-        plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
-      } catch {
-        throw new DecryptionFailedError(`decryptFields: decryption failed for field "${key}".`)
-      }
+        for (const [key, { ciphertext, nonce }] of Object.entries(myEnvelope.fields)) {
+          const ctBytes    = sodium.from_base64(ciphertext, B64)
+          const nonceBytes = sodium.from_base64(nonce, B64)
+          const plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
+          result[key] = sodium.to_string(plainBytes)
+        }
 
-      result[key] = sodium.to_string(plainBytes)
+        return result
+      } catch {
+        // Wrong sender device key or corrupted data — try the next one
+      }
     }
 
-    return result
-  }, [fetchPeerKey])
+    throw new DecryptionFailedError(
+      `Field decryption failed — no matching key found for sender '${from}'.`
+    )
+  }, [fetchPeerDeviceKeys])
 
   return { encryptFields, decryptFields, isReady, error }
 }

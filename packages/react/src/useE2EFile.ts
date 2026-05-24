@@ -7,25 +7,41 @@ import {
   DecryptionFailedError,
 } from '@encra/core'
 import type { KeyPair } from '@encra/core'
-import { loadKeyPair, saveKeyPair } from './ratchetStore.js'
+import {
+  loadKeyPair, saveKeyPair,
+  getOrCreateDeviceId,
+} from './ratchetStore.js'
+import type { DeviceKey } from './useE2EChat.js'
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /**
  * An encrypted file produced by `encryptFile`.
- * All fields are required to decrypt — store or transmit them together.
+ *
+ * The file bytes are encrypted once per recipient device so that every device
+ * can independently decrypt the file with its own key. Store or transmit the
+ * entire object — all fields are required to decrypt.
  */
 export interface EncryptedFile {
-  /** XSalsa20-Poly1305 ciphertext of the raw file bytes. */
-  ciphertext: Uint8Array
-  /** Random 24-byte nonce. Must be stored alongside `ciphertext`. */
-  nonce: Uint8Array
   /** Original filename (e.g. `"photo.jpg"`). Stored as plaintext metadata. */
   name: string
   /** MIME type (e.g. `"image/jpeg"`). Stored as plaintext metadata. */
   mimeType: string
   /** Original file size in bytes (pre-encryption). */
   size: number
+  /**
+   * One encryption envelope per recipient device.
+   * Each entry is independently encrypted with the shared secret derived from
+   * the sender's key and that specific device's public key.
+   */
+  devices: Array<{
+    /** The recipient's device UUID (matches `deviceId` in their key registration). */
+    deviceId:   string
+    /** XSalsa20-Poly1305 ciphertext of the raw file bytes. */
+    ciphertext: Uint8Array
+    /** Random 24-byte nonce. Must be stored alongside `ciphertext`. */
+    nonce:      Uint8Array
+  }>
 }
 
 export interface UseE2EFileOptions {
@@ -41,20 +57,27 @@ export interface UseE2EFileResult {
   /**
    * Encrypt a `File` or `Blob` for a recipient.
    *
+   * Encrypts the file once per registered device of the recipient so that the
+   * file is accessible on all their devices simultaneously.
+   *
    * @param file - The file or blob to encrypt.
    * @param to   - The recipient's `userId`. They must have registered a public key.
    * @returns An `EncryptedFile` object. Send or store it however you like.
    * @throws {Error} If the hook is not yet ready or the recipient's key cannot be fetched.
+   * @throws {RangeError} If `file.size` exceeds `MAX_FILE_BYTES` (50 MB).
    */
   encryptFile: (file: File | Blob, to: string) => Promise<EncryptedFile>
 
   /**
    * Decrypt an `EncryptedFile` from a sender.
    *
+   * Finds the envelope for the current device, then tries each of the sender's
+   * device keys until decryption succeeds.
+   *
    * @param encrypted - The object returned by `encryptFile`.
    * @param from      - The sender's `userId`.
    * @returns A `File` with the original filename and MIME type restored.
-   * @throws {DecryptionFailedError} If the key is wrong or the data is tampered.
+   * @throws {DecryptionFailedError} If no matching key is found or data is tampered.
    */
   decryptFile: (encrypted: EncryptedFile, from: string) => Promise<File>
 
@@ -97,7 +120,10 @@ export const MAX_FILE_BYTES = 50 * 1024 * 1024
  *
  * Uses the same X25519 key pair as `useE2EChat` — users share one identity
  * across Encra hooks. Encryption uses XSalsa20-Poly1305 authenticated encryption
- * with a per-file derived key.
+ * with a per-file, per-device derived key.
+ *
+ * Multi-device: if the recipient has multiple registered devices, the file is
+ * encrypted once per device so every device can decrypt it independently.
  *
  * Files up to 50 MB are supported. The encrypted bytes live in memory as
  * `Uint8Array` — you decide how to store or transmit them (S3, IPFS, your DB, etc.).
@@ -109,10 +135,10 @@ export const MAX_FILE_BYTES = 50 * 1024 * 1024
  *   userId: currentUser,
  * })
  *
- * // Encrypt a file for Bob
+ * // Encrypt a file for Bob (all of Bob's devices get an envelope)
  * const encrypted = await encryptFile(file, 'bob')
  *
- * // Decrypt a file from Alice
+ * // Decrypt a file from Alice (finds the envelope for this device automatically)
  * const decrypted = await decryptFile(encryptedFromAlice, 'alice')
  * const url = URL.createObjectURL(decrypted)
  */
@@ -125,9 +151,10 @@ export function useE2EFile({
   const [isReady, setIsReady] = useState(false)
   const [error,   setError]   = useState<Error | null>(null)
 
-  const keyPairRef    = useRef<KeyPair | null>(null)
-  const peerKeyCache  = useRef<Map<string, Uint8Array>>(new Map())
-  const httpBase      = serverUrl.replace(/\/$/, '')
+  const keyPairRef      = useRef<KeyPair | null>(null)
+  const deviceIdRef     = useRef<string>('')
+  const peerKeyCacheRef = useRef<Map<string, DeviceKey[]>>(new Map())
+  const httpBase        = serverUrl.replace(/\/$/, '')
 
   // ── Init ────────────────────────────────────────────────────────────────────
 
@@ -138,7 +165,11 @@ export function useE2EFile({
       try {
         await sodiumReady()
 
-        // Restore or generate stable key pair (shared with useE2EChat)
+        // Get or create a stable device ID for this browser/device
+        const deviceId = await getOrCreateDeviceId(userId)
+        deviceIdRef.current = deviceId
+
+        // Restore or generate stable key pair (shared with useE2EChat, useE2EForm)
         const stored = await loadKeyPair(userId)
         if (stored) {
           keyPairRef.current = {
@@ -154,11 +185,15 @@ export function useE2EFile({
           })
         }
 
-        // Register public key (idempotent upsert)
+        // Register public key + deviceId (idempotent upsert)
         const res = await fetch(`${httpBase}/v1/keys`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body:    JSON.stringify({ userId, publicKey: exportKey(keyPairRef.current.publicKey) }),
+          body:    JSON.stringify({
+            userId,
+            publicKey: exportKey(keyPairRef.current.publicKey),
+            deviceId,
+          }),
         })
         if (!res.ok) throw new Error(`Key registration failed: ${res.status}`)
 
@@ -178,8 +213,15 @@ export function useE2EFile({
 
   // ── Peer key helper ──────────────────────────────────────────────────────────
 
-  const fetchPeerKey = useCallback(async (peerId: string): Promise<Uint8Array> => {
-    const cached = peerKeyCache.current.get(peerId)
+  /**
+   * Fetches all registered device keys for `peerId` and caches them in memory.
+   *
+   * @param peerId - The target user's identifier.
+   * @returns Array of DeviceKey (one per registered device).
+   * @throws {Error} If the server request fails.
+   */
+  const fetchPeerDeviceKeys = useCallback(async (peerId: string): Promise<DeviceKey[]> => {
+    const cached = peerKeyCacheRef.current.get(peerId)
     if (cached) return cached
 
     const res = await fetch(`${httpBase}/v1/keys/${peerId}`, {
@@ -187,18 +229,35 @@ export function useE2EFile({
     })
     if (!res.ok) {
       throw new Error(
-        `Could not fetch public key for '${peerId}': ${res.status}. ` +
+        `Could not fetch public keys for '${peerId}': ${res.status}. ` +
         `Make sure ${peerId} has registered.`
       )
     }
-    const { publicKey: b64 } = (await res.json()) as { publicKey: string }
-    const key = importKey(b64)
-    peerKeyCache.current.set(peerId, key)
-    return key
+    const { devices } = (await res.json()) as {
+      userId:  string
+      devices: Array<{ deviceId: string; publicKey: string }>
+    }
+    const deviceKeys: DeviceKey[] = devices.map((d) => ({
+      deviceId:  d.deviceId,
+      publicKey: importKey(d.publicKey),
+    }))
+    peerKeyCacheRef.current.set(peerId, deviceKeys)
+    return deviceKeys
   }, [httpBase, apiKey])
 
   // ── encryptFile ──────────────────────────────────────────────────────────────
 
+  /**
+   * Encrypts `file` for every registered device of `to`.
+   *
+   * Uses `crypto_box_beforenm` (X25519 + HSalsa20) to derive a per-device
+   * symmetric key, then encrypts the raw file bytes with XSalsa20-Poly1305.
+   * Each device gets its own `{ ciphertext, nonce }` envelope.
+   *
+   * @param file - The file or blob to encrypt.
+   * @param to   - The recipient's `userId`.
+   * @returns `EncryptedFile` with one `devices` entry per registered device.
+   */
   const encryptFile = useCallback(async (file: File | Blob, to: string): Promise<EncryptedFile> => {
     if (!isReady || !keyPairRef.current) {
       throw new Error('useE2EFile is not ready yet. Wait for isReady before calling encryptFile.')
@@ -214,50 +273,91 @@ export function useE2EFile({
       )
     }
 
-    const peerPub = await fetchPeerKey(to)
+    const peerDevices = await fetchPeerDeviceKeys(to)
+    if (peerDevices.length === 0) {
+      throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
+    }
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
-    // Produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
-    const shared = sodium.crypto_box_beforenm(peerPub.slice(), keyPairRef.current.privateKey.slice())
+    const fileBytes = await readFileBytes(file)
+    const myPrivKey = keyPairRef.current.privateKey.slice()
 
-    const fileBytes  = await readFileBytes(file)
-    const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
-    const ciphertext = sodium.crypto_secretbox_easy(fileBytes, nonce, shared)
+    const deviceEnvelopes: EncryptedFile['devices'] = []
 
-    return { ciphertext, nonce, name, mimeType, size }
-  }, [isReady, fetchPeerKey])
+    for (const device of peerDevices) {
+      // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
+      // Produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
+      const shared      = sodium.crypto_box_beforenm(device.publicKey.slice(), myPrivKey)
+      const nonce       = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+      const ciphertext  = sodium.crypto_secretbox_easy(fileBytes, nonce, shared)
+      deviceEnvelopes.push({ deviceId: device.deviceId, ciphertext, nonce })
+    }
+
+    return { name, mimeType, size, devices: deviceEnvelopes }
+  }, [isReady, fetchPeerDeviceKeys])
 
   // ── decryptFile ──────────────────────────────────────────────────────────────
 
+  /**
+   * Decrypts `encrypted` using the current device's envelope.
+   *
+   * Finds the `devices` entry matching this device's ID, then tries each of
+   * the sender's registered public keys until one successfully decrypts the
+   * ciphertext.
+   *
+   * @param encrypted - The `EncryptedFile` produced by `encryptFile`.
+   * @param from      - The sender's `userId`.
+   * @returns The original `File` with name and MIME type restored.
+   * @throws {DecryptionFailedError} If no key produces a valid decryption.
+   */
   const decryptFile = useCallback(async (encrypted: EncryptedFile, from: string): Promise<File> => {
     if (!keyPairRef.current) {
       throw new Error('useE2EFile is not ready yet. Wait for isReady before calling decryptFile.')
     }
 
-    const peerPub = await fetchPeerKey(from)
+    // Find the envelope addressed to this device
+    const myDeviceId = deviceIdRef.current
+    const myEnvelope = encrypted.devices.find((d) => d.deviceId === myDeviceId)
+    if (!myEnvelope) {
+      throw new DecryptionFailedError(
+        `No envelope found for device '${myDeviceId}'. ` +
+        `This file was not encrypted for this device.`
+      )
+    }
+
+    // Fetch all of the sender's device keys and try each one
+    const senderDevices = await fetchPeerDeviceKeys(from)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    const shared = sodium.crypto_box_beforenm(peerPub.slice(), keyPairRef.current.privateKey.slice())
+    const myPrivKey = keyPairRef.current.privateKey.slice()
 
-    let plainBytes: Uint8Array
-    try {
-      plainBytes = sodium.crypto_secretbox_open_easy(encrypted.ciphertext, encrypted.nonce, shared)
-    } catch {
-      throw new DecryptionFailedError('File decryption failed — wrong key or corrupted data.')
+    for (const senderDevice of senderDevices) {
+      try {
+        const shared     = sodium.crypto_box_beforenm(senderDevice.publicKey.slice(), myPrivKey)
+        const plainBytes = sodium.crypto_secretbox_open_easy(
+          myEnvelope.ciphertext,
+          myEnvelope.nonce,
+          shared,
+        )
+        // Slice to a plain ArrayBuffer so TypeScript's BlobPart type is satisfied
+        const buf = plainBytes.buffer.slice(
+          plainBytes.byteOffset,
+          plainBytes.byteOffset + plainBytes.byteLength,
+        ) as ArrayBuffer
+        return new File([buf], encrypted.name, { type: encrypted.mimeType })
+      } catch {
+        // Wrong sender device key — try the next one
+      }
     }
 
-    // Slice to a plain ArrayBuffer so TypeScript's BlobPart type is satisfied
-    const buf = plainBytes.buffer.slice(
-      plainBytes.byteOffset,
-      plainBytes.byteOffset + plainBytes.byteLength,
-    ) as ArrayBuffer
-    return new File([buf], encrypted.name, { type: encrypted.mimeType })
-  }, [fetchPeerKey])
+    throw new DecryptionFailedError(
+      `File decryption failed — no matching key found for sender '${from}'.`
+    )
+  }, [fetchPeerDeviceKeys])
 
   return { encryptFile, decryptFile, isReady, error }
 }

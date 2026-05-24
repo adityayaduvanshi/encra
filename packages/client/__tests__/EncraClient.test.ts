@@ -30,7 +30,7 @@ class MockWebSocket {
   }
 
   addEventListener(event: string, listener: (e: unknown) => void) {
-    if (event === 'open')    this.openListeners.push(listener as () => void)
+    if (event === 'open')         this.openListeners.push(listener as () => void)
     else if (event === 'message') this.messageListeners.push(listener as WsListener)
     else if (event === 'close')   this.closeListeners.push(listener as () => void)
     else if (event === 'error')   this.errorListeners.push(listener as () => void)
@@ -42,21 +42,41 @@ class MockWebSocket {
 
 // ── fetch mock ────────────────────────────────────────────────────────────────
 
+const TEST_DEVICE_ID = 'test-device'
+
+/**
+ * Returns a fetch mock that speaks the multi-device key-server protocol:
+ *   POST /v1/keys     → { userId, deviceId }
+ *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ */
 function makeFetchMock(keyStore: Map<string, string>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
 
     if (url.includes('/v1/keys') && init?.method === 'POST') {
-      const body = JSON.parse(init.body as string) as { userId: string; publicKey: string }
+      const body = JSON.parse(init.body as string) as {
+        userId: string; publicKey: string; deviceId?: string
+      }
       keyStore.set(body.userId, body.publicKey)
-      return { ok: true, status: 201, json: async () => ({ userId: body.userId }) } as Response
+      return {
+        ok: true, status: 201,
+        json: async () => ({ userId: body.userId, deviceId: body.deviceId ?? TEST_DEVICE_ID }),
+      } as Response
     }
 
     const match = url.match(/\/v1\/keys\/(.+)$/)
     if (match) {
       const uid = match[1]!
       const key = keyStore.get(uid)
-      if (key) return { ok: true, status: 200, json: async () => ({ userId: uid, publicKey: key }) } as Response
+      if (key) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            userId: uid,
+            devices: [{ deviceId: TEST_DEVICE_ID, publicKey: key }],
+          }),
+        } as Response
+      }
       return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
     }
 
@@ -79,6 +99,7 @@ describe('EncraClient', () => {
 
   function setupMocks() {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     vi.stubGlobal(
       'WebSocket',
       class extends MockWebSocket {
@@ -102,7 +123,7 @@ describe('EncraClient', () => {
     client.disconnect()
   })
 
-  it('sends a register message when WebSocket opens', async () => {
+  it('sends a register message with userId and deviceId when WebSocket opens', async () => {
     setupMocks()
     const client = new EncraClient({ apiKey: 'test-key', userId: 'bob', serverUrl: 'http://localhost:3000' })
 
@@ -114,6 +135,10 @@ describe('EncraClient', () => {
       return p.type === 'register' && p.userId === 'bob'
     })
     expect(reg).toBeDefined()
+
+    // deviceId must be included for relay routing
+    const parsed = JSON.parse(reg!) as { type: string; userId: string; deviceId: string }
+    expect(parsed.deviceId).toBe(TEST_DEVICE_ID)
     client.disconnect()
   })
 
@@ -164,6 +189,7 @@ describe('EncraClient', () => {
   it('throws on fatal init error (key registration fails)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as Response)))
     vi.stubGlobal('WebSocket', MockWebSocket)
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
 
     const client = new EncraClient({ apiKey: 'bad-key', userId: 'dave', serverUrl: 'http://localhost:3000' })
     await expect(client.connect()).rejects.toThrow('Key registration failed')
@@ -178,12 +204,14 @@ describe('EncraClient', () => {
     await client.connect()
     await new Promise((r) => setTimeout(r, 100))
 
+    // fromDeviceId is required for per-device ratchet keying
     const wireMsg = JSON.stringify({
-      type:       'message',
-      from:       'carol',
-      ciphertext: exportKey(new Uint8Array(48).fill(0xaa)),
-      nonce:      exportKey(new Uint8Array(24).fill(0xbb)),
-      header:     { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
+      type:         'message',
+      from:         'carol',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   exportKey(new Uint8Array(48).fill(0xaa)),
+      nonce:        exportKey(new Uint8Array(24).fill(0xbb)),
+      header:       { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
     })
 
     mockWs.simulateMessage(wireMsg)
@@ -207,6 +235,7 @@ describe('EncraClient', () => {
 
     mockWs.simulateMessage('not-json{{{')
     mockWs.simulateMessage(JSON.stringify({ type: 'ping' }))
+    // Missing fromDeviceId, ciphertext, nonce, or header — all ignored
     mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x' }))
     mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x', ciphertext: 'a', nonce: 'b' }))
     await new Promise((r) => setTimeout(r, 100))
@@ -227,11 +256,14 @@ describe('EncraClient', () => {
     await client.connect()
     await new Promise((r) => setTimeout(r, 100))
 
+    // fromDeviceId required; "wire" event fires before decryption attempt
     mockWs.simulateMessage(JSON.stringify({
-      type: 'message', from: 'ivy',
-      ciphertext: exportKey(new Uint8Array(48).fill(0xcc)),
-      nonce:      exportKey(new Uint8Array(24).fill(0xdd)),
-      header:     { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
+      type:         'message',
+      from:         'ivy',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   exportKey(new Uint8Array(48).fill(0xcc)),
+      nonce:        exportKey(new Uint8Array(24).fill(0xdd)),
+      header:       { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
     }))
     await new Promise((r) => setTimeout(r, 200))
 
@@ -266,11 +298,17 @@ describe('EncraClient', () => {
     await new Promise((r) => setTimeout(r, 100))
     await client.sendMessage('mallory', 'hello')
 
+    // mallory has 1 device → 1 wire frame
     const frame = mockWs.sentMessages.find((m) => {
       const p = JSON.parse(m) as { type: string; to?: string }
       return p.type === 'message' && p.to === 'mallory'
     })
     expect(frame).toBeDefined()
+
+    // Frame must include toDeviceId for relay routing
+    const parsedFrame = JSON.parse(frame!) as { toDeviceId?: string }
+    expect(parsedFrame.toDeviceId).toBe(TEST_DEVICE_ID)
+
     expect(onWire).toHaveBeenCalledWith(expect.objectContaining({ direction: 'sent' }))
     expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ from: 'nina', text: 'hello' }))
     expect(client.messages).toHaveLength(1)
@@ -312,7 +350,7 @@ describe('EncraClient', () => {
 
   async function makeConnectedPair(
     aliceId: string,
-    bobId: string,
+    bobId:   string,
   ): Promise<[EncraClient, EncraClient, () => void]> {
     setupMocks()
     const aliceKP = await generateKeyPair()
@@ -347,11 +385,16 @@ describe('EncraClient', () => {
     const file = new File(['Hello from EncraClient!'], 'hello.txt', { type: 'text/plain' })
     const enc  = await alice.encryptFile(file, 'ef-bob')
 
+    // Top-level metadata is plaintext
     expect(enc.name).toBe('hello.txt')
     expect(enc.mimeType).toBe('text/plain')
     expect(enc.size).toBe(file.size)
-    expect(enc.ciphertext).toBeInstanceOf(Uint8Array)
-    expect(enc.nonce).toBeInstanceOf(Uint8Array)
+
+    // Encrypted payload is inside the devices array
+    expect(enc.devices).toHaveLength(1)
+    expect(enc.devices[0]!.deviceId).toBe(TEST_DEVICE_ID)
+    expect(enc.devices[0]!.ciphertext).toBeInstanceOf(Uint8Array)
+    expect(enc.devices[0]!.nonce).toBeInstanceOf(Uint8Array)
 
     const decrypted = await bob.decryptFile(enc, 'ef-alice')
     const text = await new Promise<string>((resolve, reject) => {
@@ -375,6 +418,7 @@ describe('EncraClient', () => {
 
     expect(enc.name).toBe('file')
     expect(enc.mimeType).toBe('application/octet-stream')
+    expect(enc.devices).toHaveLength(1)
     cleanup()
   })
 
@@ -396,7 +440,9 @@ describe('EncraClient', () => {
     await new Promise((r) => setTimeout(r, 100))
 
     const file = new File(['data'], 'f.txt')
-    await expect(client.encryptFile(file, 'ghost')).rejects.toThrow("Could not fetch public key for 'ghost'")
+    await expect(client.encryptFile(file, 'ghost')).rejects.toThrow(
+      "Could not fetch public keys for 'ghost'"
+    )
     client.disconnect()
   })
 
@@ -406,7 +452,17 @@ describe('EncraClient', () => {
     const file = new File(['secret'], 'secret.txt', { type: 'text/plain' })
     const enc  = await alice.encryptFile(file, 'ef-tamper-bob')
 
-    const tampered: EncryptedFile = { ...enc, ciphertext: new Uint8Array(enc.ciphertext.length).fill(0xff) }
+    // Tamper with the ciphertext for this device's envelope
+    const tampered: EncryptedFile = {
+      name:     enc.name,
+      mimeType: enc.mimeType,
+      size:     enc.size,
+      devices:  [{
+        deviceId:   enc.devices[0]!.deviceId,
+        ciphertext: new Uint8Array(enc.devices[0]!.ciphertext.length).fill(0xff),
+        nonce:      enc.devices[0]!.nonce,
+      }],
+    }
     await expect(bob.decryptFile(tampered, 'ef-tamper-alice')).rejects.toThrow()
 
     cleanup()
@@ -439,18 +495,23 @@ describe('EncraClient', () => {
   it('encryptFields → decryptFields round-trips all field values', async () => {
     const [alice, bob, cleanup] = await makeConnectedPair('ef2-alice', 'ef2-bob')
 
-    const fields = { name: 'Alice Smith', ssn: '123-45-6789', notes: 'Private notes 🔐' }
-    const enc    = await alice.encryptFields(fields, 'ef2-bob')
+    const fields  = { name: 'Alice Smith', ssn: '123-45-6789', notes: 'Private notes 🔐' }
+    const enc     = await alice.encryptFields(fields, 'ef2-bob')
 
-    expect(Object.keys(enc)).toEqual(['name', 'ssn', 'notes'])
+    // EncryptedFields has a devices array (one per recipient device)
+    expect(enc.devices).toHaveLength(1)
+    expect(enc.devices[0]!.deviceId).toBe(TEST_DEVICE_ID)
+
+    const devFields = enc.devices[0]!.fields
+    expect(Object.keys(devFields).sort()).toEqual(['name', 'notes', 'ssn'])
     for (const key of Object.keys(fields) as (keyof typeof fields)[]) {
-      expect(enc[key]).toHaveProperty('ciphertext')
-      expect(enc[key]).toHaveProperty('nonce')
-      expect(enc[key]!.ciphertext).not.toContain(fields[key])
+      expect(devFields[key]).toHaveProperty('ciphertext')
+      expect(devFields[key]).toHaveProperty('nonce')
+      expect(devFields[key]!.ciphertext).not.toContain(fields[key])
     }
 
     // Each field gets a unique nonce
-    const nonces = Object.values(enc).map((v) => v.nonce)
+    const nonces = Object.values(devFields).map((v) => v.nonce)
     expect(new Set(nonces).size).toBe(nonces.length)
 
     const decrypted = await bob.decryptFields(enc, 'ef2-alice')
@@ -463,7 +524,8 @@ describe('EncraClient', () => {
     const [alice, , cleanup] = await makeConnectedPair('ef2-empty-alice', 'ef2-empty-bob')
 
     const enc = await alice.encryptFields({}, 'ef2-empty-bob')
-    expect(enc).toEqual({})
+    expect(enc.devices).toHaveLength(1)
+    expect(enc.devices[0]!.fields).toEqual({})
     cleanup()
   })
 
@@ -473,18 +535,27 @@ describe('EncraClient', () => {
     const enc1 = await alice.encryptFields({ secret: 'same' }, 'ef2-nonce-bob')
     const enc2 = await alice.encryptFields({ secret: 'same' }, 'ef2-nonce-bob')
 
-    expect(enc1.secret!.ciphertext).not.toBe(enc2.secret!.ciphertext)
-    expect(enc1.secret!.nonce).not.toBe(enc2.secret!.nonce)
+    expect(enc1.devices[0]!.fields.secret!.ciphertext).not.toBe(enc2.devices[0]!.fields.secret!.ciphertext)
+    expect(enc1.devices[0]!.fields.secret!.nonce).not.toBe(enc2.devices[0]!.fields.secret!.nonce)
     cleanup()
   })
 
   it('decryptFields throws on tampered ciphertext', async () => {
     const [alice, bob, cleanup] = await makeConnectedPair('ef2-tamper-a', 'ef2-tamper-b')
 
-    const enc     = await alice.encryptFields({ x: 'value' }, 'ef2-tamper-b')
+    const enc = await alice.encryptFields({ x: 'value' }, 'ef2-tamper-b')
+
     const tampered: EncryptedFields = {
-      ...enc,
-      x: { ...enc.x!, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+      devices: [{
+        deviceId: enc.devices[0]!.deviceId,
+        fields: {
+          ...enc.devices[0]!.fields,
+          x: {
+            ...enc.devices[0]!.fields.x!,
+            ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          },
+        },
+      }],
     }
     await expect(bob.decryptFields(tampered, 'ef2-tamper-a')).rejects.toThrow()
     cleanup()

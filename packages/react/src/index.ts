@@ -1,5 +1,5 @@
 export { useE2EChat } from './useE2EChat.js'
-export type { Message, WireEvent, UseE2EChatOptions, UseE2EChatResult } from './useE2EChat.js'
+export type { Message, WireEvent, UseE2EChatOptions, UseE2EChatResult, DeviceKey } from './useE2EChat.js'
 
 export { useE2EFile, MAX_FILE_BYTES } from './useE2EFile.js'
 export type { EncryptedFile, UseE2EFileOptions, UseE2EFileResult } from './useE2EFile.js'

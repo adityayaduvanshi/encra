@@ -13,6 +13,7 @@ import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
+  getOrCreateDeviceId,
 } from './ratchetStore.js'
 
 export interface Message {
@@ -26,6 +27,19 @@ export interface WireEvent {
   ciphertext: string
   nonce: string
   timestamp: number
+}
+
+/**
+ * A single device entry returned by the key server for a given user.
+ * Encra assigns each browser/device a stable UUID; each device registers
+ * its own X25519 public key so that messages can be routed and decrypted
+ * independently on every device the user is logged in to.
+ */
+export interface DeviceKey {
+  /** The stable device UUID generated on first use and persisted in IndexedDB. */
+  deviceId:  string
+  /** The X25519 public key registered by this device. */
+  publicKey: Uint8Array
 }
 
 export const ENCRA_SERVER_URL = 'https://api.encra.dev'
@@ -54,6 +68,8 @@ export interface UseE2EChatResult {
 interface WireMessage {
   type: string
   from?: string
+  /** Sender's device UUID — used to key the per-device receiver ratchet. */
+  fromDeviceId?: string
   ciphertext?: string
   nonce?: string
   header?: MessageHeader
@@ -66,11 +82,16 @@ const MAX_MESSAGES    = 200
 /**
  * React hook for sending and receiving end-to-end encrypted messages.
  *
- * Generates (or restores from IndexedDB) a key pair on mount, registers it
- * with the server, and connects a WebSocket relay. All Double Ratchet
- * encryption/decryption is handled internally. Ratchet state is persisted
- * to IndexedDB so conversations survive page reloads. The WebSocket reconnects
- * automatically with exponential backoff on unexpected disconnection.
+ * Generates (or restores from IndexedDB) a device-stable key pair on mount,
+ * registers it with the server alongside a unique device ID, and connects a
+ * WebSocket relay. All Double Ratchet encryption/decryption is handled
+ * internally. Ratchet state is persisted to IndexedDB so conversations survive
+ * page reloads. The WebSocket reconnects automatically with exponential backoff
+ * on unexpected disconnection.
+ *
+ * Multi-device: if the recipient has several registered devices, `sendMessage`
+ * encrypts and delivers one message per device so the conversation appears on
+ * all of the recipient's devices simultaneously.
  *
  * @param options.apiKey         - Developer API key (JWT).
  * @param options.userId         - Current user's identifier.
@@ -91,47 +112,73 @@ export function useE2EChat({
   onError,
   onWireMessage,
 }: UseE2EChatOptions): UseE2EChatResult {
-  const [messages,    setMessages]    = useState<Message[]>([])
-  const [isReady,     setIsReady]     = useState(false)
+  const [messages,     setMessages]     = useState<Message[]>([])
+  const [isReady,      setIsReady]      = useState(false)
   const [isConnecting, setIsConnecting] = useState(false)
-  const [error,       setError]       = useState<Error | null>(null)
+  const [error,        setError]        = useState<Error | null>(null)
 
-  const keyPairRef   = useRef<KeyPair | null>(null)
-  const ratchetsRef  = useRef<Map<string, DoubleRatchet>>(new Map())
-  const socketRef    = useRef<WebSocket | null>(null)
+  const keyPairRef      = useRef<KeyPair | null>(null)
+  const deviceIdRef     = useRef<string>('')
+  const ratchetsRef     = useRef<Map<string, DoubleRatchet>>(new Map())
+  const peerKeyCacheRef = useRef<Map<string, DeviceKey[]>>(new Map())
+  const socketRef       = useRef<WebSocket | null>(null)
 
   // Stable refs so callbacks can change without restarting the effect
-  const onErrorRef        = useRef(onError)
-  const onWireMessageRef  = useRef(onWireMessage)
-  useEffect(() => { onErrorRef.current = onError },       [onError])
+  const onErrorRef       = useRef(onError)
+  const onWireMessageRef = useRef(onWireMessage)
+  useEffect(() => { onErrorRef.current = onError },            [onError])
   useEffect(() => { onWireMessageRef.current = onWireMessage }, [onWireMessage])
 
   const httpBase = serverUrl.replace(/\/$/, '')
   const wsBase   = httpBase.replace(/^http/, 'ws')
 
-  const fetchPeerPublicKey = useCallback(
-    async (peerId: string): Promise<Uint8Array> => {
+  /**
+   * Fetches all registered device keys for `peerId` and caches them in memory.
+   * Returns an array of `DeviceKey` (one entry per registered device).
+   *
+   * @param peerId - The target user's identifier.
+   * @throws {Error} If the server request fails or the peer has no registered keys.
+   */
+  const fetchPeerDeviceKeys = useCallback(
+    async (peerId: string): Promise<DeviceKey[]> => {
+      const cached = peerKeyCacheRef.current.get(peerId)
+      if (cached) return cached
+
       const res = await fetch(`${httpBase}/v1/keys/${peerId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
       })
       if (!res.ok) {
         throw new Error(
-          `Could not fetch public key for '${peerId}': ${res.status}. Make sure ${peerId} has registered.`
+          `Could not fetch public keys for '${peerId}': ${res.status}. ` +
+          `Make sure ${peerId} has registered.`
         )
       }
-      const { publicKey: pubB64 } = (await res.json()) as { publicKey: string }
-      return importKey(pubB64)
+      const { devices } = (await res.json()) as {
+        userId:  string
+        devices: Array<{ deviceId: string; publicKey: string }>
+      }
+      const deviceKeys: DeviceKey[] = devices.map((d) => ({
+        deviceId:  d.deviceId,
+        publicKey: importKey(d.publicKey),
+      }))
+      peerKeyCacheRef.current.set(peerId, deviceKeys)
+      return deviceKeys
     },
     [apiKey, httpBase]
   )
 
   /**
-   * Returns the sender ratchet for `peerId`, restoring from IndexedDB if needed,
-   * or creating a new one on first contact.
+   * Returns the sender ratchet for a specific peer device, restoring it from
+   * IndexedDB if available or initialising a new one on first contact.
+   *
+   * Ratchet state key: `s:${peerId}:${device.deviceId}`
+   *
+   * @param peerId - Recipient user ID.
+   * @param device - The specific recipient device (from `fetchPeerDeviceKeys`).
    */
   const getOrInitSenderRatchet = useCallback(
-    async (peerId: string): Promise<DoubleRatchet> => {
-      const key      = `s:${peerId}`
+    async (peerId: string, device: DeviceKey): Promise<DoubleRatchet> => {
+      const key      = `s:${peerId}:${device.deviceId}`
       const existing = ratchetsRef.current.get(key)
       if (existing) return existing
 
@@ -142,25 +189,29 @@ export function useE2EChat({
         return ratchet
       }
 
-      const myKP    = keyPairRef.current
+      const myKP = keyPairRef.current
       if (!myKP) throw new Error('Key pair not initialised.')
-      const peerPub = await fetchPeerPublicKey(peerId)
-      const shared  = await deriveSharedSecret(myKP.privateKey, peerPub)
-      const ratchet = await DoubleRatchet.initSender(shared, peerPub)
+      const shared  = await deriveSharedSecret(myKP.privateKey, device.publicKey)
+      const ratchet = await DoubleRatchet.initSender(shared, device.publicKey)
       ratchetsRef.current.set(key, ratchet)
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId, fetchPeerPublicKey]
+    [userId]
   )
 
   /**
-   * Returns the receiver ratchet for `peerId`, restoring from IndexedDB if needed,
-   * or creating a new one on first contact.
+   * Returns the receiver ratchet for a specific sender device, restoring it
+   * from IndexedDB if available or initialising a new one on first contact.
+   *
+   * Ratchet state key: `r:${peerId}:${fromDeviceId}`
+   *
+   * @param peerId       - Sender user ID.
+   * @param fromDeviceId - Sender's device UUID (from the wire message).
    */
   const getOrInitReceiverRatchet = useCallback(
-    async (peerId: string): Promise<DoubleRatchet> => {
-      const key      = `r:${peerId}`
+    async (peerId: string, fromDeviceId: string): Promise<DoubleRatchet> => {
+      const key      = `r:${peerId}:${fromDeviceId}`
       const existing = ratchetsRef.current.get(key)
       if (existing) return existing
 
@@ -171,16 +222,23 @@ export function useE2EChat({
         return ratchet
       }
 
-      const myKP    = keyPairRef.current
+      const myKP = keyPairRef.current
       if (!myKP) throw new Error('Key pair not initialised.')
-      const peerPub = await fetchPeerPublicKey(peerId)
-      const shared  = await deriveSharedSecret(myKP.privateKey, peerPub)
+
+      // Look up the sender's specific device public key
+      const peerDevices  = await fetchPeerDeviceKeys(peerId)
+      const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId)
+      if (!senderDevice) {
+        throw new Error(`Unknown device '${fromDeviceId}' for peer '${peerId}'.`)
+      }
+
+      const shared  = await deriveSharedSecret(myKP.privateKey, senderDevice.publicKey)
       const ratchet = await DoubleRatchet.initReceiver(shared, myKP)
       ratchetsRef.current.set(key, ratchet)
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId, fetchPeerPublicKey]
+    [userId, fetchPeerDeviceKeys]
   )
 
   useEffect(() => {
@@ -191,8 +249,8 @@ export function useE2EChat({
 
     function scheduleReconnect() {
       if (cancelled) return
-      const base   = Math.min(BACKOFF_BASE_MS * Math.pow(2, retryCount++), BACKOFF_MAX_MS)
-      const delay  = base * (0.75 + Math.random() * 0.5)
+      const base  = Math.min(BACKOFF_BASE_MS * Math.pow(2, retryCount++), BACKOFF_MAX_MS)
+      const delay = base * (0.75 + Math.random() * 0.5)
       setIsConnecting(true)
       retryTimeout = setTimeout(() => {
         if (!cancelled) connectWS()
@@ -204,7 +262,8 @@ export function useE2EChat({
       socketRef.current = ws
 
       ws.addEventListener('open', () => {
-        ws!.send(JSON.stringify({ type: 'register', userId }))
+        // Register with both userId and deviceId so the relay can route by device
+        ws!.send(JSON.stringify({ type: 'register', userId, deviceId: deviceIdRef.current }))
         retryCount = 0
         if (!cancelled) { setIsReady(true); setIsConnecting(false) }
       })
@@ -215,7 +274,14 @@ export function useE2EChat({
           msg = JSON.parse(event.data as string) as WireMessage
         } catch { return }
 
-        if (msg.type !== 'message' || !msg.from || !msg.ciphertext || !msg.nonce || !msg.header) return
+        if (
+          msg.type !== 'message' ||
+          !msg.from ||
+          !msg.fromDeviceId ||
+          !msg.ciphertext ||
+          !msg.nonce ||
+          !msg.header
+        ) return
 
         onWireMessageRef.current?.({
           direction:  'received',
@@ -225,13 +291,13 @@ export function useE2EChat({
         })
 
         try {
-          const ratchet = await getOrInitReceiverRatchet(msg.from)
+          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId)
           const text = await ratchet.decrypt({
             header:     msg.header,
             ciphertext: importKey(msg.ciphertext),
             nonce:      importKey(msg.nonce),
           })
-          await saveRatchet(userId, `r:${msg.from}`, ratchet.export())
+          await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
           if (!cancelled) {
             setMessages((prev) => {
               const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
@@ -265,6 +331,10 @@ export function useE2EChat({
         setIsConnecting(true)
         await sodiumReady()
 
+        // Get or create a stable device ID for this browser/device
+        const deviceId = await getOrCreateDeviceId(userId)
+        deviceIdRef.current = deviceId
+
         // Restore or generate a stable key pair for this userId
         const stored = await loadKeyPair(userId)
         if (stored) {
@@ -284,11 +354,15 @@ export function useE2EChat({
 
         if (cancelled) return
 
-        // Register public key with the HTTP server (idempotent upsert)
+        // Register public key + deviceId with the HTTP server (idempotent upsert)
         const regRes = await fetch(`${httpBase}/v1/keys`, {
-          method: 'POST',
+          method:  'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify({ userId, publicKey: exportKey(keyPairRef.current.publicKey) }),
+          body:    JSON.stringify({
+            userId,
+            publicKey: exportKey(keyPairRef.current.publicKey),
+            deviceId,
+          }),
         })
         if (!regRes.ok) throw new Error(`Key registration failed: ${regRes.status}`)
 
@@ -311,9 +385,19 @@ export function useE2EChat({
       socketRef.current = null
       keyPairRef.current = null
       ratchetsRef.current.clear()
+      peerKeyCacheRef.current.clear()
     }
   }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet])
 
+  /**
+   * Encrypts `text` and delivers it to every registered device of `to`.
+   * Each device gets its own Double Ratchet envelope so messages decrypt
+   * independently regardless of which device the recipient opens them on.
+   *
+   * @param to   - Recipient user ID.
+   * @param text - Plaintext message to send.
+   * @throws {Error} If the WebSocket is not connected or the recipient has no keys.
+   */
   const sendMessage = useCallback(
     async (to: string, text: string): Promise<void> => {
       const socket = socketRef.current
@@ -321,23 +405,39 @@ export function useE2EChat({
         throw new Error('WebSocket is not connected. Wait for isReady to be true.')
       }
 
-      const ratchet = await getOrInitSenderRatchet(to)
-      const { header, ciphertext, nonce } = await ratchet.encrypt(text)
-      await saveRatchet(userId, `s:${to}`, ratchet.export())
+      // Fetch all of the recipient's registered devices
+      const peerDevices = await fetchPeerDeviceKeys(to)
+      if (peerDevices.length === 0) {
+        throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
+      }
 
-      const ctB64 = exportKey(ciphertext)
-      const nB64  = exportKey(nonce)
+      // Send one encrypted message per recipient device
+      for (const device of peerDevices) {
+        const ratchet = await getOrInitSenderRatchet(to, device)
+        const { header, ciphertext, nonce } = await ratchet.encrypt(text)
+        await saveRatchet(userId, `s:${to}:${device.deviceId}`, ratchet.export())
 
-      socket.send(JSON.stringify({ type: 'message', to, ciphertext: ctB64, nonce: nB64, header }))
+        const ctB64 = exportKey(ciphertext)
+        const nB64  = exportKey(nonce)
 
-      onWireMessageRef.current?.({
-        direction:  'sent',
-        ciphertext: ctB64,
-        nonce:      nB64,
-        timestamp:  Date.now(),
-      })
+        socket.send(JSON.stringify({
+          type:       'message',
+          to,
+          toDeviceId: device.deviceId,
+          ciphertext: ctB64,
+          nonce:      nB64,
+          header,
+        }))
 
-      // Add sent message to local state and persist so it survives page reloads
+        onWireMessageRef.current?.({
+          direction:  'sent',
+          ciphertext: ctB64,
+          nonce:      nB64,
+          timestamp:  Date.now(),
+        })
+      }
+
+      // Add sent message to local state once (not once per device)
       setMessages((prev) => {
         const next   = [...prev, { from: userId, text, timestamp: Date.now() }]
         const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
@@ -345,7 +445,7 @@ export function useE2EChat({
         return capped
       })
     },
-    [userId, getOrInitSenderRatchet]
+    [userId, fetchPeerDeviceKeys, getOrInitSenderRatchet]
   )
 
   return { messages, isReady, isConnecting, sendMessage, error }
