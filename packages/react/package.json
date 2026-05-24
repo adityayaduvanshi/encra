@@ -1,6 +1,6 @@
 {
   "name": "@encra/react",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "React hook for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
