@@ -25,9 +25,9 @@ Encrypt messages, files, forms, and documents — your server never sees the pla
 | Use case | API | Status |
 |---|---|---|
 | Real-time chat | `useE2EChat()` / `EncraClient` | ✅ Available |
-| Files & media | `useE2EFile()` | 🔜 Coming soon |
-| Form submissions | `useE2EForm()` | 🔜 Coming soon |
-| Database fields | `encryptField()` | 🔜 Coming soon |
+| Files & media | `useE2EFile()` / `client.encryptFile()` | ✅ Available |
+| Form submissions | `useE2EForm()` / `client.encryptFields()` | ✅ Available |
+| Database fields | `encryptField()` | ✅ Available |
 
 ---
 
@@ -205,6 +205,14 @@ client.disconnect()        // close and clean up
 
 // Messaging
 await client.sendMessage(to: string, text: string)
+
+// File encryption (up to 50 MB)
+await client.encryptFile(file: File | Blob, to: string)      // → EncryptedFile
+await client.decryptFile(encrypted: EncryptedFile, from: string)  // → File
+
+// Form field encryption (independent per-field nonces)
+await client.encryptFields(fields: Record<string, string>, to: string)  // → EncryptedFields
+await client.decryptFields(encrypted: EncryptedFields, from: string)     // → Record<string, string>
 
 // State (synchronous reads)
 client.isReady        // boolean

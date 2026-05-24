@@ -22,6 +22,29 @@ export interface Message {
   timestamp: number
 }
 
+/**
+ * An encrypted file produced by `encryptFile`.
+ * Store or transmit all fields together — all are required to decrypt.
+ */
+export interface EncryptedFile {
+  /** XSalsa20-Poly1305 ciphertext of the raw file bytes. */
+  ciphertext: Uint8Array
+  /** Random 24-byte nonce. Must be stored alongside `ciphertext`. */
+  nonce: Uint8Array
+  /** Original filename (e.g. `"photo.jpg"`). Stored as plaintext metadata. */
+  name: string
+  /** MIME type (e.g. `"image/jpeg"`). Stored as plaintext metadata. */
+  mimeType: string
+  /** Original file size in bytes (pre-encryption). */
+  size: number
+}
+
+/**
+ * A map of field names to their encrypted values.
+ * Each field is independently encrypted with a unique random nonce.
+ */
+export type EncryptedFields = Record<string, { ciphertext: string; nonce: string }>
+
 export interface WireEvent {
   direction:  'sent' | 'received'
   ciphertext: string
@@ -68,10 +91,13 @@ interface WireMessage {
   header?:    MessageHeader
 }
 
-const BACKOFF_BASE_MS = 1_000
-const BACKOFF_MAX_MS  = 60_000
-const MAX_MESSAGES    = 200
+const BACKOFF_BASE_MS  = 1_000
+const BACKOFF_MAX_MS   = 60_000
+const MAX_MESSAGES     = 200
 const ENCRA_SERVER_URL = 'https://api.encra.dev'
+
+/** Maximum file size accepted by `encryptFile` (50 MB). */
+export const MAX_FILE_BYTES = 50 * 1024 * 1024
 
 // ── EncraClient ───────────────────────────────────────────────────────────────
 
@@ -108,8 +134,9 @@ export class EncraClient {
   private _isConnecting:boolean     = false
   private _error:       Error|null  = null
 
-  private _keyPair:     KeyPair | null               = null
+  private _keyPair:      KeyPair | null               = null
   private _ratchets:    Map<string, DoubleRatchet>   = new Map()
+  private _peerKeyCache: Map<string, Uint8Array>     = new Map()
   private _socket:      WebSocket | null             = null
   private _retryCount:  number                       = 0
   private _retryTimer:  ReturnType<typeof setTimeout>|null = null
@@ -220,7 +247,219 @@ export class EncraClient {
     this._addMessage({ from: this._userId, text, timestamp: Date.now() })
   }
 
+  /**
+   * Encrypt a `File` or `Blob` for `to` using an X25519 shared secret.
+   * The returned `EncryptedFile` must be transmitted in full to the recipient.
+   * File metadata (`name`, `mimeType`, `size`) is stored in plaintext.
+   *
+   * @param file - The file or blob to encrypt. Must not exceed `MAX_FILE_BYTES`.
+   * @param to   - Recipient's `userId`. They must have registered a public key.
+   * @returns An `EncryptedFile` ready to store or transmit.
+   * @throws {Error} If the client is not connected or the file exceeds `MAX_FILE_BYTES`.
+   *
+   * @example
+   * const enc = await client.encryptFile(file, 'bob')
+   * await uploadToServer(enc)
+   */
+  async encryptFile(file: File | Blob, to: string): Promise<EncryptedFile> {
+    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+    if (file.size > MAX_FILE_BYTES) {
+      throw new Error(
+        `File too large: ${file.size} bytes exceeds the ${MAX_FILE_BYTES}-byte limit.`
+      )
+    }
+
+    const peerPub = await this._fetchPeerPublicKey(to)
+    const bytes   = await EncraClient._readFileBytes(file)
+
+    const { default: sodium } = await import('libsodium-wrappers')
+    await sodium.ready
+
+    const shared     = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+    const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+    const ciphertext = sodium.crypto_secretbox_easy(bytes, nonce, shared)
+
+    return {
+      ciphertext,
+      nonce,
+      name:     file instanceof File ? file.name : 'file',
+      mimeType: file.type || 'application/octet-stream',
+      size:     file.size,
+    }
+  }
+
+  /**
+   * Decrypt an `EncryptedFile` received from `from`.
+   * The inverse of `encryptFile`.
+   *
+   * @param encrypted - The `EncryptedFile` object to decrypt.
+   * @param from      - Sender's `userId`.
+   * @returns The original `File` with its name and MIME type restored.
+   * @throws {DecryptionFailedError} If decryption or authentication fails.
+   *
+   * @example
+   * const file = await client.decryptFile(enc, 'alice')
+   * const url  = URL.createObjectURL(file)
+   */
+  async decryptFile(encrypted: EncryptedFile, from: string): Promise<File> {
+    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+
+    const peerPub = await this._fetchPeerPublicKey(from)
+
+    const { default: sodium } = await import('libsodium-wrappers')
+    await sodium.ready
+
+    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+
+    let plainBytes: Uint8Array | null
+    try {
+      plainBytes = sodium.crypto_secretbox_open_easy(
+        encrypted.ciphertext.slice(),
+        encrypted.nonce.slice(),
+        shared,
+      )
+    } catch {
+      throw new DecryptionFailedError(`decryptFile: decryption failed for file "${encrypted.name}".`)
+    }
+
+    if (!plainBytes) {
+      throw new DecryptionFailedError(`decryptFile: authentication failed for file "${encrypted.name}".`)
+    }
+
+    const buf = plainBytes.buffer.slice(
+      plainBytes.byteOffset,
+      plainBytes.byteOffset + plainBytes.byteLength,
+    ) as ArrayBuffer
+    return new File([buf], encrypted.name, { type: encrypted.mimeType })
+  }
+
+  /**
+   * Encrypt a flat object of string field values for `to`.
+   *
+   * Every field is encrypted independently with a unique random nonce using an
+   * X25519 shared secret. Field names (keys) are **not** encrypted — only the
+   * values are. If you need key privacy, hash the field names before passing them.
+   *
+   * @param fields - Plain object of `{ fieldName: plaintext }`.
+   * @param to     - Recipient's `userId`. They must have registered a public key.
+   * @returns `EncryptedFields` — same keys, values replaced by `{ ciphertext, nonce }`.
+   * @throws {Error} If the client is not connected or `fields` is not a plain object.
+   * @throws {TypeError} If any field value is not a string.
+   *
+   * @example
+   * const payload = await client.encryptFields({ email: 'alice@example.com', ssn: '123-45-6789' }, 'doctor')
+   * await fetch('/api/submit', { method: 'POST', body: JSON.stringify(payload) })
+   */
+  async encryptFields(
+    fields: Record<string, string>,
+    to: string,
+  ): Promise<EncryptedFields> {
+    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+    if (typeof fields !== 'object' || fields === null || Array.isArray(fields)) {
+      throw new TypeError('encryptFields: fields must be a plain object of string values.')
+    }
+
+    const peerPub = await this._fetchPeerPublicKey(to)
+
+    const { default: sodium } = await import('libsodium-wrappers')
+    await sodium.ready
+    const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
+
+    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+
+    const result: EncryptedFields = {}
+
+    for (const [key, value] of Object.entries(fields)) {
+      if (typeof value !== 'string') {
+        throw new TypeError(`encryptFields: field "${key}" must be a string, got ${typeof value}.`)
+      }
+      const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+      const ciphertext = sodium.crypto_secretbox_easy(value, nonce, shared)
+      result[key] = {
+        ciphertext: sodium.to_base64(ciphertext, B64),
+        nonce:      sodium.to_base64(nonce, B64),
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * Decrypt an `EncryptedFields` object received from `from`.
+   * The inverse of `encryptFields`.
+   *
+   * @param encrypted - The object returned by `encryptFields`.
+   * @param from      - Sender's `userId`.
+   * @returns The original `{ fieldName: plaintext }` object.
+   * @throws {DecryptionFailedError} If any field fails to decrypt or has invalid base64.
+   *
+   * @example
+   * const fields = await client.decryptFields(payload, 'patient-userId')
+   * console.log(fields.ssn) // '123-45-6789'
+   */
+  async decryptFields(
+    encrypted: EncryptedFields,
+    from: string,
+  ): Promise<Record<string, string>> {
+    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+
+    const peerPub = await this._fetchPeerPublicKey(from)
+
+    const { default: sodium } = await import('libsodium-wrappers')
+    await sodium.ready
+    const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
+
+    const shared = sodium.crypto_scalarmult(this._keyPair.privateKey.slice(), peerPub.slice())
+
+    const result: Record<string, string> = {}
+
+    for (const [key, { ciphertext, nonce }] of Object.entries(encrypted)) {
+      let ctBytes: Uint8Array
+      let nonceBytes: Uint8Array
+      try {
+        ctBytes    = sodium.from_base64(ciphertext, B64)
+        nonceBytes = sodium.from_base64(nonce, B64)
+      } catch {
+        throw new DecryptionFailedError(`decryptFields: invalid base64 for field "${key}".`)
+      }
+
+      let plainBytes: Uint8Array | null
+      try {
+        plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
+      } catch {
+        throw new DecryptionFailedError(`decryptFields: decryption failed for field "${key}".`)
+      }
+
+      if (!plainBytes) {
+        throw new DecryptionFailedError(`decryptFields: authentication failed for field "${key}".`)
+      }
+
+      result[key] = sodium.to_string(plainBytes)
+    }
+
+    return result
+  }
+
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  // ── Static helpers ────────────────────────────────────────────────────────
+
+  /**
+   * Read a `File` or `Blob` into a `Uint8Array`.
+   * Falls back to `FileReader` when `Blob.arrayBuffer()` is unavailable
+   * (jsdom < 25, some older browsers, React Native).
+   */
+  private static _readFileBytes(file: File | Blob): Promise<Uint8Array> {
+    if (typeof file.arrayBuffer === 'function') {
+      return file.arrayBuffer().then((buf) => new Uint8Array(buf))
+    }
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload  = () => resolve(new Uint8Array(reader.result as ArrayBuffer))
+      reader.onerror = () => reject(reader.error ?? new Error('FileReader error'))
+      reader.readAsArrayBuffer(file)
+    })
+  }
 
   private _setReady(v: boolean)      { this._isReady      = v; if (v) this._emit('ready') }
   private _setConnecting(v: boolean) { this._isConnecting = v; if (v) this._emit('connecting') }
@@ -233,6 +472,9 @@ export class EncraClient {
   }
 
   private async _fetchPeerPublicKey(peerId: string): Promise<Uint8Array> {
+    const cached = this._peerKeyCache.get(peerId)
+    if (cached) return cached
+
     const res = await fetch(`${this._httpBase}/v1/keys/${peerId}`, {
       headers: { Authorization: `Bearer ${this._apiKey}` },
     })
@@ -243,7 +485,9 @@ export class EncraClient {
       )
     }
     const { publicKey: pubB64 } = (await res.json()) as { publicKey: string }
-    return importKey(pubB64)
+    const key = importKey(pubB64)
+    this._peerKeyCache.set(peerId, key)
+    return key
   }
 
   private async _getOrInitSenderRatchet(peerId: string): Promise<DoubleRatchet> {
