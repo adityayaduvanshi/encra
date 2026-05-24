@@ -1,6 +1,6 @@
 {
   "name": "@encra/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Framework-agnostic vanilla JS client for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
@@ -31,7 +31,7 @@
     ".": {
       "require": "./dist/index.js",
       "default": "./dist/index.js",
-      "types":   "./dist/index.d.ts"
+      "types": "./dist/index.d.ts"
     }
   },
   "files": [
@@ -40,20 +40,20 @@
     "README.md"
   ],
   "scripts": {
-    "build":          "tsc",
+    "build": "tsc",
     "prepublishOnly": "npm run build && npm test",
-    "test":           "vitest run --coverage",
-    "test:watch":     "vitest"
+    "test": "vitest run --coverage",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@encra/core": "^0.1.1",
-    "idb":         "^8.0.3"
+    "idb": "^8.0.3"
   },
   "devDependencies": {
-    "@types/node":         "^20.0.0",
+    "@types/node": "^20.0.0",
     "@vitest/coverage-v8": "^1.0.0",
-    "jsdom":               "^24.0.0",
-    "typescript":          "^5.4.0",
-    "vitest":              "^1.0.0"
+    "jsdom": "^24.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.0.0"
   }
 }

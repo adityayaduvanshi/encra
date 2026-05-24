@@ -6,6 +6,9 @@ export { deriveSharedSecret } from './crypto/keyExchange.js'
 export { encrypt, decrypt } from './crypto/encrypt.js'
 export type { EncryptedMessage } from './crypto/encrypt.js'
 
+export { encryptField, decryptField, generateFieldKey } from './crypto/field.js'
+export type { EncryptedField } from './crypto/field.js'
+
 export { generateFingerprint } from './crypto/fingerprint.js'
 
 export { DoubleRatchet, MAX_SKIP_KEYS, RATCHET_VERSION } from './crypto/ratchet.js'

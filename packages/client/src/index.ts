@@ -1,2 +1,2 @@
-export { EncraClient } from './EncraClient.js'
-export type { Message, WireEvent, EncraClientOptions } from './EncraClient.js'
+export { EncraClient, MAX_FILE_BYTES } from './EncraClient.js'
+export type { Message, WireEvent, EncraClientOptions, EncryptedFile, EncryptedFields } from './EncraClient.js'

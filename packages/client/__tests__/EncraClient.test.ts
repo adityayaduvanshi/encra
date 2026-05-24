@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
-import { EncraClient } from '../src/EncraClient.js'
+import { EncraClient, MAX_FILE_BYTES } from '../src/EncraClient.js'
+import type { EncryptedFile, EncryptedFields } from '../src/EncraClient.js'
 import * as ratchetStore from '../src/ratchetStore.js'
 import { sodiumReady, generateKeyPair, exportKey, DoubleRatchet } from '@encra/core'
 
@@ -305,5 +306,203 @@ describe('EncraClient', () => {
 
     expect(onReady).not.toHaveBeenCalled()
     client.disconnect()
+  })
+
+  // ── encryptFile / decryptFile ─────────────────────────────────────────────
+
+  async function makeConnectedPair(
+    aliceId: string,
+    bobId: string,
+  ): Promise<[EncraClient, EncraClient, () => void]> {
+    setupMocks()
+    const aliceKP = await generateKeyPair()
+    const bobKP   = await generateKeyPair()
+
+    // Pre-populate keyStore so each client can fetch the other's key
+    keyStore.set(aliceId, exportKey(aliceKP.publicKey))
+    keyStore.set(bobId,   exportKey(bobKP.publicKey))
+
+    // Stub IDB so each client loads the pre-generated key pair
+    vi.spyOn(ratchetStore, 'loadKeyPair').mockImplementation(async (uid) => {
+      if (uid === aliceId) return { pub: exportKey(aliceKP.publicKey), priv: exportKey(aliceKP.privateKey) }
+      if (uid === bobId)   return { pub: exportKey(bobKP.publicKey),   priv: exportKey(bobKP.privateKey) }
+      return null
+    })
+    vi.spyOn(ratchetStore, 'saveKeyPair').mockResolvedValue()
+
+    const alice = new EncraClient({ apiKey: 'test-key', userId: aliceId, serverUrl: 'http://localhost:3000' })
+    const bob   = new EncraClient({ apiKey: 'test-key', userId: bobId,   serverUrl: 'http://localhost:3000' })
+
+    await alice.connect()
+    await new Promise((r) => setTimeout(r, 100))
+    await bob.connect()
+    await new Promise((r) => setTimeout(r, 100))
+
+    return [alice, bob, () => { alice.disconnect(); bob.disconnect() }]
+  }
+
+  it('encryptFile → decryptFile round-trips a text file', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('ef-alice', 'ef-bob')
+
+    const file = new File(['Hello from EncraClient!'], 'hello.txt', { type: 'text/plain' })
+    const enc  = await alice.encryptFile(file, 'ef-bob')
+
+    expect(enc.name).toBe('hello.txt')
+    expect(enc.mimeType).toBe('text/plain')
+    expect(enc.size).toBe(file.size)
+    expect(enc.ciphertext).toBeInstanceOf(Uint8Array)
+    expect(enc.nonce).toBeInstanceOf(Uint8Array)
+
+    const decrypted = await bob.decryptFile(enc, 'ef-alice')
+    const text = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload  = () => resolve(reader.result as string)
+      reader.onerror = () => reject(reader.error)
+      reader.readAsText(decrypted)
+    })
+    expect(text).toBe('Hello from EncraClient!')
+    expect(decrypted.name).toBe('hello.txt')
+    expect(decrypted.type).toBe('text/plain')
+
+    cleanup()
+  })
+
+  it('encryptFile uses default name "file" for a plain Blob', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ef-blob-alice', 'ef-blob-bob')
+
+    const blob = new Blob(['data'], { type: 'application/octet-stream' })
+    const enc  = await alice.encryptFile(blob, 'ef-blob-bob')
+
+    expect(enc.name).toBe('file')
+    expect(enc.mimeType).toBe('application/octet-stream')
+    cleanup()
+  })
+
+  it('encryptFile throws if file exceeds MAX_FILE_BYTES', async () => {
+    setupMocks()
+    const client = new EncraClient({ apiKey: 'test-key', userId: 'ef-big', serverUrl: 'http://localhost:3000' })
+    await client.connect()
+    await new Promise((r) => setTimeout(r, 100))
+
+    const bigFile = { size: MAX_FILE_BYTES + 1, type: 'text/plain', arrayBuffer: vi.fn() } as unknown as File
+    await expect(client.encryptFile(bigFile, 'anyone')).rejects.toThrow('too large')
+    client.disconnect()
+  })
+
+  it('encryptFile throws when recipient key is not found (404)', async () => {
+    setupMocks()
+    const client = new EncraClient({ apiKey: 'test-key', userId: 'ef-404', serverUrl: 'http://localhost:3000' })
+    await client.connect()
+    await new Promise((r) => setTimeout(r, 100))
+
+    const file = new File(['data'], 'f.txt')
+    await expect(client.encryptFile(file, 'ghost')).rejects.toThrow("Could not fetch public key for 'ghost'")
+    client.disconnect()
+  })
+
+  it('decryptFile throws on tampered ciphertext', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('ef-tamper-alice', 'ef-tamper-bob')
+
+    const file = new File(['secret'], 'secret.txt', { type: 'text/plain' })
+    const enc  = await alice.encryptFile(file, 'ef-tamper-bob')
+
+    const tampered: EncryptedFile = { ...enc, ciphertext: new Uint8Array(enc.ciphertext.length).fill(0xff) }
+    await expect(bob.decryptFile(tampered, 'ef-tamper-alice')).rejects.toThrow()
+
+    cleanup()
+  })
+
+  it('encryptFile caches peer public key (only fetches once)', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ef-cache-alice', 'ef-cache-bob')
+
+    const fetchMock = vi.mocked(globalThis.fetch as ReturnType<typeof vi.fn>)
+    const file = new File(['a'], 'a.txt')
+    await alice.encryptFile(file, 'ef-cache-bob')
+    await alice.encryptFile(file, 'ef-cache-bob')
+
+    const keyFetches = fetchMock.mock.calls.filter(
+      (c) => typeof c[0] === 'string' && (c[0] as string).includes('/v1/keys/ef-cache-bob')
+    )
+    expect(keyFetches.length).toBe(1)
+    cleanup()
+  })
+
+  it('throws when encryptFile called before connect()', async () => {
+    setupMocks()
+    const client = new EncraClient({ apiKey: 'test-key', userId: 'ef-nc', serverUrl: 'http://localhost:3000' })
+    const file = new File(['x'], 'x.txt')
+    await expect(client.encryptFile(file, 'other')).rejects.toThrow('not connected')
+  })
+
+  // ── encryptFields / decryptFields ─────────────────────────────────────────
+
+  it('encryptFields → decryptFields round-trips all field values', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('ef2-alice', 'ef2-bob')
+
+    const fields = { name: 'Alice Smith', ssn: '123-45-6789', notes: 'Private notes 🔐' }
+    const enc    = await alice.encryptFields(fields, 'ef2-bob')
+
+    expect(Object.keys(enc)).toEqual(['name', 'ssn', 'notes'])
+    for (const key of Object.keys(fields) as (keyof typeof fields)[]) {
+      expect(enc[key]).toHaveProperty('ciphertext')
+      expect(enc[key]).toHaveProperty('nonce')
+      expect(enc[key]!.ciphertext).not.toContain(fields[key])
+    }
+
+    // Each field gets a unique nonce
+    const nonces = Object.values(enc).map((v) => v.nonce)
+    expect(new Set(nonces).size).toBe(nonces.length)
+
+    const decrypted = await bob.decryptFields(enc, 'ef2-alice')
+    expect(decrypted).toEqual(fields)
+
+    cleanup()
+  })
+
+  it('encryptFields handles empty object', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ef2-empty-alice', 'ef2-empty-bob')
+
+    const enc = await alice.encryptFields({}, 'ef2-empty-bob')
+    expect(enc).toEqual({})
+    cleanup()
+  })
+
+  it('encryptFields produces unique ciphertexts on repeated calls (fresh nonce)', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ef2-nonce-alice', 'ef2-nonce-bob')
+
+    const enc1 = await alice.encryptFields({ secret: 'same' }, 'ef2-nonce-bob')
+    const enc2 = await alice.encryptFields({ secret: 'same' }, 'ef2-nonce-bob')
+
+    expect(enc1.secret!.ciphertext).not.toBe(enc2.secret!.ciphertext)
+    expect(enc1.secret!.nonce).not.toBe(enc2.secret!.nonce)
+    cleanup()
+  })
+
+  it('decryptFields throws on tampered ciphertext', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('ef2-tamper-a', 'ef2-tamper-b')
+
+    const enc     = await alice.encryptFields({ x: 'value' }, 'ef2-tamper-b')
+    const tampered: EncryptedFields = {
+      ...enc,
+      x: { ...enc.x!, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+    }
+    await expect(bob.decryptFields(tampered, 'ef2-tamper-a')).rejects.toThrow()
+    cleanup()
+  })
+
+  it('encryptFields throws if a field value is not a string', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ef2-type-alice', 'ef2-type-bob')
+
+    await expect(
+      // @ts-expect-error — intentional runtime type check
+      alice.encryptFields({ age: 42 }, 'ef2-type-bob')
+    ).rejects.toThrow('must be a string')
+    cleanup()
+  })
+
+  it('throws when encryptFields called before connect()', async () => {
+    setupMocks()
+    const client = new EncraClient({ apiKey: 'test-key', userId: 'ef2-nc', serverUrl: 'http://localhost:3000' })
+    await expect(client.encryptFields({ x: 'y' }, 'other')).rejects.toThrow('not connected')
   })
 })
