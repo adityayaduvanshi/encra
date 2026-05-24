@@ -1,6 +1,6 @@
 {
   "name": "@encra/client",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Framework-agnostic vanilla JS client for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",

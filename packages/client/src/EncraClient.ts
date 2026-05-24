@@ -12,6 +12,7 @@ import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
+  getOrCreateDeviceId,
 } from './ratchetStore.js'
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -23,27 +24,53 @@ export interface Message {
 }
 
 /**
- * An encrypted file produced by `encryptFile`.
- * Store or transmit all fields together — all are required to decrypt.
+ * A single device's public key entry.
+ * Returned by `GET /v1/keys/:userId` as an array (one entry per registered device).
  */
-export interface EncryptedFile {
-  /** XSalsa20-Poly1305 ciphertext of the raw file bytes. */
-  ciphertext: Uint8Array
-  /** Random 24-byte nonce. Must be stored alongside `ciphertext`. */
-  nonce: Uint8Array
-  /** Original filename (e.g. `"photo.jpg"`). Stored as plaintext metadata. */
-  name: string
-  /** MIME type (e.g. `"image/jpeg"`). Stored as plaintext metadata. */
-  mimeType: string
-  /** Original file size in bytes (pre-encryption). */
-  size: number
+export interface DeviceKey {
+  /** Stable UUID generated once per browser/device, stored in IndexedDB. */
+  deviceId:  string
+  publicKey: Uint8Array
 }
 
 /**
- * A map of field names to their encrypted values.
- * Each field is independently encrypted with a unique random nonce.
+ * An encrypted file produced by `encryptFile`.
+ * Contains one encrypted copy per recipient device.
+ * Transmit the entire object — the recipient's device picks its own entry.
  */
-export type EncryptedFields = Record<string, { ciphertext: string; nonce: string }>
+export interface EncryptedFile {
+  /** Original filename (e.g. `"photo.jpg"`). Stored as plaintext metadata. */
+  name:     string
+  /** MIME type (e.g. `"image/jpeg"`). Stored as plaintext metadata. */
+  mimeType: string
+  /** Original file size in bytes (pre-encryption). */
+  size:     number
+  /**
+   * One encrypted copy per registered device of the recipient.
+   * Each entry uses a unique nonce.
+   */
+  devices: Array<{
+    /** Matches the recipient device's `deviceId` in IndexedDB. */
+    deviceId:   string
+    ciphertext: Uint8Array
+    nonce:      Uint8Array
+  }>
+}
+
+/**
+ * Encrypted form fields produced by `encryptFields`.
+ * Contains one independently-encrypted copy per recipient device.
+ */
+export interface EncryptedFields {
+  /**
+   * One encrypted copy per registered device of the recipient.
+   * Each device entry has independent per-field nonces.
+   */
+  devices: Array<{
+    deviceId: string
+    fields:   Record<string, { ciphertext: string; nonce: string }>
+  }>
+}
 
 export interface WireEvent {
   direction:  'sent' | 'received'
@@ -62,20 +89,11 @@ export interface EncraClientOptions {
 // ── Typed event map ───────────────────────────────────────────────────────────
 
 interface EventMap {
-  /** WebSocket is open and the client is registered. */
   ready:        []
-  /** Connecting for the first time or after a disconnect. */
   connecting:   []
-  /** WebSocket closed; automatic reconnect is scheduled. */
   disconnected: []
-  /** A new decrypted message arrived. */
   message:      [msg: Message]
-  /**
-   * A recoverable error occurred (decryption failure, WS error).
-   * Fatal init errors are thrown by `connect()` instead.
-   */
   error:        [err: Error]
-  /** Raw wire data for every encrypted send/receive. Useful for debugging. */
   wire:         [event: WireEvent]
 }
 
@@ -84,11 +102,12 @@ type Listener<K extends keyof EventMap> = (...args: EventMap[K]) => void
 // ── Internal wire shape ───────────────────────────────────────────────────────
 
 interface WireMessage {
-  type:       string
-  from?:      string
-  ciphertext?: string
-  nonce?:     string
-  header?:    MessageHeader
+  type:          string
+  from?:         string
+  fromDeviceId?: string
+  ciphertext?:   string
+  nonce?:        string
+  header?:       MessageHeader
 }
 
 const BACKOFF_BASE_MS  = 1_000
@@ -102,46 +121,38 @@ export const MAX_FILE_BYTES = 50 * 1024 * 1024
 // ── EncraClient ───────────────────────────────────────────────────────────────
 
 /**
- * Framework-agnostic Encra client.
+ * Framework-agnostic Encra client with multi-device support.
  *
- * Generates (or restores from IndexedDB) a key pair on `connect()`, registers
- * it with the server, and opens a WebSocket relay. All Double Ratchet
- * encryption/decryption is handled internally. State is persisted to IndexedDB
- * so conversations survive page reloads. The WebSocket reconnects automatically
- * with exponential backoff.
- *
- * Works in any JS environment — React, Vue, Svelte, Angular, vanilla JS,
- * Node.js. For React, prefer the `useE2EChat` hook from `@encra/react` which
- * wraps this client.
+ * Each browser/device gets a stable `deviceId` stored in IndexedDB.
+ * When sending to a recipient, encrypts once per registered device so all
+ * their devices can decrypt. Ratchet state is per-device-pair so sessions
+ * are fully independent across devices.
  *
  * @example
  * const client = new EncraClient({ apiKey: 'e2e_live_xxx', userId: 'alice' })
- *
  * client.on('message', (msg) => console.log(msg.from, msg.text))
  * client.on('ready',   ()    => console.log('connected'))
- *
  * await client.connect()
  * await client.sendMessage('bob', 'hello!')
- *
- * // Later:
  * client.disconnect()
  */
 export class EncraClient {
   // ── State ─────────────────────────────────────────────────────────────────
 
-  private _messages:    Message[]   = []
-  private _isReady:     boolean     = false
-  private _isConnecting:boolean     = false
-  private _error:       Error|null  = null
+  private _messages:     Message[]  = []
+  private _isReady:      boolean    = false
+  private _isConnecting: boolean    = false
+  private _error:        Error|null = null
 
-  private _keyPair:      KeyPair | null               = null
-  private _ratchets:    Map<string, DoubleRatchet>   = new Map()
-  private _peerKeyCache: Map<string, Uint8Array>     = new Map()
-  private _socket:      WebSocket | null             = null
-  private _retryCount:  number                       = 0
-  private _retryTimer:  ReturnType<typeof setTimeout>|null = null
-  private _cancelled:   boolean                      = false
-  private _connected:   boolean                      = false
+  private _keyPair:      KeyPair | null                = null
+  private _deviceId:     string | null                 = null
+  private _ratchets:     Map<string, DoubleRatchet>    = new Map()
+  private _peerKeyCache: Map<string, DeviceKey[]>      = new Map()
+  private _socket:       WebSocket | null              = null
+  private _retryCount:   number                        = 0
+  private _retryTimer:   ReturnType<typeof setTimeout>|null = null
+  private _cancelled:    boolean                       = false
+  private _connected:    boolean                       = false
 
   private readonly _listeners = new Map<string, Listener<keyof EventMap>[]>()
 
@@ -161,11 +172,12 @@ export class EncraClient {
 
   // ── Getters ───────────────────────────────────────────────────────────────
 
-  get isReady():      boolean   { return this._isReady }
-  get isConnecting(): boolean   { return this._isConnecting }
-  get error():        Error|null{ return this._error }
-  /** Snapshot of all messages (sent + received), newest last. */
-  get messages():     Message[] { return this._messages }
+  get isReady():      boolean    { return this._isReady }
+  get isConnecting(): boolean    { return this._isConnecting }
+  get error():        Error|null { return this._error }
+  get messages():     Message[]  { return this._messages }
+  /** This device's stable ID (available after `connect()` resolves). */
+  get deviceId():     string | null { return this._deviceId }
 
   // ── Typed event emitter ───────────────────────────────────────────────────
 
@@ -192,22 +204,12 @@ export class EncraClient {
 
   // ── Public API ────────────────────────────────────────────────────────────
 
-  /**
-   * Initialise crypto, register the public key, and open the WebSocket.
-   * Resolves when the WebSocket is open and the client is registered.
-   * Throws on fatal errors (e.g. key registration fails).
-   * After the first connection, automatic reconnect is managed internally.
-   */
   async connect(): Promise<void> {
     if (this._connected) return
     this._connected = true
     await this._init()
   }
 
-  /**
-   * Close the connection and cancel any pending reconnects.
-   * After calling this the instance should not be reused.
-   */
   disconnect(): void {
     this._cancelled = true
     if (this._retryTimer) clearTimeout(this._retryTimer)
@@ -220,46 +222,41 @@ export class EncraClient {
   }
 
   /**
-   * Encrypt `text` and send it to `to`.
-   * Throws if the WebSocket is not currently open.
-   *
-   * @param to   - Recipient's userId.
-   * @param text - Plaintext message.
+   * Encrypt `text` and send it to all registered devices of `to`.
+   * Throws if the WebSocket is not open.
    */
   async sendMessage(to: string, text: string): Promise<void> {
     if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       throw new Error('Not connected. Wait for the "ready" event before sending.')
     }
 
-    const ratchet = await this._getOrInitSenderRatchet(to)
-    const { header, ciphertext, nonce } = await ratchet.encrypt(text)
-    await saveRatchet(this._userId, `s:${to}`, ratchet.export())
+    const peerDevices = await this._fetchPeerDeviceKeys(to)
 
-    const ctB64 = exportKey(ciphertext)
-    const nB64  = exportKey(nonce)
+    for (const device of peerDevices) {
+      const ratchet     = await this._getOrInitSenderRatchet(to, device)
+      const { header, ciphertext, nonce } = await ratchet.encrypt(text)
+      await saveRatchet(this._userId, `s:${to}:${device.deviceId}`, ratchet.export())
 
-    this._socket.send(JSON.stringify({
-      type: 'message', to, ciphertext: ctB64, nonce: nB64, header,
-    }))
+      const ctB64 = exportKey(ciphertext)
+      const nB64  = exportKey(nonce)
 
-    this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
+      this._socket.send(JSON.stringify({
+        type: 'message', to, toDeviceId: device.deviceId,
+        ciphertext: ctB64, nonce: nB64, header,
+      }))
+
+      this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
+    }
 
     this._addMessage({ from: this._userId, text, timestamp: Date.now() })
   }
 
   /**
-   * Encrypt a `File` or `Blob` for `to` using an X25519 shared secret.
-   * The returned `EncryptedFile` must be transmitted in full to the recipient.
-   * File metadata (`name`, `mimeType`, `size`) is stored in plaintext.
+   * Encrypt a `File` or `Blob` for all registered devices of `to`.
+   * Returns an `EncryptedFile` with one encrypted copy per device.
+   * The recipient's device automatically picks its own copy when decrypting.
    *
-   * @param file - The file or blob to encrypt. Must not exceed `MAX_FILE_BYTES`.
-   * @param to   - Recipient's `userId`. They must have registered a public key.
-   * @returns An `EncryptedFile` ready to store or transmit.
-   * @throws {Error} If the client is not connected or the file exceeds `MAX_FILE_BYTES`.
-   *
-   * @example
-   * const enc = await client.encryptFile(file, 'bob')
-   * await uploadToServer(enc)
+   * @throws {RangeError} If the file exceeds `MAX_FILE_BYTES` (50 MB).
    */
   async encryptFile(file: File | Blob, to: string): Promise<EncryptedFile> {
     if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
@@ -269,84 +266,84 @@ export class EncraClient {
       )
     }
 
-    const peerPub = await this._fetchPeerPublicKey(to)
-    const bytes   = await EncraClient._readFileBytes(file)
+    const peerDevices = await this._fetchPeerDeviceKeys(to)
+    const bytes       = await EncraClient._readFileBytes(file)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    // crypto_box_beforenm = crypto_scalarmult + HSalsa20 key derivation.
-    // This produces a key suitable for crypto_secretbox (unlike raw scalarmult output).
-    const shared     = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
-    const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
-    const ciphertext = sodium.crypto_secretbox_easy(bytes, nonce, shared)
+    const deviceEntries: EncryptedFile['devices'] = []
+
+    for (const device of peerDevices) {
+      const shared     = sodium.crypto_box_beforenm(device.publicKey.slice(), this._keyPair.privateKey.slice())
+      const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+      const ciphertext = sodium.crypto_secretbox_easy(bytes, nonce, shared)
+      deviceEntries.push({ deviceId: device.deviceId, ciphertext, nonce })
+    }
 
     return {
-      ciphertext,
-      nonce,
       name:     file instanceof File ? file.name : 'file',
       mimeType: file.type || 'application/octet-stream',
       size:     file.size,
+      devices:  deviceEntries,
     }
   }
 
   /**
    * Decrypt an `EncryptedFile` received from `from`.
-   * The inverse of `encryptFile`.
+   * Automatically selects the entry encrypted for this device.
    *
-   * @param encrypted - The `EncryptedFile` object to decrypt.
-   * @param from      - Sender's `userId`.
-   * @returns The original `File` with its name and MIME type restored.
-   * @throws {DecryptionFailedError} If decryption or authentication fails.
-   *
-   * @example
-   * const file = await client.decryptFile(enc, 'alice')
-   * const url  = URL.createObjectURL(file)
+   * @throws {DecryptionFailedError} If no entry matches this device or decryption fails.
    */
   async decryptFile(encrypted: EncryptedFile, from: string): Promise<File> {
-    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+    if (!this._keyPair || !this._deviceId) {
+      throw new Error('EncraClient is not connected. Call connect() first.')
+    }
 
-    const peerPub = await this._fetchPeerPublicKey(from)
+    const entry = encrypted.devices.find((d) => d.deviceId === this._deviceId)
+    if (!entry) {
+      throw new DecryptionFailedError(
+        `decryptFile: no entry found for this device (${this._deviceId}).`
+      )
+    }
+
+    const peerDevices = await this._fetchPeerDeviceKeys(from)
+    const senderDevice = peerDevices.find((d) => d.publicKey) ?? peerDevices[0]
+    if (!senderDevice) {
+      throw new DecryptionFailedError(`decryptFile: could not fetch sender key for '${from}'.`)
+    }
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
 
-    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
-
-    let plainBytes: Uint8Array
-    try {
-      plainBytes = sodium.crypto_secretbox_open_easy(
-        encrypted.ciphertext.slice(),
-        encrypted.nonce.slice(),
-        shared,
-      )
-    } catch {
-      throw new DecryptionFailedError(`decryptFile: decryption failed for file "${encrypted.name}".`)
+    // Try each sender device key until one decrypts successfully
+    for (const senderDev of peerDevices) {
+      const shared = sodium.crypto_box_beforenm(senderDev.publicKey.slice(), this._keyPair.privateKey.slice())
+      let plainBytes: Uint8Array
+      try {
+        plainBytes = sodium.crypto_secretbox_open_easy(
+          entry.ciphertext.slice(),
+          entry.nonce.slice(),
+          shared,
+        )
+      } catch {
+        continue
+      }
+      const buf = plainBytes.buffer.slice(
+        plainBytes.byteOffset,
+        plainBytes.byteOffset + plainBytes.byteLength,
+      ) as ArrayBuffer
+      return new File([buf], encrypted.name, { type: encrypted.mimeType })
     }
 
-    const buf = plainBytes.buffer.slice(
-      plainBytes.byteOffset,
-      plainBytes.byteOffset + plainBytes.byteLength,
-    ) as ArrayBuffer
-    return new File([buf], encrypted.name, { type: encrypted.mimeType })
+    throw new DecryptionFailedError(`decryptFile: decryption failed for file "${encrypted.name}".`)
   }
 
   /**
-   * Encrypt a flat object of string field values for `to`.
+   * Encrypt a flat object of string field values for all registered devices of `to`.
+   * Each device gets independently encrypted fields with unique random nonces.
    *
-   * Every field is encrypted independently with a unique random nonce using an
-   * X25519 shared secret. Field names (keys) are **not** encrypted — only the
-   * values are. If you need key privacy, hash the field names before passing them.
-   *
-   * @param fields - Plain object of `{ fieldName: plaintext }`.
-   * @param to     - Recipient's `userId`. They must have registered a public key.
-   * @returns `EncryptedFields` — same keys, values replaced by `{ ciphertext, nonce }`.
-   * @throws {Error} If the client is not connected or `fields` is not a plain object.
    * @throws {TypeError} If any field value is not a string.
-   *
-   * @example
-   * const payload = await client.encryptFields({ email: 'alice@example.com', ssn: '123-45-6789' }, 'doctor')
-   * await fetch('/api/submit', { method: 'POST', body: JSON.stringify(payload) })
    */
   async encryptFields(
     fields: Record<string, string>,
@@ -357,92 +354,95 @@ export class EncraClient {
       throw new TypeError('encryptFields: fields must be a plain object of string values.')
     }
 
-    const peerPub = await this._fetchPeerPublicKey(to)
+    const peerDevices = await this._fetchPeerDeviceKeys(to)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
     const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
 
-    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
+    const deviceEntries: EncryptedFields['devices'] = []
 
-    const result: EncryptedFields = {}
+    for (const device of peerDevices) {
+      const shared  = sodium.crypto_box_beforenm(device.publicKey.slice(), this._keyPair.privateKey.slice())
+      const encryptedFields: Record<string, { ciphertext: string; nonce: string }> = {}
 
-    for (const [key, value] of Object.entries(fields)) {
-      if (typeof value !== 'string') {
-        throw new TypeError(`encryptFields: field "${key}" must be a string, got ${typeof value}.`)
+      for (const [key, value] of Object.entries(fields)) {
+        if (typeof value !== 'string') {
+          throw new TypeError(`encryptFields: field "${key}" must be a string, got ${typeof value}.`)
+        }
+        const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+        const ciphertext = sodium.crypto_secretbox_easy(value, nonce, shared)
+        encryptedFields[key] = {
+          ciphertext: sodium.to_base64(ciphertext, B64),
+          nonce:      sodium.to_base64(nonce, B64),
+        }
       }
-      const nonce      = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
-      const ciphertext = sodium.crypto_secretbox_easy(value, nonce, shared)
-      result[key] = {
-        ciphertext: sodium.to_base64(ciphertext, B64),
-        nonce:      sodium.to_base64(nonce, B64),
-      }
+
+      deviceEntries.push({ deviceId: device.deviceId, fields: encryptedFields })
     }
 
-    return result
+    return { devices: deviceEntries }
   }
 
   /**
    * Decrypt an `EncryptedFields` object received from `from`.
-   * The inverse of `encryptFields`.
+   * Automatically selects the entry encrypted for this device.
    *
-   * @param encrypted - The object returned by `encryptFields`.
-   * @param from      - Sender's `userId`.
-   * @returns The original `{ fieldName: plaintext }` object.
-   * @throws {DecryptionFailedError} If any field fails to decrypt or has invalid base64.
-   *
-   * @example
-   * const fields = await client.decryptFields(payload, 'patient-userId')
-   * console.log(fields.ssn) // '123-45-6789'
+   * @throws {DecryptionFailedError} If no entry matches this device or any field fails to decrypt.
    */
   async decryptFields(
     encrypted: EncryptedFields,
     from: string,
   ): Promise<Record<string, string>> {
-    if (!this._keyPair) throw new Error('EncraClient is not connected. Call connect() first.')
+    if (!this._keyPair || !this._deviceId) {
+      throw new Error('EncraClient is not connected. Call connect() first.')
+    }
 
-    const peerPub = await this._fetchPeerPublicKey(from)
+    const entry = encrypted.devices.find((d) => d.deviceId === this._deviceId)
+    if (!entry) {
+      throw new DecryptionFailedError(
+        `decryptFields: no entry found for this device (${this._deviceId}).`
+      )
+    }
+
+    const peerDevices = await this._fetchPeerDeviceKeys(from)
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
     const B64 = sodium.base64_variants.URLSAFE_NO_PADDING
 
-    const shared = sodium.crypto_box_beforenm(peerPub.slice(), this._keyPair.privateKey.slice())
+    // Try each sender device key
+    for (const senderDev of peerDevices) {
+      const shared  = sodium.crypto_box_beforenm(senderDev.publicKey.slice(), this._keyPair.privateKey.slice())
+      const result: Record<string, string> = {}
+      let allOk = true
 
-    const result: Record<string, string> = {}
-
-    for (const [key, { ciphertext, nonce }] of Object.entries(encrypted)) {
-      let ctBytes: Uint8Array
-      let nonceBytes: Uint8Array
-      try {
-        ctBytes    = sodium.from_base64(ciphertext, B64)
-        nonceBytes = sodium.from_base64(nonce, B64)
-      } catch {
-        throw new DecryptionFailedError(`decryptFields: invalid base64 for field "${key}".`)
+      for (const [key, { ciphertext, nonce }] of Object.entries(entry.fields)) {
+        let ctBytes: Uint8Array
+        let nonceBytes: Uint8Array
+        try {
+          ctBytes    = sodium.from_base64(ciphertext, B64)
+          nonceBytes = sodium.from_base64(nonce, B64)
+        } catch {
+          allOk = false; break
+        }
+        let plainBytes: Uint8Array
+        try {
+          plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
+        } catch {
+          allOk = false; break
+        }
+        result[key] = sodium.to_string(plainBytes)
       }
 
-      let plainBytes: Uint8Array
-      try {
-        plainBytes = sodium.crypto_secretbox_open_easy(ctBytes, nonceBytes, shared)
-      } catch {
-        throw new DecryptionFailedError(`decryptFields: decryption failed for field "${key}".`)
-      }
-
-      result[key] = sodium.to_string(plainBytes)
+      if (allOk) return result
     }
 
-    return result
+    throw new DecryptionFailedError('decryptFields: decryption failed — wrong key or tampered data.')
   }
 
   // ── Private helpers ───────────────────────────────────────────────────────
 
-  // ── Static helpers ────────────────────────────────────────────────────────
-
-  /**
-   * Read a `File` or `Blob` into a `Uint8Array`.
-   * Falls back to `FileReader` when `Blob.arrayBuffer()` is unavailable
-   * (jsdom < 25, some older browsers, React Native).
-   */
   private static _readFileBytes(file: File | Blob): Promise<Uint8Array> {
     if (typeof file.arrayBuffer === 'function') {
       return file.arrayBuffer().then((buf) => new Uint8Array(buf))
@@ -465,7 +465,8 @@ export class EncraClient {
     this._emit('message', msg)
   }
 
-  private async _fetchPeerPublicKey(peerId: string): Promise<Uint8Array> {
+  /** Fetch all device keys for a peer, with in-memory caching. */
+  private async _fetchPeerDeviceKeys(peerId: string): Promise<DeviceKey[]> {
     const cached = this._peerKeyCache.get(peerId)
     if (cached) return cached
 
@@ -474,55 +475,66 @@ export class EncraClient {
     })
     if (!res.ok) {
       throw new Error(
-        `Could not fetch public key for '${peerId}': ${res.status}. ` +
+        `Could not fetch public keys for '${peerId}': ${res.status}. ` +
         `Make sure ${peerId} has registered.`
       )
     }
-    const { publicKey: pubB64 } = (await res.json()) as { publicKey: string }
-    const key = importKey(pubB64)
-    this._peerKeyCache.set(peerId, key)
-    return key
+    const { devices } = (await res.json()) as {
+      devices: Array<{ deviceId: string; publicKey: string }>
+    }
+    const keys: DeviceKey[] = devices.map((d) => ({
+      deviceId:  d.deviceId,
+      publicKey: importKey(d.publicKey),
+    }))
+    this._peerKeyCache.set(peerId, keys)
+    return keys
   }
 
-  private async _getOrInitSenderRatchet(peerId: string): Promise<DoubleRatchet> {
-    const key      = `s:${peerId}`
-    const existing = this._ratchets.get(key)
+  private async _getOrInitSenderRatchet(peerId: string, device: DeviceKey): Promise<DoubleRatchet> {
+    const ratchetKey = `s:${peerId}:${device.deviceId}`
+    const existing   = this._ratchets.get(ratchetKey)
     if (existing) return existing
 
-    const stored = await loadRatchet(this._userId, key)
+    const stored = await loadRatchet(this._userId, ratchetKey)
     if (stored) {
       const ratchet = await DoubleRatchet.fromExport(stored)
-      this._ratchets.set(key, ratchet)
+      this._ratchets.set(ratchetKey, ratchet)
       return ratchet
     }
 
     if (!this._keyPair) throw new Error('Key pair not initialised.')
-    const peerPub = await this._fetchPeerPublicKey(peerId)
-    const shared  = await deriveSharedSecret(this._keyPair.privateKey, peerPub)
-    const ratchet = await DoubleRatchet.initSender(shared, peerPub)
-    this._ratchets.set(key, ratchet)
-    await saveRatchet(this._userId, key, ratchet.export())
+    const shared  = await deriveSharedSecret(this._keyPair.privateKey, device.publicKey)
+    const ratchet = await DoubleRatchet.initSender(shared, device.publicKey)
+    this._ratchets.set(ratchetKey, ratchet)
+    await saveRatchet(this._userId, ratchetKey, ratchet.export())
     return ratchet
   }
 
-  private async _getOrInitReceiverRatchet(peerId: string): Promise<DoubleRatchet> {
-    const key      = `r:${peerId}`
-    const existing = this._ratchets.get(key)
+  private async _getOrInitReceiverRatchet(
+    peerId:       string,
+    fromDeviceId: string,
+  ): Promise<DoubleRatchet> {
+    const ratchetKey = `r:${peerId}:${fromDeviceId}`
+    const existing   = this._ratchets.get(ratchetKey)
     if (existing) return existing
 
-    const stored = await loadRatchet(this._userId, key)
+    const stored = await loadRatchet(this._userId, ratchetKey)
     if (stored) {
       const ratchet = await DoubleRatchet.fromExport(stored)
-      this._ratchets.set(key, ratchet)
+      this._ratchets.set(ratchetKey, ratchet)
       return ratchet
     }
 
     if (!this._keyPair) throw new Error('Key pair not initialised.')
-    const peerPub = await this._fetchPeerPublicKey(peerId)
-    const shared  = await deriveSharedSecret(this._keyPair.privateKey, peerPub)
+    // Find the sender's specific device key
+    const peerDevices  = await this._fetchPeerDeviceKeys(peerId)
+    const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId) ?? peerDevices[0]
+    if (!senderDevice) throw new Error(`Key not found for device ${fromDeviceId} of '${peerId}'.`)
+
+    const shared  = await deriveSharedSecret(this._keyPair.privateKey, senderDevice.publicKey)
     const ratchet = await DoubleRatchet.initReceiver(shared, this._keyPair)
-    this._ratchets.set(key, ratchet)
-    await saveRatchet(this._userId, key, ratchet.export())
+    this._ratchets.set(ratchetKey, ratchet)
+    await saveRatchet(this._userId, ratchetKey, ratchet.export())
     return ratchet
   }
 
@@ -541,9 +553,16 @@ export class EncraClient {
     this._socket = ws
 
     ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ type: 'register', userId: this._userId }))
+      ws.send(JSON.stringify({
+        type:     'register',
+        userId:   this._userId,
+        deviceId: this._deviceId,
+      }))
       this._retryCount = 0
-      if (!this._cancelled) this._setReady(true), this._setConnecting(false)
+      if (!this._cancelled) {
+        this._setReady(true)
+        this._setConnecting(false)
+      }
     })
 
     ws.addEventListener('message', async (event) => {
@@ -552,7 +571,7 @@ export class EncraClient {
         msg = JSON.parse(event.data as string) as WireMessage
       } catch { return }
 
-      if (msg.type !== 'message' || !msg.from || !msg.ciphertext || !msg.nonce || !msg.header) return
+      if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.header) return
 
       this._emit('wire', {
         direction:  'received',
@@ -562,13 +581,13 @@ export class EncraClient {
       })
 
       try {
-        const ratchet = await this._getOrInitReceiverRatchet(msg.from)
-        const text = await ratchet.decrypt({
+        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId)
+        const text    = await ratchet.decrypt({
           header:     msg.header,
           ciphertext: importKey(msg.ciphertext),
           nonce:      importKey(msg.nonce),
         })
-        await saveRatchet(this._userId, `r:${msg.from}`, ratchet.export())
+        await saveRatchet(this._userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
         if (!this._cancelled) {
           this._addMessage({ from: msg.from, text, timestamp: Date.now() })
         }
@@ -614,15 +633,22 @@ export class EncraClient {
       })
     }
 
+    // Restore or generate a stable device ID for this browser/device
+    this._deviceId = await getOrCreateDeviceId(this._userId)
+
     // Restore message history
     const history = await loadMessages(this._userId)
     if (history.length > 0) this._messages = history
 
-    // Register public key (idempotent upsert)
+    // Register this device's public key
     const regRes = await fetch(`${this._httpBase}/v1/keys`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this._apiKey}` },
-      body:    JSON.stringify({ userId: this._userId, publicKey: exportKey(this._keyPair.publicKey) }),
+      body:    JSON.stringify({
+        userId:    this._userId,
+        publicKey: exportKey(this._keyPair.publicKey),
+        deviceId:  this._deviceId,
+      }),
     })
     if (!regRes.ok) throw new Error(`Key registration failed: ${regRes.status}`)
 

@@ -4,23 +4,27 @@ import jwt from 'jsonwebtoken'
 import { getPool } from '../db/pool.js'
 
 interface RelayMessage {
-  type: 'register' | 'message'
-  userId?: string
-  to?: string
-  from?: string
-  ciphertext?: string
-  nonce?: string
-  header?: unknown     // Opaque ratchet header — forwarded as-is to recipient
-  senderName?: string  // Display name set by the sender client — forwarded as-is
+  type:          'register' | 'message'
+  // Registration
+  userId?:       string
+  deviceId?:     string   // sender's device ID
+  // Messaging
+  to?:           string
+  toDeviceId?:   string   // recipient's device ID
+  ciphertext?:   string
+  nonce?:        string
+  header?:       unknown  // Opaque ratchet header — forwarded as-is
+  senderName?:   string
 }
 
+/** clients key: `${userId}:${deviceId}` */
 const clients = new Map<string, WebSocket>()
 
 /** Maximum allowed size for a single WebSocket message (64 KB). */
 const MAX_MESSAGE_BYTES = 64 * 1024
 
 function authenticateWs(req: IncomingMessage): string | null {
-  const url = new URL(req.url ?? '', 'http://localhost')
+  const url   = new URL(req.url ?? '', 'http://localhost')
   const token = url.searchParams.get('token')
   if (!token) return null
 
@@ -36,42 +40,61 @@ function authenticateWs(req: IncomingMessage): string | null {
 }
 
 async function queueOfflineMessage(
-  recipientId: string,
-  senderId: string,
-  ciphertext: string,
-  nonce: string,
-  header: unknown,
-  senderName: string | undefined,
+  recipientId:       string,
+  recipientDeviceId: string,
+  senderId:          string,
+  senderDeviceId:    string,
+  ciphertext:        string,
+  nonce:             string,
+  header:            unknown,
+  senderName:        string | undefined,
 ): Promise<void> {
   const pool = getPool()
   await pool.query(
-    `INSERT INTO message_queue (recipient_id, sender_id, ciphertext, nonce, header, sender_name)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [recipientId, senderId, ciphertext, nonce, JSON.stringify(header ?? {}), senderName ?? null]
+    `INSERT INTO message_queue
+       (recipient_id, recipient_device_id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      recipientId,
+      recipientDeviceId,
+      senderId,
+      senderDeviceId,
+      ciphertext,
+      nonce,
+      JSON.stringify(header ?? {}),
+      senderName ?? null,
+    ]
   )
 }
 
-async function flushQueuedMessages(userId: string, socket: WebSocket): Promise<void> {
-  const pool = getPool()
+async function flushQueuedMessages(
+  userId:   string,
+  deviceId: string,
+  socket:   WebSocket,
+): Promise<void> {
+  const pool   = getPool()
   const result = await pool.query<{
-    id: number
-    sender_id: string
-    ciphertext: string
-    nonce: string
-    header: unknown
-    sender_name: string | null
+    id:                number
+    sender_id:         string
+    sender_device_id:  string
+    ciphertext:        string
+    nonce:             string
+    header:            unknown
+    sender_name:       string | null
   }>(
-    `DELETE FROM message_queue WHERE recipient_id = $1
-     RETURNING id, sender_id, ciphertext, nonce, header, sender_name`,
-    [userId]
+    `DELETE FROM message_queue
+     WHERE recipient_id = $1 AND recipient_device_id = $2
+     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name`,
+    [userId, deviceId]
   )
   for (const row of result.rows) {
     socket.send(JSON.stringify({
-      type:       'message',
-      from:       row.sender_id,
-      ciphertext: row.ciphertext,
-      nonce:      row.nonce,
-      header:     row.header,
+      type:         'message',
+      from:         row.sender_id,
+      fromDeviceId: row.sender_device_id,
+      ciphertext:   row.ciphertext,
+      nonce:        row.nonce,
+      header:       row.header,
       ...(row.sender_name !== null && { senderName: row.sender_name }),
     }))
   }
@@ -87,7 +110,9 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
       return
     }
 
-    let registeredUserId: string | null = null
+    let registeredKey:      string | null = null  // `${userId}:${deviceId}`
+    let registeredUserId:   string | null = null
+    let registeredDeviceId: string | null = null
 
     socket.on('message', (raw) => {
       if (Buffer.byteLength(raw as Buffer) > MAX_MESSAGE_BYTES) {
@@ -103,44 +128,64 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         return
       }
 
+      // ── register ────────────────────────────────────────────────────────────
       if (msg.type === 'register') {
-        if (!msg.userId) {
-          socket.send(JSON.stringify({ type: 'error', message: 'register requires userId.' }))
+        if (!msg.userId || !msg.deviceId) {
+          socket.send(JSON.stringify({ type: 'error', message: 'register requires userId and deviceId.' }))
           return
         }
-        registeredUserId = msg.userId
-        clients.set(registeredUserId, socket)
-        flushQueuedMessages(registeredUserId, socket).catch(() => {
+        registeredUserId   = msg.userId
+        registeredDeviceId = msg.deviceId
+        registeredKey      = `${msg.userId}:${msg.deviceId}`
+        clients.set(registeredKey, socket)
+
+        flushQueuedMessages(msg.userId, msg.deviceId, socket).catch(() => {
           // Non-fatal — messages remain in queue for next connection
         })
-        socket.send(JSON.stringify({ type: 'registered', userId: registeredUserId }))
+
+        socket.send(JSON.stringify({ type: 'registered', userId: msg.userId, deviceId: msg.deviceId }))
         return
       }
 
+      // ── message ─────────────────────────────────────────────────────────────
       if (msg.type === 'message') {
-        if (!registeredUserId) {
+        if (!registeredKey || !registeredUserId || !registeredDeviceId) {
           socket.send(JSON.stringify({ type: 'error', message: 'Must register before sending messages.' }))
           return
         }
-        if (!msg.to || !msg.ciphertext || !msg.nonce) {
-          socket.send(JSON.stringify({ type: 'error', message: 'message requires to, ciphertext, and nonce.' }))
+        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce) {
+          socket.send(JSON.stringify({
+            type: 'error',
+            message: 'message requires to, toDeviceId, ciphertext, and nonce.',
+          }))
           return
         }
 
-        const recipientSocket = clients.get(msg.to)
-        const payload = JSON.stringify({
-          type: 'message',
-          from: registeredUserId,
-          ciphertext: msg.ciphertext,
-          nonce: msg.nonce,
-          ...(msg.header      !== undefined && { header:     msg.header }),
-          ...(msg.senderName  !== undefined && { senderName: msg.senderName }),
+        const recipientKey    = `${msg.to}:${msg.toDeviceId}`
+        const recipientSocket = clients.get(recipientKey)
+        const payload         = JSON.stringify({
+          type:         'message',
+          from:         registeredUserId,
+          fromDeviceId: registeredDeviceId,
+          ciphertext:   msg.ciphertext,
+          nonce:        msg.nonce,
+          ...(msg.header     !== undefined && { header:     msg.header }),
+          ...(msg.senderName !== undefined && { senderName: msg.senderName }),
         })
 
         if (recipientSocket && recipientSocket.readyState === WebSocket.OPEN) {
           recipientSocket.send(payload)
         } else {
-          queueOfflineMessage(msg.to, registeredUserId, msg.ciphertext, msg.nonce, msg.header, msg.senderName).catch(() => {
+          queueOfflineMessage(
+            msg.to,
+            msg.toDeviceId,
+            registeredUserId,
+            registeredDeviceId,
+            msg.ciphertext,
+            msg.nonce,
+            msg.header,
+            msg.senderName,
+          ).catch(() => {
             socket.send(JSON.stringify({ type: 'error', message: 'Failed to queue message for offline recipient.' }))
           })
         }
@@ -151,7 +196,7 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
     })
 
     socket.on('close', () => {
-      if (registeredUserId) clients.delete(registeredUserId)
+      if (registeredKey) clients.delete(registeredKey)
     })
   })
 

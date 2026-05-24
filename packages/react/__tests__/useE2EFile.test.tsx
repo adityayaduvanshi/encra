@@ -6,21 +6,43 @@ import { sodiumReady, generateKeyPair, exportKey } from '@encra/core'
 
 // ── fetch mock ────────────────────────────────────────────────────────────────
 
+const TEST_DEVICE_ID = 'test-device'
+
+/**
+ * Returns a fetch mock that speaks the multi-device key-server protocol:
+ *   POST /v1/keys     → { userId, deviceId }
+ *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ *
+ * Keys are stored by userId only (single-device scenario for simplicity).
+ */
 function makeFetchMock(keyStore: Map<string, string>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
 
     if (url.includes('/v1/keys') && init?.method === 'POST') {
-      const body = JSON.parse(init.body as string) as { userId: string; publicKey: string }
+      const body = JSON.parse(init.body as string) as {
+        userId: string; publicKey: string; deviceId?: string
+      }
       keyStore.set(body.userId, body.publicKey)
-      return { ok: true, status: 201, json: async () => ({ userId: body.userId }) } as Response
+      return {
+        ok: true, status: 201,
+        json: async () => ({ userId: body.userId, deviceId: body.deviceId ?? TEST_DEVICE_ID }),
+      } as Response
     }
 
     const match = url.match(/\/v1\/keys\/(.+)$/)
     if (match) {
       const uid = match[1]!
       const key = keyStore.get(uid)
-      if (key) return { ok: true, status: 200, json: async () => ({ userId: uid, publicKey: key }) } as Response
+      if (key) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            userId: uid,
+            devices: [{ deviceId: TEST_DEVICE_ID, publicKey: key }],
+          }),
+        } as Response
+      }
       return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
     }
 
@@ -42,6 +64,7 @@ describe('useE2EFile', () => {
 
   function setup(userId: string) {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     return renderHook(() =>
       useE2EFile({ apiKey: 'test-key', userId, serverUrl: 'http://localhost:3000' })
     )
@@ -79,21 +102,24 @@ describe('useE2EFile', () => {
       encrypted = await aliceHook.result.current.encryptFile(file, 'fa-bob')
     })
 
+    // Top-level metadata should be intact
     expect(encrypted!.name).toBe('hello.txt')
     expect(encrypted!.mimeType).toBe('text/plain')
     expect(encrypted!.size).toBe(file.size)
-    expect(encrypted!.ciphertext).toBeInstanceOf(Uint8Array)
-    expect(encrypted!.nonce).toBeInstanceOf(Uint8Array)
+
+    // Encrypted payload is inside the devices array (one entry per recipient device)
+    expect(encrypted!.devices).toHaveLength(1)
+    expect(encrypted!.devices[0]!.deviceId).toBe(TEST_DEVICE_ID)
+    expect(encrypted!.devices[0]!.ciphertext).toBeInstanceOf(Uint8Array)
+    expect(encrypted!.devices[0]!.nonce).toBeInstanceOf(Uint8Array)
 
     // Ciphertext should not contain the plaintext
-    const ctStr = Buffer.from(encrypted!.ciphertext).toString('utf8')
+    const ctStr = Buffer.from(encrypted!.devices[0]!.ciphertext).toString('utf8')
     expect(ctStr).not.toContain('Hello from useE2EFile!')
 
     let decrypted: File
     await act(async () => {
-      // Bob needs Alice's public key in the keyStore so he can fetch it
-      const aliceKP = await ratchetStore.loadKeyPair('fa-alice')
-      if (aliceKP) keyStore.set('fa-alice', aliceKP.pub)
+      // Alice's public key is already in keyStore from her hook's init registration
       decrypted = await bobHook.result.current.decryptFile(encrypted!, 'fa-alice')
     })
 
@@ -125,10 +151,12 @@ describe('useE2EFile', () => {
 
     expect(encrypted!.name).toBe('file')          // default name for Blob
     expect(encrypted!.mimeType).toBe('application/octet-stream')
+    expect(encrypted!.devices).toHaveLength(1)
   })
 
   it('throws if encryptFile called before isReady', async () => {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     // Don't wait for ready
     const { result } = renderHook(() =>
       useE2EFile({ apiKey: 'test-key', userId: 'fa-notready', serverUrl: 'http://localhost:3000' })
@@ -151,7 +179,9 @@ describe('useE2EFile', () => {
 
     const file = new File(['data'], 'f.txt')
     // 'ghost' is not in keyStore → 404
-    await expect(result.current.encryptFile(file, 'ghost')).rejects.toThrow("Could not fetch public key for 'ghost'")
+    await expect(result.current.encryptFile(file, 'ghost')).rejects.toThrow(
+      "Could not fetch public keys for 'ghost'"
+    )
   })
 
   it('caches peer public keys (only fetches once)', async () => {
@@ -175,6 +205,7 @@ describe('useE2EFile', () => {
 
   it('sets fatal error if key registration fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as Response)))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     const onError = vi.fn()
     const { result } = renderHook(() =>
       useE2EFile({ apiKey: 'bad-key', userId: 'fa-fail', serverUrl: 'http://localhost:3000', onError })
@@ -186,6 +217,7 @@ describe('useE2EFile', () => {
 
   it('restores key pair from IDB without generating a new one', async () => {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     const storedKP = await generateKeyPair()
     vi.spyOn(ratchetStore, 'loadKeyPair').mockResolvedValue({
       pub:  exportKey(storedKP.publicKey),

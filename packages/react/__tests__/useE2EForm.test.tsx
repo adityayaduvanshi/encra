@@ -1,27 +1,47 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { renderHook, act, waitFor } from '@testing-library/react'
 import { useE2EForm } from '../src/useE2EForm.js'
+import type { EncryptedFields } from '../src/useE2EForm.js'
 import * as ratchetStore from '../src/ratchetStore.js'
-import * as core from '@encra/core'
 import { sodiumReady, generateKeyPair, exportKey } from '@encra/core'
 
 // ── fetch mock ────────────────────────────────────────────────────────────────
 
+const TEST_DEVICE_ID = 'test-device'
+
+/**
+ * Returns a fetch mock that speaks the multi-device key-server protocol:
+ *   POST /v1/keys     → { userId, deviceId }
+ *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ */
 function makeFetchMock(keyStore: Map<string, string>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
 
     if (url.includes('/v1/keys') && init?.method === 'POST') {
-      const body = JSON.parse(init.body as string) as { userId: string; publicKey: string }
+      const body = JSON.parse(init.body as string) as {
+        userId: string; publicKey: string; deviceId?: string
+      }
       keyStore.set(body.userId, body.publicKey)
-      return { ok: true, status: 201, json: async () => ({ userId: body.userId }) } as Response
+      return {
+        ok: true, status: 201,
+        json: async () => ({ userId: body.userId, deviceId: body.deviceId ?? TEST_DEVICE_ID }),
+      } as Response
     }
 
     const match = url.match(/\/v1\/keys\/(.+)$/)
     if (match) {
       const uid = match[1]!
       const key = keyStore.get(uid)
-      if (key) return { ok: true, status: 200, json: async () => ({ userId: uid, publicKey: key }) } as Response
+      if (key) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            userId: uid,
+            devices: [{ deviceId: TEST_DEVICE_ID, publicKey: key }],
+          }),
+        } as Response
+      }
       return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
     }
 
@@ -43,6 +63,7 @@ describe('useE2EForm', () => {
 
   function setup(userId: string) {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     return renderHook(() =>
       useE2EForm({ apiKey: 'test-key', userId, serverUrl: 'http://localhost:3000' })
     )
@@ -55,11 +76,6 @@ describe('useE2EForm', () => {
   })
 
   it('encrypt → decrypt round-trips all field values', async () => {
-    // Mock deriveSharedSecret to return a native Uint8Array (avoids WASM cross-realm
-    // issues in jsdom's inlined module environment — same pattern as useE2EChat tests).
-    const sharedKey = new Uint8Array(32).fill(0x42)
-    vi.spyOn(core, 'deriveSharedSecret').mockResolvedValue(sharedKey)
-
     const aliceHook = setup('form-alice2')
     await waitFor(() => expect(aliceHook.result.current.isReady).toBe(true))
 
@@ -83,21 +99,26 @@ describe('useE2EForm', () => {
       encrypted = await aliceHook.result.current.encryptFields(fields, 'form-bob')
     })
 
-    // Same keys, values replaced by { ciphertext, nonce }
-    expect(Object.keys(encrypted!)).toEqual(['name', 'ssn', 'notes'])
+    // EncryptedFields has a devices array (one entry per recipient device)
+    expect(encrypted!.devices).toHaveLength(1)
+    expect(encrypted!.devices[0]!.deviceId).toBe(TEST_DEVICE_ID)
+
+    const devFields = encrypted!.devices[0]!.fields
+    expect(Object.keys(devFields).sort()).toEqual(['name', 'notes', 'ssn'])
+
     for (const key of Object.keys(fields) as (keyof typeof fields)[]) {
-      expect(encrypted![key]).toHaveProperty('ciphertext')
-      expect(encrypted![key]).toHaveProperty('nonce')
-      expect(typeof encrypted![key]!.ciphertext).toBe('string')
+      expect(devFields[key]).toHaveProperty('ciphertext')
+      expect(devFields[key]).toHaveProperty('nonce')
+      expect(typeof devFields[key]!.ciphertext).toBe('string')
       // Ciphertext is base64, should not contain the plaintext
-      expect(encrypted![key]!.ciphertext).not.toContain(fields[key])
+      expect(devFields[key]!.ciphertext).not.toContain(fields[key])
     }
 
     // Each field gets a unique nonce
-    const nonces = Object.values(encrypted!).map((v) => v.nonce)
+    const nonces = Object.values(devFields).map((v) => v.nonce)
     expect(new Set(nonces).size).toBe(nonces.length)
 
-    // Decrypt with the same mocked shared key — both sides use the same sharedKey
+    // Bob decrypts — Alice's key was registered during her hook init
     let decrypted: Record<string, string>
     await act(async () => {
       decrypted = await bobHook.result.current.decryptFields(encrypted!, 'form-alice2')
@@ -117,12 +138,12 @@ describe('useE2EForm', () => {
     await act(async () => {
       encrypted = await result.current.encryptFields({}, 'form-empty-peer')
     })
-    expect(encrypted!).toEqual({})
+    // One device envelope with no fields
+    expect(encrypted!.devices).toHaveLength(1)
+    expect(encrypted!.devices[0]!.fields).toEqual({})
   })
 
   it('produces unique ciphertexts on repeated calls (fresh nonce per call)', async () => {
-    vi.spyOn(core, 'deriveSharedSecret').mockResolvedValue(new Uint8Array(32).fill(0x11))
-
     const { result } = setup('form-nonce')
     await waitFor(() => expect(result.current.isReady).toBe(true))
 
@@ -137,13 +158,16 @@ describe('useE2EForm', () => {
       enc2 = await result.current.encryptFields({ secret: 'same value' }, 'form-nonce-peer')
     })
 
-    expect(enc1!.secret!.ciphertext).not.toBe(enc2!.secret!.ciphertext)
-    expect(enc1!.secret!.nonce).not.toBe(enc2!.secret!.nonce)
+    const ct1 = enc1!.devices[0]!.fields.secret!.ciphertext
+    const ct2 = enc2!.devices[0]!.fields.secret!.ciphertext
+    const n1  = enc1!.devices[0]!.fields.secret!.nonce
+    const n2  = enc2!.devices[0]!.fields.secret!.nonce
+
+    expect(ct1).not.toBe(ct2)
+    expect(n1).not.toBe(n2)
   })
 
   it('decryptFields throws on tampered ciphertext', async () => {
-    vi.spyOn(core, 'deriveSharedSecret').mockResolvedValue(new Uint8Array(32).fill(0x22))
-
     const { result } = setup('form-tamper')
     await waitFor(() => expect(result.current.isReady).toBe(true))
 
@@ -155,16 +179,25 @@ describe('useE2EForm', () => {
       encrypted = await result.current.encryptFields({ secret: 'test' }, 'form-tamper-peer')
     })
 
-    // Tamper: flip first character of ciphertext
-    const tampered = {
-      ...encrypted!,
-      secret: { ...encrypted!.secret!, ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' },
+    // Tamper: replace the ciphertext with garbage while keeping a valid nonce
+    const tampered: EncryptedFields = {
+      devices: [{
+        deviceId: TEST_DEVICE_ID,
+        fields: {
+          ...encrypted!.devices[0]!.fields,
+          secret: {
+            ...encrypted!.devices[0]!.fields.secret!,
+            ciphertext: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          },
+        },
+      }],
     }
     await expect(result.current.decryptFields(tampered, 'form-tamper-peer')).rejects.toThrow()
   })
 
   it('throws if encryptFields called before isReady', async () => {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     const { result } = renderHook(() =>
       useE2EForm({ apiKey: 'test-key', userId: 'form-notready', serverUrl: 'http://localhost:3000' })
     )
@@ -175,13 +208,11 @@ describe('useE2EForm', () => {
     const { result } = setup('form-404')
     await waitFor(() => expect(result.current.isReady).toBe(true))
     await expect(result.current.encryptFields({ x: 'y' }, 'ghost')).rejects.toThrow(
-      "Could not fetch public key for 'ghost'"
+      "Could not fetch public keys for 'ghost'"
     )
   })
 
   it('throws if a field value is not a string', async () => {
-    vi.spyOn(core, 'deriveSharedSecret').mockResolvedValue(new Uint8Array(32).fill(0x33))
-
     const { result } = setup('form-typecheck')
     await waitFor(() => expect(result.current.isReady).toBe(true))
 
@@ -195,8 +226,6 @@ describe('useE2EForm', () => {
   })
 
   it('caches peer public keys (only fetches once)', async () => {
-    vi.spyOn(core, 'deriveSharedSecret').mockResolvedValue(new Uint8Array(32).fill(0x44))
-
     const { result } = setup('form-cache')
     await waitFor(() => expect(result.current.isReady).toBe(true))
 
@@ -218,6 +247,7 @@ describe('useE2EForm', () => {
 
   it('sets fatal error if key registration fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as Response)))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     const onError = vi.fn()
     const { result } = renderHook(() =>
       useE2EForm({ apiKey: 'bad', userId: 'form-fail', serverUrl: 'http://localhost:3000', onError })
@@ -229,6 +259,7 @@ describe('useE2EForm', () => {
 
   it('restores key pair from IDB without generating a new one', async () => {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     const storedKP = await generateKeyPair()
     vi.spyOn(ratchetStore, 'loadKeyPair').mockResolvedValue({
       pub:  exportKey(storedKP.publicKey),

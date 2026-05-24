@@ -21,10 +21,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: StoredMessage[]
   }
+  devices: {
+    key:   string        // userId
+    value: string        // deviceId (UUID)
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 2
+const DB_VERSION = 3
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -38,6 +42,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('keypairs')) db.createObjectStore('keypairs')
         if (!db.objectStoreNames.contains('ratchets')) db.createObjectStore('ratchets')
         if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
+        if (!db.objectStoreNames.contains('devices'))  db.createObjectStore('devices')
       },
     })
   }
@@ -78,4 +83,27 @@ export async function saveMessages(userId: string, messages: StoredMessage[]): P
   try {
     await (await getDB()).put('messages', messages, userId)
   } catch { /* non-fatal: messages still visible in-memory */ }
+}
+
+/**
+ * Returns the stable device ID for this browser/device.
+ * Generated once with crypto.randomUUID() and persisted to IndexedDB.
+ * Falls back to a random string if the Crypto API is unavailable.
+ */
+export async function getOrCreateDeviceId(userId: string): Promise<string> {
+  try {
+    const db       = await getDB()
+    const existing = await db.get('devices', userId)
+    if (existing) return existing
+
+    const deviceId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+
+    await db.put('devices', deviceId, userId)
+    return deviceId
+  } catch {
+    return 'default'
+  }
 }

@@ -7,9 +7,7 @@ import {
   generateKeyPair,
   DoubleRatchet,
   exportKey,
-  importKey,
 } from '@encra/core'
-import sodium from 'libsodium-wrappers'
 
 // ── WebSocket mock ────────────────────────────────────────────────────────────
 
@@ -39,10 +37,10 @@ class MockWebSocket {
   }
 
   addEventListener(event: string, listener: (e: unknown) => void) {
-    if (event === 'open') this.openListeners.push(listener as () => void)
+    if (event === 'open')    this.openListeners.push(listener as () => void)
     else if (event === 'message') this.messageListeners.push(listener as WsListener)
-    else if (event === 'close') this.closeListeners.push(listener as () => void)
-    else if (event === 'error') this.errorListeners.push(listener as () => void)
+    else if (event === 'close')   this.closeListeners.push(listener as () => void)
+    else if (event === 'error')   this.errorListeners.push(listener as () => void)
   }
 
   simulateMessage(data: string) {
@@ -56,14 +54,26 @@ class MockWebSocket {
 
 // ── fetch mock ────────────────────────────────────────────────────────────────
 
+const TEST_DEVICE_ID = 'test-device'
+
+/**
+ * Returns a fetch mock that speaks the multi-device key-server protocol:
+ *   POST /v1/keys     → { userId, deviceId }
+ *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ */
 function makeFetchMock(keyStore: Map<string, string>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
 
     if (url.includes('/v1/keys') && init?.method === 'POST') {
-      const body = JSON.parse(init.body as string) as { userId: string; publicKey: string }
+      const body = JSON.parse(init.body as string) as {
+        userId: string; publicKey: string; deviceId?: string
+      }
       keyStore.set(body.userId, body.publicKey)
-      return { ok: true, status: 201, json: async () => ({ userId: body.userId }) } as Response
+      return {
+        ok: true, status: 201,
+        json: async () => ({ userId: body.userId, deviceId: body.deviceId ?? TEST_DEVICE_ID }),
+      } as Response
     }
 
     const match = url.match(/\/v1\/keys\/(.+)$/)
@@ -71,7 +81,13 @@ function makeFetchMock(keyStore: Map<string, string>) {
       const uid = match[1]!
       const key = keyStore.get(uid)
       if (key) {
-        return { ok: true, status: 200, json: async () => ({ userId: uid, publicKey: key }) } as Response
+        return {
+          ok: true, status: 200,
+          json: async () => ({
+            userId: uid,
+            devices: [{ deviceId: TEST_DEVICE_ID, publicKey: key }],
+          }),
+        } as Response
       }
       return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
     }
@@ -97,6 +113,7 @@ describe('useE2EChat', () => {
 
   function setupMocks() {
     vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     vi.stubGlobal(
       'WebSocket',
       class extends MockWebSocket {
@@ -119,7 +136,7 @@ describe('useE2EChat', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('sends a register message when WebSocket opens', async () => {
+  it('sends a register message with userId and deviceId when WebSocket opens', async () => {
     setupMocks()
 
     const { result } = renderHook(() =>
@@ -129,10 +146,14 @@ describe('useE2EChat', () => {
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
 
     const registerMsg = mockWs.sentMessages.find((m) => {
-      const parsed = JSON.parse(m) as { type: string; userId?: string }
+      const parsed = JSON.parse(m) as { type: string; userId?: string; deviceId?: string }
       return parsed.type === 'register' && parsed.userId === 'bob'
     })
     expect(registerMsg).toBeDefined()
+
+    // deviceId must be included in the register message for server-side routing
+    const parsed = JSON.parse(registerMsg!) as { type: string; userId: string; deviceId: string }
+    expect(parsed.deviceId).toBe(TEST_DEVICE_ID)
   })
 
   it('fetches sender public key on first incoming message (key derivation cache miss)', async () => {
@@ -151,16 +172,17 @@ describe('useE2EChat', () => {
 
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
 
+    // fromDeviceId is now required for per-device ratchet keying.
     // Send a message with arbitrary bytes — decryption will fail (wrong shared secret),
     // but the hook must still attempt to fetch Carol's public key (cache miss path)
     // and handle the DecryptionFailedError without crashing.
-    // A header is required by the new ratchet-aware hook.
     const wireMsg = JSON.stringify({
-      type: 'message',
-      from: 'carol',
-      ciphertext: exportKey(new Uint8Array(48).fill(0xaa)),
-      nonce: exportKey(new Uint8Array(24).fill(0xbb)),
-      header: { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
+      type:         'message',
+      from:         'carol',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   exportKey(new Uint8Array(48).fill(0xaa)),
+      nonce:        exportKey(new Uint8Array(24).fill(0xbb)),
+      header:       { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
     })
 
     await act(async () => {
@@ -187,6 +209,7 @@ describe('useE2EChat', () => {
       vi.fn(async () => ({ ok: false, status: 500, json: async () => ({}) } as Response))
     )
     vi.stubGlobal('WebSocket', MockWebSocket)
+    vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
 
     const { result } = renderHook(() =>
       useE2EChat({ apiKey: 'bad-key', userId: 'dave', serverUrl: 'http://localhost:3000' })
@@ -256,8 +279,9 @@ describe('useE2EChat', () => {
     await act(async () => {
       mockWs.simulateMessage('not-json{{{')
       mockWs.simulateMessage(JSON.stringify({ type: 'ping' }))
-      mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x' })) // missing ciphertext/nonce/header
-      mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x', ciphertext: 'a', nonce: 'b' })) // missing header
+      // missing fromDeviceId, ciphertext, nonce, header — all ignored
+      mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x' }))
+      mockWs.simulateMessage(JSON.stringify({ type: 'message', from: 'x', ciphertext: 'a', nonce: 'b' }))
       await new Promise((r) => setTimeout(r, 100))
     })
 
@@ -279,11 +303,12 @@ describe('useE2EChat', () => {
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
 
     const wireMsg = JSON.stringify({
-      type: 'message',
-      from: 'ivy',
-      ciphertext: exportKey(new Uint8Array(48).fill(0xcc)),
-      nonce: exportKey(new Uint8Array(24).fill(0xdd)),
-      header: { dh: exportKey(ivyKP.publicKey), pn: 0, n: 0 },
+      type:         'message',
+      from:         'ivy',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   exportKey(new Uint8Array(48).fill(0xcc)),
+      nonce:        exportKey(new Uint8Array(24).fill(0xdd)),
+      header:       { dh: exportKey(ivyKP.publicKey), pn: 0, n: 0 },
     })
 
     await act(async () => {
@@ -334,7 +359,7 @@ describe('useE2EChat', () => {
   it('sendMessage encrypts and routes the payload, fires onWireMessage with direction sent', async () => {
     setupMocks()
 
-    // Register the peer's key so fetchPeerPublicKey succeeds
+    // Register the peer's key so fetchPeerDeviceKeys succeeds
     const peerKP = await generateKeyPair()
     keyStore.set('mallory', exportKey(peerKP.publicKey))
 
@@ -367,12 +392,18 @@ describe('useE2EChat', () => {
       await result.current.sendMessage('mallory', 'second message')
     })
 
-    // The socket should have received two 'message' frames addressed to mallory
+    // mallory has 1 device, so each sendMessage sends 1 frame — 2 total
     const sentFrames = mockWs.sentMessages.filter((m) => {
       const p = JSON.parse(m) as { type: string; to?: string }
       return p.type === 'message' && p.to === 'mallory'
     })
     expect(sentFrames).toHaveLength(2)
+
+    // Frames must include toDeviceId for relay routing
+    for (const frame of sentFrames) {
+      const p = JSON.parse(frame) as { toDeviceId?: string }
+      expect(p.toDeviceId).toBe(TEST_DEVICE_ID)
+    }
 
     // onWireMessage should have fired with direction 'sent' for each message
     const sentEvents = onWireMessage.mock.calls.filter(
@@ -394,11 +425,12 @@ describe('useE2EChat', () => {
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
 
     const wireMsg = JSON.stringify({
-      type: 'message',
-      from: 'oscar',
-      ciphertext: exportKey(new Uint8Array(48).fill(0xee)),
-      nonce: exportKey(new Uint8Array(24).fill(0xff)),
-      header: { dh: exportKey(senderKP.publicKey), pn: 0, n: 0 },
+      type:         'message',
+      from:         'oscar',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   exportKey(new Uint8Array(48).fill(0xee)),
+      nonce:        exportKey(new Uint8Array(24).fill(0xff)),
+      header:       { dh: exportKey(senderKP.publicKey), pn: 0, n: 0 },
     })
 
     await act(async () => {
