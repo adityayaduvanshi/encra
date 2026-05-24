@@ -2,54 +2,65 @@
 
 **Signal-level end-to-end encryption for any app.**
 
-Encrypt messages, files, forms, and documents — your server never sees the plaintext. Developers get an API key, drop in a hook, and their users get cryptographic privacy without knowing anything about cryptography.
+Encrypt messages, files, forms, and documents — your server never sees the plaintext. Developers get an API key, drop in a hook or client, and their users get cryptographic privacy without knowing anything about cryptography.
 
 **[Live demo & API keys → encra.dev](https://encra.dev)**
 
 ---
 
+## Packages
+
+| Package | Version | Description |
+|---|---|---|
+| [`@encra/core`](packages/core) | ![npm](https://img.shields.io/npm/v/@encra/core) | Pure crypto primitives — X25519, XSalsa20-Poly1305, Double Ratchet |
+| [`@encra/client`](packages/client) | ![npm](https://img.shields.io/npm/v/@encra/client) | Framework-agnostic JS client — works with Vue, Svelte, Angular, vanilla JS, Node.js |
+| [`@encra/react`](packages/react) | ![npm](https://img.shields.io/npm/v/@encra/react) | React hook (`useE2EChat`) — thin wrapper around `@encra/client` |
+| [`@encra/server`](packages/server) | — | Key server + WebSocket relay (self-host or use encra.dev) |
+| [`encra`](packages/cli) | ![npm](https://img.shields.io/npm/v/encra) | CLI — `init`, `keygen`, `ping` |
+
+---
+
 ## What can you encrypt?
 
-| Use case | Hook | Status |
+| Use case | API | Status |
 |---|---|---|
-| Real-time chat | `useE2EChat()` | ✅ Available now |
+| Real-time chat | `useE2EChat()` / `EncraClient` | ✅ Available |
 | Files & media | `useE2EFile()` | 🔜 Coming soon |
 | Form submissions | `useE2EForm()` | 🔜 Coming soon |
 | Database fields | `encryptField()` | 🔜 Coming soon |
 
-The cryptographic primitives in `@encra/core` already support all of the above — the additional hooks are being built.
-
 ---
 
-## 5-Minute Quickstart
+## Quickstart
 
 ### 1. Get an API key
 
-Sign up at [encra.dev](https://encra.dev) — free plan, no credit card required. Or [self-host](#self-hosting-guide) your own key server.
+Sign up at [encra.dev](https://encra.dev) — free plan, no credit card required.
+Or [self-host](#self-hosting-guide) your own key server.
 
 ### 2. Install
 
 ```bash
-# Core crypto (works in Node.js, browser, React Native)
-npm install @encra/core
-
-# React hook
+# React
 npm install @encra/react
 
-# Or run the setup wizard
+# Vue, Svelte, Angular, vanilla JS, Node.js
+npm install @encra/client
+
+# Or run the interactive setup wizard
 npx encra init
 ```
 
-### 3. Add to your React app
+### 3. React
 
 ```tsx
 import { useE2EChat } from '@encra/react'
 
 function Chat({ currentUser, recipient }) {
-  const { messages, isReady, sendMessage } = useE2EChat({
+  const { messages, isReady, isConnecting, sendMessage } = useE2EChat({
     apiKey: process.env.NEXT_PUBLIC_ENCRA_API_KEY,
     userId: currentUser,
-    // serverUrl optional — defaults to Encra managed server
+    onError: (err) => console.error(err),
   })
 
   return (
@@ -65,49 +76,53 @@ function Chat({ currentUser, recipient }) {
 }
 ```
 
-That's it. Data is encrypted on the sender's device and decrypted on the recipient's device. The server only ever sees encrypted blobs.
+### 4. Vue / Svelte / Vanilla JS / Node.js
 
-### 4. Use without React
+```ts
+import { EncraClient } from '@encra/client'
 
-```typescript
-import {
-  generateKeyPair,
-  deriveSharedSecret,
-  exportKey,
-  importKey,
-  DoubleRatchet,
-} from '@encra/core'
-
-// Register user
-const aliceKP = await generateKeyPair()
-await fetch('https://api.encra.dev/v1/keys', {
-  method: 'POST',
-  headers: { Authorization: 'Bearer YOUR_API_KEY', 'Content-Type': 'application/json' },
-  body: JSON.stringify({ userId: 'alice', publicKey: exportKey(aliceKP.publicKey) }),
+const client = new EncraClient({
+  apiKey:    process.env.ENCRA_API_KEY,
+  userId:    'alice',
+  serverUrl: 'https://api.encra.dev', // optional, this is the default
 })
 
-// Encrypt and send
-const bobRes = await fetch('https://api.encra.dev/v1/keys/bob', {
-  headers: { Authorization: 'Bearer YOUR_API_KEY' },
-})
-const { publicKey: bobPubB64 } = await bobRes.json()
-const shared  = await deriveSharedSecret(aliceKP.privateKey, importKey(bobPubB64))
-const ratchet = await DoubleRatchet.initSender(shared, importKey(bobPubB64))
-const msg     = ratchet.encrypt('Hello Bob!')
-// send msg.header, msg.ciphertext, msg.nonce to Bob via WebSocket
+client.on('message', (msg) => console.log(msg.from, msg.text))
+client.on('ready',   ()    => console.log('connected'))
+client.on('error',   (err) => console.error(err))
+
+await client.connect()
+await client.sendMessage('bob', 'Hello!')
+
+// Read state at any time
+console.log(client.isReady, client.messages)
+
+// Clean up
+client.disconnect()
 ```
 
----
+**Vue example:**
+```ts
+// composable: useEncraChat.ts
+import { ref, onMounted, onUnmounted } from 'vue'
+import { EncraClient } from '@encra/client'
 
-## Managed vs Self-Hosted
+export function useEncraChat(userId: string) {
+  const messages   = ref([])
+  const isReady    = ref(false)
+  const client     = new EncraClient({ apiKey: import.meta.env.VITE_ENCRA_KEY, userId })
 
-| | Managed (encra.dev) | Self-Hosted |
-|--|-------------------|-------------|
-| Setup | Get API key, done | Clone, configure Postgres, deploy |
-| Cost | Free tier + paid plans | Your own infra costs |
-| Maintenance | Zero | You own it |
-| Data location | Encra servers | Wherever you deploy |
-| License | — | BUSL 1.1 (see below) |
+  onMounted(async () => {
+    client.on('message', () => { messages.value = [...client.messages] })
+    client.on('ready',   () => { isReady.value = true })
+    await client.connect()
+  })
+
+  onUnmounted(() => client.disconnect())
+
+  return { messages, isReady, sendMessage: client.sendMessage.bind(client) }
+}
+```
 
 ---
 
@@ -148,8 +163,8 @@ Root Key
 ```
 
 If an attacker compromises today's key:
-- **Past data** — safe, those keys are already deleted
-- **Future data** — safe after the next DH ratchet step
+- **Past messages** — safe, those keys are already deleted
+- **Future messages** — safe after the next DH ratchet step
 
 ---
 
@@ -179,6 +194,52 @@ If an attacker compromises today's key:
 
 ## API Reference
 
+### `@encra/client` — `EncraClient`
+
+```typescript
+const client = new EncraClient({ apiKey, userId, serverUrl? })
+
+// Lifecycle
+await client.connect()     // resolves when WebSocket is open
+client.disconnect()        // close and clean up
+
+// Messaging
+await client.sendMessage(to: string, text: string)
+
+// State (synchronous reads)
+client.isReady        // boolean
+client.isConnecting   // boolean
+client.messages       // Message[]  — sent + received, newest last
+client.error          // Error | null
+
+// Events
+client.on('ready',        ()         => ...)
+client.on('connecting',   ()         => ...)
+client.on('disconnected', ()         => ...)
+client.on('message',      (msg)      => ...)  // { from, text, timestamp }
+client.on('error',        (err)      => ...)  // recoverable errors
+client.on('wire',         (event)    => ...)  // raw encrypted wire data
+client.off(event, listener)
+```
+
+### `@encra/react` — `useE2EChat`
+
+```typescript
+const {
+  messages,      // Message[]
+  isReady,       // boolean — WebSocket open and registered
+  isConnecting,  // boolean — connecting or reconnecting
+  sendMessage,   // (to: string, text: string) => Promise<void>
+  error,         // Error | null — fatal init errors only
+} = useE2EChat({
+  apiKey:          string,
+  userId:          string,
+  serverUrl?:      string,   // defaults to https://api.encra.dev
+  onError?:        (err: Error) => void,       // recoverable errors
+  onWireMessage?:  (event: WireEvent) => void, // raw wire data
+})
+```
+
 ### `@encra/core`
 
 ```typescript
@@ -188,45 +249,50 @@ exportKey(key: Uint8Array): string        // → URL-safe base64
 importKey(b64: string): Uint8Array
 
 // Key exchange
-deriveSharedSecret(myPrivKey: Uint8Array, theirPubKey: Uint8Array): Promise<Uint8Array>
+deriveSharedSecret(myPrivKey, theirPubKey): Promise<Uint8Array>
 
 // Double Ratchet
 DoubleRatchet.initSender(sharedSecret, theirPublicKey): Promise<DoubleRatchet>
-DoubleRatchet.initReceiver(sharedSecret, ourKeyPair): Promise<DoubleRatchet>
-ratchet.encrypt(plaintext: string): RatchetMessage
-ratchet.decrypt(message: RatchetMessage): string
+DoubleRatchet.initReceiver(sharedSecret, ourKeyPair):   Promise<DoubleRatchet>
+ratchet.encrypt(plaintext: string): Promise<RatchetMessage>
+ratchet.decrypt(message: RatchetMessage): Promise<string>
+ratchet.export(): RatchetStateExport   // persist to storage
+DoubleRatchet.fromExport(state): Promise<DoubleRatchet>  // restore
 
 // Errors
 InvalidKeyError / DecryptionFailedError / KeyNotFoundError
 ```
 
-### `@encra/react`
-
-```typescript
-const { messages, isReady, sendMessage, error } = useE2EChat({
-  apiKey: string,
-  userId: string,
-  serverUrl?: string,  // defaults to https://api.encra.dev
-})
-```
-
 ### `encra` CLI
 
 ```bash
-npx encra init      # Interactive setup wizard — generates .env + starter component
-npx encra keygen    # Generate a test X25519 key pair
-npx encra ping      # Verify server is reachable and API key is valid
+npx encra init      # Interactive setup — writes .env.example + starter component
+npx encra keygen    # Generate a test X25519 key pair + fingerprint
+npx encra ping      # Verify server reachability and API key validity
 ```
 
 ### Server REST API
 
 All endpoints require `Authorization: Bearer <api_key>`.
 
-| Method | Path | Response |
-|--------|------|----------|
-| `GET` | `/health` | `{ ok: true }` |
-| `POST` | `/v1/keys` | `201 { userId }` |
-| `GET` | `/v1/keys/:userId` | `200 { userId, publicKey }` or `404` |
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/health` | Liveness check |
+| `POST` | `/v1/keys` | Register / update a public key |
+| `GET`  | `/v1/keys/:userId` | Fetch a user's public key |
+| `WS`   | `/v1/relay?token=` | WebSocket relay — routes encrypted messages |
+
+---
+
+## Managed vs Self-Hosted
+
+| | Managed (encra.dev) | Self-Hosted |
+|--|-------------------|-------------|
+| Setup | Get API key, done | Clone, configure Postgres, deploy |
+| Cost | Free tier + paid plans | Your own infra costs |
+| Maintenance | Zero | You own it |
+| Data location | Encra servers | Wherever you deploy |
+| License | — | BUSL 1.1 (see below) |
 
 ---
 
@@ -242,11 +308,13 @@ cd encra && npm install
 cp packages/server/.env.example packages/server/.env
 # Set DATABASE_URL and JWT_SECRET
 
-# Migrate
+# Migrate database
 psql $DATABASE_URL -f packages/server/migrations/001_init.sql
+psql $DATABASE_URL -f packages/server/migrations/002_message_queue_header.sql
 
-# Start
-cd packages/server && npm run build && npm start
+# Build and start
+npm run build --workspace=packages/server
+npm start     --workspace=packages/server
 ```
 
 ---
@@ -254,10 +322,10 @@ cd packages/server && npm run build && npm start
 ## Development
 
 ```bash
-npm install       # Install all deps
-npm test          # Run all tests
-npm run build     # Build all packages
-node e2e-test.mjs # Alice→Bob end-to-end test
+npm install          # Install all workspace deps
+npm test             # Run all tests
+npm run build        # Build all packages
+node e2e-test.mjs    # Alice→Bob end-to-end integration test
 ```
 
 ---
@@ -266,9 +334,10 @@ node e2e-test.mjs # Alice→Bob end-to-end test
 
 | Package | License |
 |---------|---------|
-| `packages/core` | Apache 2.0 |
-| `packages/react` | Apache 2.0 |
-| `packages/cli` | Apache 2.0 |
+| `packages/core`   | Apache 2.0 |
+| `packages/client` | Apache 2.0 |
+| `packages/react`  | Apache 2.0 |
+| `packages/cli`    | Apache 2.0 |
 | `packages/server` | BUSL 1.1 → Apache 2.0 on 2030-01-01 |
 
 For commercial licensing: [legal@encra.dev](mailto:legal@encra.dev)

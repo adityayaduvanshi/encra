@@ -1,14 +1,14 @@
 {
-  "name": "@encra/react",
-  "version": "0.2.1",
-  "description": "React hook for Encra end-to-end encrypted chat",
+  "name": "@encra/client",
+  "version": "0.1.0",
+  "description": "Framework-agnostic vanilla JS client for Encra end-to-end encrypted chat",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
   "homepage": "https://github.com/adityayaduvanshi/encra#readme",
   "repository": {
     "type": "git",
     "url": "https://github.com/adityayaduvanshi/encra.git",
-    "directory": "packages/react"
+    "directory": "packages/client"
   },
   "bugs": {
     "url": "https://github.com/adityayaduvanshi/encra/issues"
@@ -16,11 +16,11 @@
   "keywords": [
     "encryption",
     "e2e",
-    "react",
-    "hook",
     "chat",
     "double-ratchet",
-    "signal"
+    "signal",
+    "vanilla",
+    "javascript"
   ],
   "engines": {
     "node": ">=18.0.0"
@@ -31,7 +31,7 @@
     ".": {
       "require": "./dist/index.js",
       "default": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types":   "./dist/index.d.ts"
     }
   },
   "files": [
@@ -40,25 +40,20 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build":          "tsc",
     "prepublishOnly": "npm run build && npm test",
-    "test": "vitest run --coverage"
-  },
-  "peerDependencies": {
-    "react": ">=18.0.0"
+    "test":           "vitest run --coverage",
+    "test:watch":     "vitest"
   },
   "dependencies": {
     "@encra/core": "^0.1.1",
-    "idb": "^8.0.3"
+    "idb":         "^8.0.3"
   },
   "devDependencies": {
-    "@testing-library/react": "^14.0.0",
-    "@types/node": "^20.0.0",
-    "@types/react": "^18.3.0",
+    "@types/node":         "^20.0.0",
     "@vitest/coverage-v8": "^1.0.0",
-    "jsdom": "^24.0.0",
-    "react": "^18.3.0",
-    "typescript": "^5.4.0",
-    "vitest": "^1.0.0"
+    "jsdom":               "^24.0.0",
+    "typescript":          "^5.4.0",
+    "vitest":              "^1.0.0"
   }
 }
