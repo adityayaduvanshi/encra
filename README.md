@@ -55,6 +55,59 @@ function Chat({ me, recipient }) {
 
 ---
 
+## Why Encra?
+
+Most apps store user data in plaintext. One breach, one subpoena, one rogue employee — everything is exposed. Encra moves encryption to the client so your server becomes **mathematically incapable** of reading user data, not just policy-incapable.
+
+- 🔒 **HIPAA / GDPR by default** — you can't leak what you can't read
+- ⚡ **5-minute setup** — one hook or one class, no cryptography expertise needed
+- 🔑 **Zero key management** — key generation, exchange, rotation, and persistence handled for you
+- 🛡️ **Built on libsodium** — the same crypto library used by Signal, WhatsApp, and 1Password
+
+**The alternative is months of work:**
+
+| | Raw Web Crypto | Build your own | **Encra** |
+|---|---|---|---|
+| Setup time | Days | Months | **5 minutes** |
+| Key server + relay | Build it | Build it | **Included** |
+| Double Ratchet | Build it | Build it | **Included** |
+| State persistence | Build it | Build it | **Included** |
+| Reconnect + backoff | Build it | Build it | **Included** |
+| Cryptographic test vectors | Write them | Write them | **Included** |
+| Ongoing maintenance | You | You | **Encra team** |
+
+---
+
+## How it works
+
+Your server is a blind relay. It stores public keys and forwards encrypted blobs — it has no ability to read the content.
+
+```mermaid
+sequenceDiagram
+    participant A as 🖥️ Alice's device
+    participant S as ☁️ Encra server
+    participant B as 🖥️ Bob's device
+
+    A->>S: POST publicKey (never the private key)
+    B->>S: POST publicKey (never the private key)
+
+    A->>S: GET Bob's publicKey
+    S-->>A: Bob's publicKey
+    B->>S: GET Alice's publicKey
+    S-->>B: Alice's publicKey
+
+    Note over A,B: Both derive the same shared secret locally — it never leaves the device
+
+    A->>S: { ciphertext, nonce, header }
+    Note over S: ⛔ Sees only an encrypted blob — cannot decrypt
+    S->>B: { ciphertext, nonce, header }
+    Note over B: DoubleRatchet.decrypt() → "Hello!"
+```
+
+Every message uses a **unique one-time key** derived from a ratchet chain. Keys are deleted immediately after use — compromising today's key reveals nothing about past or future messages.
+
+---
+
 ## What can you encrypt?
 
 | Use case | React | Vanilla / Vue / Svelte / Node |
@@ -178,9 +231,6 @@ client.on('error',   (err) => console.error(err))
 await client.connect()
 await client.sendMessage('bob', 'Hello, Bob!')
 
-// Read state at any time
-console.log(client.isReady, client.messages)
-
 client.disconnect()
 ```
 
@@ -199,14 +249,13 @@ function FileShare({ userId, recipientId }) {
     const file = e.target.files?.[0]
     if (!file) return
 
-    // Encrypt on the device — server never sees the contents
     const encrypted = await encryptFile(file, recipientId)
 
-    // Upload the ciphertext however you like (S3, R2, your DB, etc.)
+    // Upload ciphertext however you like — S3, R2, your DB, etc.
     await fetch('/api/files', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(encrypted),  // ← only encrypted bytes leave the device
+      body:    JSON.stringify(encrypted),
     })
   }
 
@@ -241,9 +290,9 @@ function MedicalForm({ patientId, doctorId }) {
 
   return (
     <form onSubmit={handleSubmit}>
-      <input name="ssn"           placeholder="SSN"          />
-      <input name="dateOfBirth"   placeholder="Date of birth"/>
-      <input name="chiefComplaint"placeholder="Chief complaint"/>
+      <input name="ssn"            placeholder="SSN"           />
+      <input name="dateOfBirth"    placeholder="Date of birth" />
+      <input name="chiefComplaint" placeholder="Chief complaint"/>
       <button disabled={!isReady} type="submit">Submit (encrypted)</button>
     </form>
   )
@@ -255,63 +304,17 @@ function MedicalForm({ patientId, doctorId }) {
 ```ts
 import { generateFieldKey, encryptField, decryptField } from '@encra/core'
 
-// Generate once and store in a secrets manager (AWS Secrets Manager, Vault, etc.)
-const key = await generateFieldKey()  // 32-byte symmetric key
+// Generate once — store in AWS Secrets Manager, Vault, etc. Never in the DB.
+const key = await generateFieldKey()
 
 // Encrypt before INSERT
 const encryptedSSN = await encryptField('123-45-6789', key)
 // → { ciphertext: "base64...", nonce: "base64..." }
-// INSERT INTO patients (ssn_ciphertext, ssn_nonce) VALUES (?, ?)
 
 // Decrypt after SELECT
 const ssn = await decryptField(encryptedSSN, key)
 // → "123-45-6789"
 ```
-
----
-
-## How the encryption works
-
-```
-Alice's device                    Server                    Bob's device
-─────────────────                 ──────                    ────────────
-generateKeyPair()
-POST publicKey ──────────────────► store(alice → pubKey)
-                                   store(bob   → pubKey) ◄── generateKeyPair()
-                                                               POST publicKey
-
-GET bob's pubKey ◄──────────────►  GET alice's pubKey
-deriveSharedSecret()                                      deriveSharedSecret()
-  (never leaves device)                                     (never leaves device)
-
-DoubleRatchet.encrypt("Hello!")
-  │  one-time key derived, used once, then deleted
-  ▼
-{ header, ciphertext, nonce } ───► relay ──────────────► DoubleRatchet.decrypt()
-                                  (sees only                "Hello!"
-                                   encrypted blob)
-```
-
-### Double Ratchet — forward secrecy + break-in recovery
-
-Every message uses a **different, one-time encryption key**:
-
-```
-Root Key
-   │
-   ├─► Chain Key 1 ──► Message Key 1  (used once, then deleted)
-   │       │
-   │       └─► Chain Key 2 ──► Message Key 2  (used once, then deleted)
-   │
-   └─► (DH ratchet step on every direction flip — new root key, new chains)
-```
-
-| If an attacker steals a key… | Impact |
-|---|---|
-| Past messages | ✅ Safe — those keys are already deleted |
-| Future messages | ✅ Safe after the next DH ratchet step |
-
-This is the same protocol used by Signal, WhatsApp, and iMessage.
 
 ---
 
@@ -321,56 +324,28 @@ This is the same protocol used by Signal, WhatsApp, and iMessage.
 
 Most apps store user data in plaintext on their servers. A single breach — or a subpoena — exposes everything. Encra moves encryption to the client so your server becomes mathematically incapable of reading user data, not just policy-incapable.
 
-Developers shouldn't need a PhD in cryptography to ship private apps. Encra packages the Signal Protocol into a single hook or class, handling key generation, key exchange, ratchet state persistence, reconnection, and error surfacing — so you don't have to.
-
 ### Why not use raw Web Crypto?
 
-You could. But you'd need to:
-
-- Implement X25519 key exchange correctly
-- Implement Double Ratchet from scratch (forward secrecy, out-of-order messages, MAX_SKIP, state persistence)
-- Build a key server and WebSocket relay
-- Handle key registration, peer key lookup, and offline delivery
-- Deal with reconnects, backoff, and error surfacing
-- Persist ratchet state to IndexedDB across page reloads
-- Test all of the above with cryptographic test vectors
-
-Encra is the production-grade version of that work, auditable and open source.
+You could. But you'd need to implement X25519 key exchange, Double Ratchet from scratch (forward secrecy, out-of-order messages, state persistence), a key server, a WebSocket relay, reconnection logic, offline delivery, and cryptographic test vectors. Encra is the production-grade version of that work — auditable and open source.
 
 ### How secure is it?
 
 Encra uses the same cryptographic primitives as Signal:
 
-| Purpose | Algorithm | Why |
-|---|---|---|
-| Key exchange | X25519 (ECDH) | Fast, side-channel resistant, 128-bit security |
-| Encryption | XSalsa20-Poly1305 | Authenticated encryption, random nonce, no IV reuse |
-| KDF / ratchet | Keyed BLAKE2b-256 | Fast, secure, no length-extension attacks |
-| Key generation | X25519 keypair | OS CSPRNG via libsodium `randombytes_buf` |
-| Key derivation | `crypto_box_beforenm` | Proper ECDH + HSalsa20 — not raw DH output |
-
-The server stores **only** public keys and ciphertext blobs. No plaintext, no private keys, no shared secrets — ever.
+| Purpose | Algorithm |
+|---|---|
+| Key exchange | X25519 (ECDH) via `crypto_box_beforenm` |
+| Encryption | XSalsa20-Poly1305 (authenticated) |
+| KDF / ratchet | Keyed BLAKE2b-256 |
+| Randomness | OS CSPRNG via libsodium `randombytes_buf` |
 
 ### What platforms are supported?
 
-| Platform | Package |
-|---|---|
-| React 18+ | `@encra/react` |
-| Vue 3, Svelte, Angular | `@encra/client` |
-| Vanilla JS (browser) | `@encra/client` |
-| Node.js 18+ | `@encra/client` or `@encra/core` |
-| React Native | `@encra/core` (hooks coming soon) |
+React 18+, Vue 3, Svelte, Angular, vanilla JS (browser), Node.js 18+, and React Native (`@encra/core` only).
 
 ### How fast is setup?
 
-Under 5 minutes:
-
-1. `npm install @encra/react` (or `@encra/client`)
-2. Set `NEXT_PUBLIC_ENCRA_API_KEY` in your `.env`
-3. Drop in `useE2EChat()` (or `new EncraClient()`)
-4. Done — your messages are end-to-end encrypted
-
-Or run `npx encra init` for an interactive wizard that writes the env file and a starter component for your framework.
+Under 5 minutes: install the package, set your API key, drop in one hook or class. Or run `npx encra init` for an interactive wizard.
 
 ---
 
@@ -381,16 +356,30 @@ Or run `npx encra init` for an interactive wizard that writes the env file and a
 | Threat | How |
 |---|---|
 | Server breach | Server stores only public keys + ciphertext. No plaintext, no private keys. |
-| Network interception (MITM) | XSalsa20-Poly1305 authenticated encryption — tampering is detected and rejected. |
-| Key compromise exposing past data | Double Ratchet with per-message key deletion (forward secrecy). |
-| Key compromise exposing future data | DH ratchet step on every direction change (break-in recovery). |
+| Network interception | XSalsa20-Poly1305 authenticated encryption — tampering is detected and rejected. |
+| Key compromise exposing past messages | Double Ratchet with per-message key deletion (forward secrecy). |
+| Key compromise exposing future messages | DH ratchet step on every direction change (break-in recovery). |
 | Weak randomness | All nonces and key pairs via libsodium `randombytes_buf` (OS CSPRNG). |
 
-### What we do NOT protect against
+### What we do not protect against
 
-- **Compromised endpoint** — if the device running your app is fully compromised (malware, physical access), Encra cannot help.
-- **Metadata** — Encra encrypts content, not metadata. The server knows *who* communicated and *when*, but not *what*.
-- **Key server impersonation** — Encra does not implement certificate pinning or key transparency (yet). Use `generateFingerprint()` for out-of-band verification.
+- **Compromised endpoint** — if the device is fully compromised (malware, physical access), Encra cannot help.
+- **Metadata** — Encra encrypts content, not metadata. The server knows *who* communicated and *when*, not *what*.
+- **Key server impersonation** — use `generateFingerprint()` for out-of-band verification of peer identity.
+
+### Double Ratchet — how forward secrecy works
+
+```
+Root Key
+   │
+   ├─► Chain Key 1 ──► Message Key 1  (used once, then deleted from memory)
+   │       │
+   │       └─► Chain Key 2 ──► Message Key 2  (used once, then deleted from memory)
+   │
+   └─► (DH ratchet step on direction flip — new root key, new chains)
+```
+
+If an attacker compromises today's key: past messages are safe (keys already deleted), future messages are safe after the next DH ratchet step.
 
 ---
 
@@ -405,7 +394,7 @@ const { messages, isReady, isConnecting, sendMessage, error } = useE2EChat({
   userId:         string,
   serverUrl?:     string,                       // default: https://api.encra.dev
   onError?:       (err: Error) => void,
-  onWireMessage?: (event: WireEvent) => void,   // raw wire data
+  onWireMessage?: (event: WireEvent) => void,
 })
 
 // Encrypted file transfer (up to 50 MB)
@@ -431,8 +420,8 @@ const { encryptFields, decryptFields, isReady, error } = useE2EForm({
 const client = new EncraClient({ apiKey, userId, serverUrl? })
 
 // Lifecycle
-await client.connect()          // resolves when WebSocket is open
-client.disconnect()             // close and clean up
+await client.connect()
+client.disconnect()
 
 // Messaging
 await client.sendMessage(to: string, text: string)
@@ -445,19 +434,14 @@ await client.decryptFile(encrypted: EncryptedFile, from: string)  // → File
 await client.encryptFields(fields: Record<string, string>, to: string)   // → EncryptedFields
 await client.decryptFields(encrypted: EncryptedFields, from: string)     // → Record<string, string>
 
-// Synchronous state
+// State
 client.isReady        // boolean
 client.isConnecting   // boolean
-client.messages       // Message[]  — sent + received, newest last
+client.messages       // Message[]
 client.error          // Error | null
 
 // Events
-client.on('ready',        ()      => ...)
-client.on('connecting',   ()      => ...)
-client.on('disconnected', ()      => ...)
-client.on('message',      (msg)   => ...)   // { from, text, timestamp }
-client.on('error',        (err)   => ...)   // recoverable errors
-client.on('wire',         (event) => ...)   // raw encrypted wire data
+client.on('ready' | 'connecting' | 'disconnected' | 'message' | 'error' | 'wire', listener)
 client.off(event, listener)
 ```
 
@@ -465,34 +449,13 @@ client.off(event, listener)
 
 ```typescript
 import {
-  // Key pairs
-  generateKeyPair,        // () => Promise<{ publicKey, privateKey }>
-  exportKey,              // (key: Uint8Array) => string  (URL-safe base64)
-  importKey,              // (b64: string) => Uint8Array
-  sodiumReady,            // () => Promise<void>  — await once at startup
-
-  // Key exchange
-  deriveSharedSecret,     // (myPrivKey, theirPubKey) => Promise<Uint8Array>
-
-  // Symmetric encryption
-  encrypt,                // (plaintext, sharedSecret) => Promise<{ ciphertext, nonce }>
-  decrypt,                // ({ ciphertext, nonce }, sharedSecret) => Promise<string>
-
-  // Database field encryption (no server required)
-  generateFieldKey,       // () => Promise<Uint8Array>  — 32-byte symmetric key
-  encryptField,           // (value, key) => Promise<{ ciphertext, nonce }>
-  decryptField,           // (encrypted, key) => Promise<string>
-
-  // Safety numbers
-  generateFingerprint,    // (pubKeyA, pubKeyB) => Promise<string>
-
-  // Double Ratchet (advanced)
+  generateKeyPair, exportKey, importKey, sodiumReady,
+  deriveSharedSecret,
+  encrypt, decrypt,
+  generateFieldKey, encryptField, decryptField,
+  generateFingerprint,
   DoubleRatchet,
-
-  // Typed errors
-  InvalidKeyError,
-  DecryptionFailedError,
-  KeyNotFoundError,
+  InvalidKeyError, DecryptionFailedError, KeyNotFoundError,
 } from '@encra/core'
 ```
 
@@ -506,14 +469,14 @@ npx encra ping      # Verify server reachability and API key validity
 
 ### Server REST API
 
-All endpoints require `Authorization: Bearer <api_key>`.
-
 | Method | Path | Description |
 |---|---|---|
 | `GET`  | `/health` | Liveness check |
 | `POST` | `/v1/keys` | Register / update a public key |
 | `GET`  | `/v1/keys/:userId` | Fetch a user's public key |
 | `WS`   | `/v1/relay?token=` | WebSocket relay — routes encrypted messages |
+
+All endpoints require `Authorization: Bearer <api_key>`.
 
 ---
 
@@ -524,14 +487,14 @@ All endpoints require `Authorization: Bearer <api_key>`.
 | Setup | Get an API key, done | Clone, configure Postgres, deploy |
 | Cost | Free tier + paid plans | Your own infra costs |
 | Maintenance | Zero | You own it |
-| Data location | Encra servers (US) | Wherever you deploy |
+| Data location | Encra servers | Wherever you deploy |
 | License | — | BUSL 1.1 (see below) |
 
 ---
 
 ## Self-hosting
 
-> **Note:** `packages/server` is licensed under BUSL 1.1. Self-hosting is permitted for non-commercial use. See [License](#license).
+> `packages/server` is BUSL 1.1 — self-hosting is permitted for non-commercial use.
 
 ```bash
 git clone https://github.com/adityayaduvanshi/encra
@@ -539,7 +502,7 @@ cd encra && npm install
 
 # Configure
 cp packages/server/.env.example packages/server/.env
-# Edit .env — set DATABASE_URL and JWT_SECRET
+# Set DATABASE_URL and JWT_SECRET
 
 # Migrate
 psql $DATABASE_URL -f packages/server/migrations/001_init.sql
@@ -549,8 +512,6 @@ psql $DATABASE_URL -f packages/server/migrations/002_message_queue_header.sql
 npm run build --workspace=packages/server
 npm start     --workspace=packages/server
 ```
-
-The server exposes `:3000` by default. Point `serverUrl` in your SDK config to your deployment.
 
 ---
 
@@ -563,7 +524,7 @@ npm run build        # Build all packages
 node e2e-test.mjs    # Alice → Bob end-to-end integration test
 ```
 
-Tests use [Vitest](https://vitest.dev) with cryptographic test vectors — the real libsodium primitives are tested, never mocked.
+Tests use [Vitest](https://vitest.dev) with cryptographic test vectors — the real libsodium primitives, never mocked.
 
 ---
 
