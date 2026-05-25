@@ -1,137 +1,195 @@
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import { useE2EFile } from '@encra/react'
 import type { EncryptedFile } from '@encra/react'
 import type { Config } from '../App'
-import { StatusBadge } from './StatusBadge'
+import { StatusDot } from './StatusBadge'
+import { emitLog } from '../lib/logger'
 
-interface Props {
-  config: Config
-  sessionId: string
+interface Props { config: Config; sessionId: string }
+
+function fmt(n: number) {
+  if (n < 1024) return `${n} B`
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1048576).toFixed(2)} MB`
 }
 
-function b64(bytes: Uint8Array, len = 24): string {
+function b64preview(bytes: Uint8Array, len = 28): string {
   let s = ''
   const end = Math.min(bytes.length, len)
   for (let i = 0; i < end; i++) s += String.fromCharCode(bytes[i]!)
-  return btoa(s).slice(0, len) + '…'
-}
-
-function fmtBytes(n: number) {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  return `${(n / 1024 / 1024).toFixed(2)} MB`
+  return btoa(s).slice(0, len)
 }
 
 // ── Alice panel ────────────────────────────────────────────────────────────────
 
-interface AliceProps {
-  userId: string
-  recipientId: string
-  config: Config
-  onEncrypted: (ef: EncryptedFile) => void
-}
-
-function AlicePanel({ userId, recipientId, config, onEncrypted }: AliceProps) {
+function AlicePanel({
+  userId, recipientId, config, onEncrypted,
+}: {
+  userId: string; recipientId: string; config: Config; onEncrypted: (ef: EncryptedFile) => void
+}) {
   const { encryptFile, isReady, error } = useE2EFile({
     apiKey: config.apiKey, userId, serverUrl: config.serverUrl,
   })
-  const [file,     setFile]     = useState<File | null>(null)
-  const [busy,     setBusy]     = useState(false)
-  const [done,     setDone]     = useState(false)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const [file,   setFile]   = useState<File | null>(null)
+  const [busy,   setBusy]   = useState(false)
+  const [done,   setDone]   = useState(false)
+  const [encErr, setEncErr] = useState<string | null>(null)
+  const inputRef  = useRef<HTMLInputElement>(null)
+  const didLogRef = useRef(false)
+
+  useEffect(() => {
+    if (isReady && !didLogRef.current) {
+      didLogRef.current = true
+      emitLog({
+        category: 'KEY', actor: 'Alice',
+        title: 'X25519 key pair registered (file hook)',
+        fields: [
+          { label: 'userId',      value: userId                         },
+          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'     },
+          { label: 'private key', value: 'stays on device — never sent' },
+        ],
+      })
+    }
+  }, [isReady, userId])
+
+  useEffect(() => {
+    if (error) emitLog({ category: 'ERROR', actor: 'Alice', title: error.message })
+  }, [error])
 
   async function handleEncrypt() {
     if (!file || !isReady) return
-    setBusy(true)
+    setBusy(true); setEncErr(null)
+
+    emitLog({
+      category: 'KEY', actor: 'Alice',
+      title: 'Fetching recipient device public keys',
+      fields: [
+        { label: 'for',      value: recipientId         },
+        { label: 'endpoint', value: 'GET /v1/keys/:userId' },
+      ],
+    })
+    emitLog({
+      category: 'CRYPTO', actor: 'Alice',
+      title: 'Starting file encryption',
+      fields: [
+        { label: 'file',      value: file.name                                  },
+        { label: 'size',      value: fmt(file.size)                             },
+        { label: 'mime',      value: file.type || 'unknown'                     },
+        { label: 'algorithm', value: 'X25519 ECDH → shared secret → XSalsa20-Poly1305' },
+        { label: 'nonce',     value: 'random 24 bytes (libsodium randombytes)'  },
+      ],
+    })
+
     try {
       const ef = await encryptFile(file, recipientId)
-      onEncrypted(ef)
-      setDone(true)
-    } catch (err) {
-      console.error(err)
-    } finally {
-      setBusy(false)
-    }
+      emitLog({
+        category: 'CRYPTO', actor: 'Alice',
+        title: `File encrypted for ${ef.devices.length} device(s)`,
+        fields: [
+          { label: 'devices',    value: ef.devices.map(d => d.deviceId).join(', ') },
+          { label: 'ciphertext', value: b64preview(ef.devices[0]?.ciphertext ?? new Uint8Array(), 28) + '…' },
+          { label: 'nonce',      value: b64preview(ef.devices[0]?.nonce      ?? new Uint8Array(), 18) + '…' },
+          { label: 'mac',        value: 'Poly1305 authenticator appended to ciphertext' },
+          { label: 'plaintext',  value: '(zero-knowledge — only ciphertext leaves device)' },
+        ],
+      })
+      onEncrypted(ef); setDone(true)
+    } catch (e) {
+      emitLog({
+        category: 'ERROR', actor: 'Alice',
+        title: 'File encryption failed',
+        fields: [{ label: 'error', value: e instanceof Error ? e.message : String(e) }],
+      })
+      setEncErr(e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
   }
 
-  function reset() {
-    setFile(null)
-    setDone(false)
-  }
+  if (done) return (
+    <div className="panel flex flex-col items-center justify-center" style={{ height: '100%', gap: 12, padding: 24 }}>
+      <div style={{
+        width: 48, height: 48, borderRadius: 12,
+        background: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22,
+      }}>
+        ✓
+      </div>
+      <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>File encrypted</p>
+      <p style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center' }}>
+        Payload sent to Bob's panel →
+      </p>
+      <button
+        className="btn btn-ghost"
+        style={{ marginTop: 4 }}
+        onClick={() => { setFile(null); setDone(false) }}
+      >
+        Encrypt another
+      </button>
+    </div>
+  )
 
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">👩</span>
+    <div className="panel flex flex-col" style={{ height: '100%' }}>
+      <div className="panel-header">
+        <div className="flex items-center gap-2.5">
+          <div style={{
+            width: 26, height: 26, borderRadius: 6,
+            background: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 11, color: 'var(--accent)', fontFamily: 'JetBrains Mono', fontWeight: 500,
+          }}>A</div>
           <div>
-            <p className="font-semibold text-slate-100 leading-none">Alice <span className="text-slate-500 font-normal text-xs">sender</span></p>
-            <p className="text-xs text-slate-500 font-mono mt-0.5 truncate">{userId}</p>
+            <p style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>Alice</p>
+            <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>sender</p>
           </div>
         </div>
-        <StatusBadge isReady={isReady} isConnecting={false} error={error} />
+        <StatusDot isReady={isReady} isConnecting={false} error={error} />
       </div>
 
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-4">
-        {done ? (
-          <div className="text-center space-y-3">
-            <div className="text-5xl">✅</div>
-            <p className="text-emerald-400 font-medium">File encrypted!</p>
-            <p className="text-slate-400 text-sm">
-              Payload sent to Bob's panel →
-            </p>
-            <button
-              onClick={reset}
-              className="text-sm text-slate-400 hover:text-slate-200 underline underline-offset-2"
-            >
-              Encrypt another file
-            </button>
-          </div>
-        ) : (
-          <>
-            {/* Drop zone */}
-            <div
-              onClick={() => inputRef.current?.click()}
-              className={`w-full border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-colors ${
-                file
-                  ? 'border-emerald-700 bg-emerald-950/30'
-                  : 'border-slate-700 hover:border-slate-500'
-              }`}
-            >
-              <input
-                ref={inputRef}
-                type="file"
-                className="hidden"
-                onChange={(e) => { setFile(e.target.files?.[0] ?? null) }}
-              />
-              {file ? (
-                <div className="space-y-1">
-                  <p className="text-2xl">📄</p>
-                  <p className="font-medium text-slate-100">{file.name}</p>
-                  <p className="text-xs text-slate-400">{file.type || 'unknown type'} · {fmtBytes(file.size)}</p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <p className="text-3xl">📂</p>
-                  <p className="text-slate-400 text-sm">Click to pick a file</p>
-                  <p className="text-slate-600 text-xs">Max 50 MB</p>
-                </div>
-              )}
+      <div className="flex-1 flex flex-col justify-center" style={{ padding: 20, gap: 12 }}>
+        {/* Drop zone */}
+        <div
+          className={`drop-zone${file ? ' has-file' : ''}`}
+          onClick={() => inputRef.current?.click()}
+        >
+          <input
+            ref={inputRef} type="file" className="hidden"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          />
+          {file ? (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: 8,
+                background: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18,
+              }}>
+                📄
+              </div>
+              <p style={{ fontSize: 13, fontWeight: 500, color: 'var(--text-1)' }}>{file.name}</p>
+              <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                {file.type || 'unknown'} · {fmt(file.size)}
+              </p>
             </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+              <p style={{ fontSize: 22, opacity: 0.4 }}>⊕</p>
+              <p style={{ fontSize: 13, color: 'var(--text-2)' }}>Click to select a file</p>
+              <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)' }}>max 50 MB</p>
+            </div>
+          )}
+        </div>
 
-            <button
-              onClick={handleEncrypt}
-              disabled={!file || !isReady || busy}
-              className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-medium rounded-lg transition-colors text-sm"
-            >
-              {busy ? 'Encrypting…' : `🔒 Encrypt for Bob`}
-            </button>
-          </>
+        {encErr && (
+          <p className="mono" style={{ fontSize: 11, color: 'var(--red)' }}>{encErr}</p>
         )}
 
-        {error && (
-          <p className="text-xs text-red-400 text-center">{error.message}</p>
-        )}
+        <button
+          className="btn btn-accent"
+          style={{ width: '100%' }}
+          onClick={handleEncrypt}
+          disabled={!file || !isReady || busy}
+        >
+          {busy ? 'Encrypting…' : '🔒 Encrypt for Bob'}
+        </button>
       </div>
     </div>
   )
@@ -139,105 +197,173 @@ function AlicePanel({ userId, recipientId, config, onEncrypted }: AliceProps) {
 
 // ── Bob panel ──────────────────────────────────────────────────────────────────
 
-interface BobProps {
-  userId: string
-  senderId: string
-  config: Config
-  encrypted: EncryptedFile | null
-}
-
-function BobPanel({ userId, senderId, config, encrypted }: BobProps) {
+function BobPanel({
+  userId, senderId, config, encrypted,
+}: {
+  userId: string; senderId: string; config: Config; encrypted: EncryptedFile | null
+}) {
   const { decryptFile, isReady, error } = useE2EFile({
     apiKey: config.apiKey, userId, serverUrl: config.serverUrl,
   })
   const [result, setResult] = useState<File | null>(null)
   const [busy,   setBusy]   = useState(false)
   const [decErr, setDecErr] = useState<string | null>(null)
+  const didLogRef = useRef(false)
+
+  useEffect(() => {
+    if (isReady && !didLogRef.current) {
+      didLogRef.current = true
+      emitLog({
+        category: 'KEY', actor: 'Bob',
+        title: 'X25519 key pair registered (file hook)',
+        fields: [
+          { label: 'userId',      value: userId                         },
+          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'     },
+          { label: 'private key', value: 'stays on device — never sent' },
+        ],
+      })
+    }
+  }, [isReady, userId])
+
+  useEffect(() => {
+    if (error) emitLog({ category: 'ERROR', actor: 'Bob', title: error.message })
+  }, [error])
 
   async function handleDecrypt() {
     if (!encrypted || !isReady) return
-    setBusy(true)
-    setDecErr(null)
+    setBusy(true); setDecErr(null)
+
+    emitLog({
+      category: 'KEY', actor: 'Bob',
+      title: 'Locating device envelope in payload',
+      fields: [
+        { label: 'envelopes', value: encrypted.devices.length.toString()     },
+        { label: 'action',    value: 'finding envelope addressed to this device' },
+      ],
+    })
+    emitLog({
+      category: 'CRYPTO', actor: 'Bob',
+      title: 'XSalsa20-Poly1305 file decrypt',
+      fields: [
+        { label: 'file',      value: encrypted.name                                   },
+        { label: 'algorithm', value: 'X25519 ECDH → shared secret → XSalsa20-Poly1305 decrypt' },
+        { label: 'nonce',     value: b64preview(encrypted.devices[0]?.nonce ?? new Uint8Array(), 18) + '…' },
+        { label: 'mac check', value: 'Poly1305 MAC verified before decryption'        },
+      ],
+    })
+
     try {
-      const f = await decryptFile(encrypted, senderId)
-      setResult(f)
-    } catch (err) {
-      setDecErr(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
+      const result = await decryptFile(encrypted, senderId)
+      emitLog({
+        category: 'CRYPTO', actor: 'Bob',
+        title: 'File decrypted successfully',
+        fields: [
+          { label: 'file',      value: result.name     },
+          { label: 'size',      value: fmt(result.size) },
+          { label: 'integrity', value: '✓ Poly1305 MAC verified'          },
+          { label: 'key source','value': `X25519(Bob.priv, Alice.pub)`    },
+        ],
+      })
+      setResult(result)
+    } catch (e) {
+      emitLog({
+        category: 'ERROR', actor: 'Bob',
+        title: 'File decryption failed',
+        fields: [{ label: 'error', value: e instanceof Error ? e.message : String(e) }],
+      })
+      setDecErr(e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
   }
 
   function download() {
     if (!result) return
     const url = URL.createObjectURL(result)
-    const a   = document.createElement('a')
+    const a = document.createElement('a')
     a.href = url; a.download = result.name; a.click()
     URL.revokeObjectURL(url)
   }
 
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">👨</span>
+    <div className="panel flex flex-col" style={{ height: '100%' }}>
+      <div className="panel-header">
+        <div className="flex items-center gap-2.5">
+          <div style={{
+            width: 26, height: 26, borderRadius: 6,
+            background: 'var(--purple-dim)', border: '1px solid rgba(168,85,247,0.25)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 11, color: 'var(--purple)', fontFamily: 'JetBrains Mono', fontWeight: 500,
+          }}>B</div>
           <div>
-            <p className="font-semibold text-slate-100 leading-none">Bob <span className="text-slate-500 font-normal text-xs">recipient</span></p>
-            <p className="text-xs text-slate-500 font-mono mt-0.5 truncate">{userId}</p>
+            <p style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>Bob</p>
+            <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>recipient</p>
           </div>
         </div>
-        <StatusBadge isReady={isReady} isConnecting={false} error={error} />
+        <StatusDot isReady={isReady} isConnecting={false} error={error} />
       </div>
 
-      <div className="flex-1 flex flex-col items-center justify-center p-6 gap-4">
+      <div className="flex-1 flex flex-col items-center justify-center" style={{ padding: 20, gap: 12 }}>
         {result ? (
-          <div className="text-center space-y-3">
-            <div className="text-5xl">📄</div>
-            <p className="text-emerald-400 font-medium">Decrypted successfully!</p>
-            <div className="bg-slate-800 rounded-lg px-4 py-3 text-sm space-y-1">
-              <p className="text-slate-200 font-medium">{result.name}</p>
-              <p className="text-slate-400 text-xs">{result.type || 'unknown type'} · {fmtBytes(result.size)}</p>
+          <>
+            <div style={{
+              width: 48, height: 48, borderRadius: 12,
+              background: 'var(--purple-dim)', border: '1px solid rgba(168,85,247,0.25)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22,
+            }}>📄</div>
+            <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--purple)' }}>Decrypted</p>
+            <div style={{
+              background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+              borderRadius: 8, padding: '10px 14px', textAlign: 'center', width: '100%',
+            }}>
+              <p style={{ fontSize: 13, fontWeight: 500 }}>{result.name}</p>
+              <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 3 }}>
+                {result.type || 'unknown'} · {fmt(result.size)}
+              </p>
             </div>
-            <button
-              onClick={download}
-              className="px-6 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium rounded-lg transition-colors"
-            >
+            <button className="btn btn-purple" style={{ width: '100%' }} onClick={download}>
               ⬇ Download
             </button>
             <button
+              className="mono"
+              style={{ fontSize: 10, color: 'var(--text-3)', background: 'none', border: 'none', cursor: 'pointer' }}
               onClick={() => setResult(null)}
-              className="block text-xs text-slate-500 hover:text-slate-300 mx-auto"
+              onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-2)')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-3)')}
             >
-              Reset
+              reset
             </button>
+          </>
+        ) : !encrypted ? (
+          <div style={{ textAlign: 'center', opacity: 0.4 }}>
+            <p style={{ fontSize: 28, marginBottom: 8 }}>📭</p>
+            <p className="mono" style={{ fontSize: 11, color: 'var(--text-3)' }}>
+              waiting for Alice…
+            </p>
           </div>
         ) : (
-          <div className="text-center space-y-4 w-full">
-            {!encrypted ? (
-              <div className="space-y-2">
-                <div className="text-4xl opacity-30">📭</div>
-                <p className="text-slate-600 text-sm">Waiting for Alice to encrypt a file…</p>
-              </div>
-            ) : (
-              <>
-                <div className="bg-slate-800 rounded-lg px-4 py-3 text-sm space-y-1 text-left">
-                  <p className="text-slate-400 text-xs uppercase tracking-wide mb-2">Incoming encrypted file</p>
-                  <p className="text-slate-200 font-medium">{encrypted.name}</p>
-                  <p className="text-slate-400 text-xs">{encrypted.mimeType} · {fmtBytes(encrypted.size)}</p>
-                  <p className="text-slate-500 text-xs mt-1">{encrypted.devices.length} device envelope(s)</p>
-                </div>
-                <button
-                  onClick={handleDecrypt}
-                  disabled={!isReady || busy}
-                  className="w-full py-2.5 bg-purple-700 hover:bg-purple-600 disabled:bg-slate-800 disabled:text-slate-600 text-white font-medium rounded-lg transition-colors text-sm"
-                >
-                  {busy ? 'Decrypting…' : '🔓 Decrypt File'}
-                </button>
-              </>
-            )}
-            {decErr && (
-              <p className="text-xs text-red-400">{decErr}</p>
-            )}
+          <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{
+              background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+              borderRadius: 8, padding: '12px 14px',
+            }}>
+              <p className="mono" style={{ fontSize: 9, color: 'var(--text-3)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                Incoming file
+              </p>
+              <p style={{ fontSize: 13, fontWeight: 500 }}>{encrypted.name}</p>
+              <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>
+                {encrypted.mimeType} · {fmt(encrypted.size)}
+              </p>
+              <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                {encrypted.devices.length} device envelope(s)
+              </p>
+            </div>
+            <button
+              className="btn btn-purple" style={{ width: '100%' }}
+              onClick={handleDecrypt}
+              disabled={!isReady || busy}
+            >
+              {busy ? 'Decrypting…' : '🔓 Decrypt file'}
+            </button>
+            {decErr && <p className="mono" style={{ fontSize: 11, color: 'var(--red)' }}>{decErr}</p>}
           </div>
         )}
       </div>
@@ -245,75 +371,93 @@ function BobPanel({ userId, senderId, config, encrypted }: BobProps) {
   )
 }
 
-// ── Wire / payload panel ───────────────────────────────────────────────────────
+// ── Wire panel ─────────────────────────────────────────────────────────────────
 
 function WirePanel({ encrypted }: { encrypted: EncryptedFile | null }) {
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="px-4 py-3 border-b border-slate-800 shrink-0">
-        <p className="text-sm font-semibold text-slate-300">🔌 Wire</p>
-        <p className="text-xs text-slate-500 mt-0.5">EncryptedFile payload</p>
+    <div className="terminal">
+      <div className="terminal-header">
+        <div className="terminal-dot" style={{ background: '#ff5f57' }} />
+        <div className="terminal-dot" style={{ background: '#febc2e' }} />
+        <div className="terminal-dot" style={{ background: '#28c840' }} />
+        <span className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginLeft: 8 }}>
+          payload.json
+        </span>
       </div>
-      <div className="flex-1 overflow-y-auto p-3 min-h-0">
+      <div className="terminal-body">
         {!encrypted ? (
-          <p className="text-center text-slate-600 text-xs pt-8">
-            Encrypt a file to see the payload
+          <p style={{ color: 'var(--text-3)', fontSize: 10 }}>
+            encrypt a file to see payload
           </p>
         ) : (
-          <div className="text-xs font-mono space-y-1 text-slate-400">
-            <p><span className="text-slate-500">name     </span><span className="text-slate-200">{encrypted.name}</span></p>
-            <p><span className="text-slate-500">mimeType </span><span className="text-slate-200">{encrypted.mimeType}</span></p>
-            <p><span className="text-slate-500">size     </span><span className="text-slate-200">{fmtBytes(encrypted.size)}</span></p>
-            <p className="mt-2 text-slate-500 uppercase tracking-wide text-[10px]">devices ({encrypted.devices.length})</p>
-            {encrypted.devices.map((d, i) => (
-              <div key={i} className="bg-slate-800 rounded-lg p-2 space-y-1 mt-1">
-                <p><span className="text-slate-500">deviceId  </span><span className="text-blue-400">{d.deviceId}</span></p>
-                <p><span className="text-slate-500">ciphertext</span></p>
-                <p className="text-emerald-400 break-all pl-2">{b64(d.ciphertext)}</p>
-                <p><span className="text-slate-500">nonce     </span><span className="text-amber-400">{b64(d.nonce, 16)}</span></p>
-              </div>
-            ))}
-            <p className="text-slate-600 pt-2 text-[10px] leading-relaxed">
-              The server stores only these bytes — name, mime type, and ciphertext.
-              Without the private key it is computationally infeasible to recover the plaintext.
+          <>
+            <div style={{ color: 'var(--border-strong)' }}>{'{'}</div>
+            <div style={{ paddingLeft: 14 }}>
+              <JsonLine k="name"     v={`"${encrypted.name}"`}     vc="var(--amber)" />
+              <JsonLine k="mimeType" v={`"${encrypted.mimeType}"`} vc="var(--amber)" />
+              <JsonLine k="size"     v={fmt(encrypted.size)}       vc="var(--blue)"  />
+              <div style={{ marginTop: 6, color: 'var(--text-2)' }}>"devices": [</div>
+              {encrypted.devices.map((d, i) => (
+                <div key={i} style={{ paddingLeft: 14 }}>
+                  <div style={{ color: 'var(--border-strong)' }}>{'{'}</div>
+                  <div style={{ paddingLeft: 14 }}>
+                    <JsonLine k="deviceId"   v={`"${d.deviceId}"`}             vc="var(--blue)"   />
+                    <JsonLine k="ciphertext" v={`"${b64preview(d.ciphertext)}…"` } vc="var(--accent)" />
+                    <JsonLine k="nonce"      v={`"${b64preview(d.nonce, 16)}…"`}  vc="var(--amber)"  />
+                  </div>
+                  <div style={{ color: 'var(--border-strong)' }}>{i < encrypted.devices.length - 1 ? '},' : '}'}</div>
+                </div>
+              ))}
+              <div style={{ color: 'var(--text-2)' }}>]</div>
+            </div>
+            <div style={{ color: 'var(--border-strong)' }}>{'}'}</div>
+            <p style={{ marginTop: 14, color: 'var(--text-3)', fontSize: 10, lineHeight: 1.6 }}>
+              ↑ only ciphertext is stored server-side.{'\n'}
+              private key never leaves the device.
             </p>
-          </div>
+          </>
         )}
       </div>
     </div>
   )
 }
 
-// ── FileDemo ──────────────────────────────────────────────────────────────────
+function JsonLine({ k, v, vc }: { k: string; v: string; vc: string }) {
+  return (
+    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+      <span style={{ color: 'var(--text-2)' }}>"{k}":</span>
+      <span style={{ color: vc, wordBreak: 'break-all' }}>{v},</span>
+    </div>
+  )
+}
+
+// ── FileDemo ───────────────────────────────────────────────────────────────────
 
 export default function FileDemo({ config, sessionId }: Props) {
   const [encrypted, setEncrypted] = useState<EncryptedFile | null>(null)
-
   const aliceId = `alice-file-${sessionId}`
   const bobId   = `bob-file-${sessionId}`
 
   return (
-    <div className="space-y-4 h-full">
-      <div className="flex gap-2 text-xs text-slate-400 bg-slate-900 rounded-lg px-4 py-3 border border-slate-800">
-        <span className="text-blue-400 shrink-0 mt-px">ℹ</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flex: 1, minHeight: 0 }}>
+      <div className="info-banner">
+        <span style={{ color: 'var(--accent)', flexShrink: 0 }}>ℹ</span>
         <span>
-          Alice encrypts a file using her private key and Bob's public key (X25519 + XSalsa20-Poly1305).
-          The <strong className="text-slate-300">Wire</strong> panel shows what gets transmitted —
-          an <code className="text-emerald-400">EncryptedFile</code> with one envelope per recipient device.
-          Bob's key decrypts only the envelope addressed to his device.
+          Alice encrypts using X25519 + XSalsa20-Poly1305. One ciphertext per recipient device.
+          The <span className="mono" style={{ color: 'var(--text-1)' }}>payload.json</span> panel shows
+          exactly what gets stored — ciphertext, never plaintext.
         </span>
       </div>
-
-      <div className="grid grid-cols-[1fr_240px_1fr] gap-4" style={{ height: 'calc(100vh - 260px)', minHeight: '400px' }}>
-        <AlicePanel
-          userId={aliceId} recipientId={bobId}
-          config={config} onEncrypted={setEncrypted}
-        />
-        <WirePanel encrypted={encrypted} />
-        <BobPanel
-          userId={bobId} senderId={aliceId}
-          config={config} encrypted={encrypted}
-        />
+      <div style={{ display: 'flex', gap: 12, flex: 1, minHeight: 0 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <AlicePanel userId={aliceId} recipientId={bobId} config={config} onEncrypted={setEncrypted} />
+        </div>
+        <div style={{ width: 240, flexShrink: 0 }}>
+          <WirePanel encrypted={encrypted} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <BobPanel userId={bobId} senderId={aliceId} config={config} encrypted={encrypted} />
+        </div>
       </div>
     </div>
   )

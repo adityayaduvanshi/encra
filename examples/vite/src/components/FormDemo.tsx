@@ -1,130 +1,195 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useE2EForm } from '@encra/react'
 import type { EncryptedFields } from '@encra/react'
 import type { Config } from '../App'
-import { StatusBadge } from './StatusBadge'
+import { StatusDot } from './StatusBadge'
+import { emitLog } from '../lib/logger'
 
-interface Props {
-  config: Config
-  sessionId: string
-}
+interface Props { config: Config; sessionId: string }
 
-const FORM_FIELDS = [
-  { name: 'fullName',       label: 'Full name',       placeholder: 'Alice Johnson',            type: 'text'  },
-  { name: 'dateOfBirth',    label: 'Date of birth',   placeholder: '1990-04-15',               type: 'text'  },
-  { name: 'ssn',            label: 'SSN',             placeholder: '123-45-6789',              type: 'text'  },
-  { name: 'email',          label: 'Email',           placeholder: 'alice@example.com',        type: 'email' },
-  { name: 'chiefComplaint', label: 'Chief complaint', placeholder: 'Persistent headaches…',   type: 'text'  },
-  { name: 'notes',          label: 'Private notes',   placeholder: 'Anything else…',           type: 'text'  },
+const FIELDS = [
+  { name: 'fullName',       label: 'Full name',      placeholder: 'Alice Johnson'          },
+  { name: 'dateOfBirth',    label: 'Date of birth',  placeholder: '1990-04-15'             },
+  { name: 'ssn',            label: 'SSN',            placeholder: '123-45-6789'            },
+  { name: 'email',          label: 'Email',          placeholder: 'alice@example.com'      },
+  { name: 'chiefComplaint', label: 'Chief complaint',placeholder: 'Persistent headaches…'  },
+  { name: 'notes',          label: 'Private notes',  placeholder: 'Anything else…'         },
 ] as const
+type FieldName = (typeof FIELDS)[number]['name']
 
-type FieldName = (typeof FORM_FIELDS)[number]['name']
+// ── Alice panel ────────────────────────────────────────────────────────────────
 
-// ── Alice / sender panel ───────────────────────────────────────────────────────
-
-interface AliceProps {
-  userId: string
-  recipientId: string
-  config: Config
-  onEncrypted: (ef: EncryptedFields) => void
-}
-
-function AlicePanel({ userId, recipientId, config, onEncrypted }: AliceProps) {
+function AlicePanel({
+  userId, recipientId, config, onEncrypted,
+}: {
+  userId: string; recipientId: string; config: Config; onEncrypted: (ef: EncryptedFields) => void
+}) {
   const { encryptFields, isReady, error } = useE2EForm({
     apiKey: config.apiKey, userId, serverUrl: config.serverUrl,
   })
   const [values, setValues] = useState<Record<FieldName, string>>({
     fullName: '', dateOfBirth: '', ssn: '', email: '', chiefComplaint: '', notes: '',
   })
-  const [busy, setBusy]  = useState(false)
-  const [sent, setSent]  = useState(false)
+  const [busy,   setBusy]   = useState(false)
+  const [sent,   setSent]   = useState(false)
+  const [encErr, setEncErr] = useState<string | null>(null)
+  const didLogRef = useRef(false)
 
-  function set(name: FieldName, value: string) {
-    setValues((v) => ({ ...v, [name]: value }))
-  }
+  useEffect(() => {
+    if (isReady && !didLogRef.current) {
+      didLogRef.current = true
+      emitLog({
+        category: 'KEY', actor: 'Alice',
+        title: 'X25519 key pair registered (form hook)',
+        fields: [
+          { label: 'userId',      value: userId                         },
+          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'     },
+          { label: 'private key', value: 'stays on device — never sent' },
+        ],
+      })
+    }
+  }, [isReady, userId])
+
+  useEffect(() => {
+    if (error) emitLog({ category: 'ERROR', actor: 'Alice', title: error.message })
+  }, [error])
+
+  const hasAny = Object.values(values).some((v) => v.trim())
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     if (!isReady) return
-    setBusy(true)
+    setBusy(true); setEncErr(null)
+
+    const filled = Object.entries(values).filter(([, v]) => v.trim())
+
+    emitLog({
+      category: 'KEY', actor: 'Alice',
+      title: 'Fetching recipient device public keys',
+      fields: [
+        { label: 'for',      value: recipientId           },
+        { label: 'endpoint', value: 'GET /v1/keys/:userId' },
+      ],
+    })
+    emitLog({
+      category: 'CRYPTO', actor: 'Alice',
+      title: `Encrypting ${filled.length} form field(s) individually`,
+      fields: [
+        { label: 'fields',       value: filled.map(([k]) => k).join(', ')                },
+        { label: 'algorithm',    value: 'X25519 ECDH + XSalsa20-Poly1305 per field'      },
+        { label: 'per-field nonce', value: 'random 24 bytes each (libsodium randombytes)' },
+        { label: 'field names',  value: 'plaintext (visible in payload)'                 },
+        { label: 'field values', value: 'encrypted — server sees only ciphertext'        },
+      ],
+    })
+
     try {
       const ef = await encryptFields(
-        Object.fromEntries(
-          Object.entries(values).filter(([, v]) => v.trim())
-        ) as Record<string, string>,
+        Object.fromEntries(filled) as Record<string, string>,
         recipientId,
       )
-      onEncrypted(ef)
-      setSent(true)
+
+      emitLog({
+        category: 'CRYPTO', actor: 'Alice',
+        title: `${filled.length} field(s) encrypted for ${ef.devices.length} device(s)`,
+        fields: filled.map(([k]) => ({
+          label: k,
+          value: (ef.devices[0]?.fields[k]?.ciphertext.slice(0, 26) ?? '?') + '… (ciphertext)',
+        })),
+      })
+      emitLog({
+        category: 'TRANSPORT', actor: 'Alice',
+        title: 'Encrypted form payload ready for transit',
+        fields: [
+          { label: 'devices',  value: ef.devices.length.toString()   },
+          { label: 'fields',   value: Object.keys(ef.devices[0]?.fields ?? {}).length.toString() },
+          { label: 'format',   value: '{ devices: [{ deviceId, fields: { [name]: { ciphertext, nonce } } }] }' },
+          { label: 'plaintext','value': '(zero-knowledge — never leaves client)' },
+        ],
+      })
+
+      onEncrypted(ef); setSent(true)
     } catch (err) {
-      console.error(err)
-    } finally {
-      setBusy(false)
-    }
+      emitLog({
+        category: 'ERROR', actor: 'Alice',
+        title: 'Form encryption failed',
+        fields: [{ label: 'error', value: err instanceof Error ? err.message : String(err) }],
+      })
+      setEncErr(err instanceof Error ? err.message : String(err))
+    } finally { setBusy(false) }
   }
 
-  if (sent) {
-    return (
-      <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-        <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">
-          <div className="flex items-center gap-2">
-            <span className="text-xl">👩</span>
-            <p className="font-semibold text-slate-100">Alice <span className="text-slate-500 font-normal text-xs">patient</span></p>
-          </div>
-          <StatusBadge isReady={isReady} isConnecting={false} error={error} />
-        </div>
-        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-6 text-center">
-          <div className="text-5xl">📤</div>
-          <p className="text-emerald-400 font-medium">Form submitted (encrypted)</p>
-          <p className="text-slate-400 text-sm">The doctor (Bob) received the encrypted payload →</p>
-          <button
-            onClick={() => setSent(false)}
-            className="text-sm text-slate-400 hover:text-slate-200 underline underline-offset-2"
-          >
-            Fill again
-          </button>
-        </div>
-      </div>
-    )
-  }
+  if (sent) return (
+    <div className="panel flex flex-col items-center justify-center" style={{ height: '100%', gap: 12, padding: 24 }}>
+      <div style={{
+        width: 48, height: 48, borderRadius: 12,
+        background: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22,
+      }}>✓</div>
+      <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--accent)' }}>Form submitted (encrypted)</p>
+      <p style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center' }}>
+        Bob (doctor) received the encrypted payload →
+      </p>
+      <button className="btn btn-ghost" style={{ marginTop: 4 }} onClick={() => setSent(false)}>
+        Fill again
+      </button>
+    </div>
+  )
 
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">👩</span>
+    <div className="panel flex flex-col" style={{ height: '100%' }}>
+      <div className="panel-header">
+        <div className="flex items-center gap-2.5">
+          <div style={{
+            width: 26, height: 26, borderRadius: 6,
+            background: 'var(--accent-dim)', border: '1px solid var(--accent-border)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 11, color: 'var(--accent)', fontFamily: 'JetBrains Mono', fontWeight: 500,
+          }}>A</div>
           <div>
-            <p className="font-semibold text-slate-100 leading-none">Alice <span className="text-slate-500 font-normal text-xs">patient</span></p>
-            <p className="text-xs text-slate-500 font-mono mt-0.5 truncate">{userId}</p>
+            <p style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>Alice</p>
+            <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>patient</p>
           </div>
         </div>
-        <StatusBadge isReady={isReady} isConnecting={false} error={error} />
+        <StatusDot isReady={isReady} isConnecting={false} error={error} />
       </div>
 
-      <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
-        <p className="text-xs text-slate-500 uppercase tracking-wide">Medical intake form</p>
-        {FORM_FIELDS.map((f) => (
+      <form
+        onSubmit={handleSubmit}
+        className="flex-1 overflow-y-auto"
+        style={{ padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}
+      >
+        <p className="mono" style={{ fontSize: 9, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 2 }}>
+          Medical intake form
+        </p>
+
+        {FIELDS.map((f) => (
           <div key={f.name}>
-            <label className="block text-xs font-medium text-slate-400 mb-1">{f.label}</label>
+            <label className="mono" style={{
+              display: 'block', fontSize: 9,
+              color: 'var(--text-3)', marginBottom: 4,
+              textTransform: 'uppercase', letterSpacing: '0.06em',
+            }}>
+              {f.label}
+            </label>
             <input
-              type={f.type}
+              className="field"
+              type="text"
               value={values[f.name]}
-              onChange={(e) => set(f.name, e.target.value)}
+              onChange={(e) => setValues((v) => ({ ...v, [f.name]: e.target.value }))}
               placeholder={f.placeholder}
               disabled={!isReady}
-              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-600 disabled:opacity-40 focus:outline-none focus:border-emerald-500 transition-colors"
             />
           </div>
         ))}
 
-        {error && (
-          <p className="text-xs text-red-400">{error.message}</p>
-        )}
+        {encErr && <p className="mono" style={{ fontSize: 11, color: 'var(--red)' }}>{encErr}</p>}
 
         <button
           type="submit"
-          disabled={!isReady || busy || Object.values(values).every((v) => !v.trim())}
-          className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-medium rounded-lg transition-colors text-sm"
+          className="btn btn-accent"
+          style={{ width: '100%', marginTop: 4 }}
+          disabled={!isReady || busy || !hasAny}
         >
           {busy ? 'Encrypting…' : '🔒 Submit encrypted'}
         </button>
@@ -133,96 +198,170 @@ function AlicePanel({ userId, recipientId, config, onEncrypted }: AliceProps) {
   )
 }
 
-// ── Bob / recipient panel ─────────────────────────────────────────────────────
+// ── Bob panel ──────────────────────────────────────────────────────────────────
 
-interface BobProps {
-  userId: string
-  senderId: string
-  config: Config
-  encrypted: EncryptedFields | null
-}
-
-function BobPanel({ userId, senderId, config, encrypted }: BobProps) {
+function BobPanel({
+  userId, senderId, config, encrypted,
+}: {
+  userId: string; senderId: string; config: Config; encrypted: EncryptedFields | null
+}) {
   const { decryptFields, isReady, error } = useE2EForm({
     apiKey: config.apiKey, userId, serverUrl: config.serverUrl,
   })
   const [result, setResult] = useState<Record<string, string> | null>(null)
   const [busy,   setBusy]   = useState(false)
   const [decErr, setDecErr] = useState<string | null>(null)
+  const didLogRef = useRef(false)
+
+  useEffect(() => {
+    if (isReady && !didLogRef.current) {
+      didLogRef.current = true
+      emitLog({
+        category: 'KEY', actor: 'Bob',
+        title: 'X25519 key pair registered (form hook)',
+        fields: [
+          { label: 'userId',      value: userId                         },
+          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'     },
+          { label: 'private key', value: 'stays on device — never sent' },
+        ],
+      })
+    }
+  }, [isReady, userId])
+
+  useEffect(() => {
+    if (error) emitLog({ category: 'ERROR', actor: 'Bob', title: error.message })
+  }, [error])
 
   async function handleDecrypt() {
     if (!encrypted || !isReady) return
-    setBusy(true)
-    setDecErr(null)
+    setBusy(true); setDecErr(null)
+
+    const fieldNames = Object.keys(encrypted.devices[0]?.fields ?? {})
+    emitLog({
+      category: 'KEY', actor: 'Bob',
+      title: 'Locating own device envelope in payload',
+      fields: [
+        { label: 'envelopes', value: encrypted.devices.length.toString()         },
+        { label: 'action',    value: 'matching deviceId → ECDH with Alice pubkey' },
+      ],
+    })
+    emitLog({
+      category: 'CRYPTO', actor: 'Bob',
+      title: `Decrypting ${fieldNames.length} field(s)`,
+      fields: [
+        { label: 'from',      value: senderId                                          },
+        { label: 'algorithm', value: 'X25519 ECDH + XSalsa20-Poly1305 decrypt per field' },
+        { label: 'fields',    value: fieldNames.join(', ')                             },
+        { label: 'mac check', value: 'Poly1305 MAC verified per field before decryption' },
+      ],
+    })
+
     try {
-      const r = await decryptFields(encrypted, senderId)
-      setResult(r)
-    } catch (err) {
-      setDecErr(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusy(false)
-    }
+      const result = await decryptFields(encrypted, senderId)
+      emitLog({
+        category: 'CRYPTO', actor: 'Bob',
+        title: `${Object.keys(result).length} field(s) decrypted successfully`,
+        fields: Object.entries(result).map(([k, v]) => ({
+          label: k,
+          value: v,
+          mono: false,
+        })),
+      })
+      setResult(result)
+    } catch (e) {
+      emitLog({
+        category: 'ERROR', actor: 'Bob',
+        title: 'Form decryption failed',
+        fields: [{ label: 'error', value: e instanceof Error ? e.message : String(e) }],
+      })
+      setDecErr(e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
   }
 
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800 shrink-0">
-        <div className="flex items-center gap-2">
-          <span className="text-xl">👨‍⚕️</span>
+    <div className="panel flex flex-col" style={{ height: '100%' }}>
+      <div className="panel-header">
+        <div className="flex items-center gap-2.5">
+          <div style={{
+            width: 26, height: 26, borderRadius: 6,
+            background: 'var(--purple-dim)', border: '1px solid rgba(168,85,247,0.25)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 11, color: 'var(--purple)', fontFamily: 'JetBrains Mono', fontWeight: 500,
+          }}>B</div>
           <div>
-            <p className="font-semibold text-slate-100 leading-none">Bob <span className="text-slate-500 font-normal text-xs">doctor</span></p>
-            <p className="text-xs text-slate-500 font-mono mt-0.5 truncate">{userId}</p>
+            <p style={{ fontSize: 13, fontWeight: 600, lineHeight: 1 }}>Bob</p>
+            <p className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>doctor</p>
           </div>
         </div>
-        <StatusBadge isReady={isReady} isConnecting={false} error={error} />
+        <StatusDot isReady={isReady} isConnecting={false} error={error} />
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4 min-h-0">
+      <div className="flex-1 overflow-y-auto" style={{ padding: 16 }}>
         {result ? (
-          <div className="space-y-3">
-            <p className="text-xs text-slate-500 uppercase tracking-wide">Decrypted patient record</p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <p className="mono" style={{ fontSize: 9, color: 'var(--accent)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 2 }}>
+              ✓ Decrypted patient record
+            </p>
             {Object.entries(result).map(([key, value]) => {
-              const field = FORM_FIELDS.find((f) => f.name === key)
+              const field = FIELDS.find((f) => f.name === key)
               return (
                 <div key={key}>
-                  <p className="text-xs text-slate-500 mb-0.5">{field?.label ?? key}</p>
-                  <p className="text-sm text-slate-100 bg-slate-800 rounded-lg px-3 py-2 font-mono">
-                    {value}
+                  <p className="mono" style={{ fontSize: 9, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
+                    {field?.label ?? key}
                   </p>
+                  <div style={{
+                    background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                    borderRadius: 7, padding: '8px 12px',
+                    fontSize: 13, fontWeight: 500, color: 'var(--text-1)',
+                  }}>
+                    {value}
+                  </div>
                 </div>
               )
             })}
             <button
+              className="mono"
+              style={{ fontSize: 10, color: 'var(--text-3)', background: 'none', border: 'none', cursor: 'pointer', marginTop: 4, textAlign: 'left' }}
               onClick={() => setResult(null)}
-              className="text-xs text-slate-500 hover:text-slate-300 underline underline-offset-2 mt-2"
+              onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-2)')}
+              onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-3)')}
             >
-              Reset
+              reset
             </button>
           </div>
         ) : (
-          <div className="flex flex-col items-center justify-center h-full gap-4 text-center">
+          <div className="flex flex-col items-center justify-center" style={{ height: '100%', gap: 12 }}>
             {!encrypted ? (
-              <div className="space-y-2">
-                <div className="text-4xl opacity-30">📭</div>
-                <p className="text-slate-600 text-sm">Waiting for Alice to submit a form…</p>
+              <div style={{ textAlign: 'center', opacity: 0.4 }}>
+                <p style={{ fontSize: 28, marginBottom: 8 }}>📭</p>
+                <p className="mono" style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                  waiting for Alice…
+                </p>
               </div>
             ) : (
-              <div className="space-y-4 w-full">
-                <div className="bg-slate-800 rounded-lg px-4 py-3 text-left space-y-1">
-                  <p className="text-xs text-slate-500 uppercase tracking-wide mb-2">Incoming encrypted form</p>
-                  <p className="text-xs text-slate-400">
-                    {encrypted.devices.length} device envelope(s) ·{' '}
+              <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{
+                  background: 'var(--bg-elevated)', border: '1px solid var(--border)',
+                  borderRadius: 8, padding: '12px 14px',
+                }}>
+                  <p className="mono" style={{ fontSize: 9, color: 'var(--text-3)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+                    Incoming encrypted form
+                  </p>
+                  <p className="mono" style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                    {encrypted.devices.length} device envelope(s)
+                  </p>
+                  <p className="mono" style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 2 }}>
                     {Object.keys(encrypted.devices[0]?.fields ?? {}).length} field(s)
                   </p>
                 </div>
                 <button
+                  className="btn btn-purple" style={{ width: '100%' }}
                   onClick={handleDecrypt}
                   disabled={!isReady || busy}
-                  className="w-full py-2.5 bg-purple-700 hover:bg-purple-600 disabled:bg-slate-800 disabled:text-slate-600 text-white font-medium rounded-lg transition-colors text-sm"
                 >
                   {busy ? 'Decrypting…' : '🔓 Decrypt fields'}
                 </button>
-                {decErr && <p className="text-xs text-red-400">{decErr}</p>}
+                {decErr && <p className="mono" style={{ fontSize: 11, color: 'var(--red)' }}>{decErr}</p>}
               </div>
             )}
           </div>
@@ -236,83 +375,103 @@ function BobPanel({ userId, senderId, config, encrypted }: BobProps) {
 
 function WirePanel({ encrypted }: { encrypted: EncryptedFields | null }) {
   return (
-    <div className="flex flex-col bg-slate-900 rounded-xl border border-slate-800 overflow-hidden h-full">
-      <div className="px-4 py-3 border-b border-slate-800 shrink-0">
-        <p className="text-sm font-semibold text-slate-300">🔌 Wire</p>
-        <p className="text-xs text-slate-500 mt-0.5">EncryptedFields payload</p>
+    <div className="terminal">
+      <div className="terminal-header">
+        <div className="terminal-dot" style={{ background: '#ff5f57' }} />
+        <div className="terminal-dot" style={{ background: '#febc2e' }} />
+        <div className="terminal-dot" style={{ background: '#28c840' }} />
+        <span className="mono" style={{ fontSize: 10, color: 'var(--text-3)', marginLeft: 8 }}>
+          payload.json
+        </span>
       </div>
-      <div className="flex-1 overflow-y-auto p-3 min-h-0">
+      <div className="terminal-body">
         {!encrypted ? (
-          <p className="text-center text-slate-600 text-xs pt-8">
-            Submit the form to see the payload
+          <p style={{ color: 'var(--text-3)', fontSize: 10 }}>
+            submit the form to see payload
           </p>
         ) : (
-          <div className="text-xs font-mono space-y-2 text-slate-400">
-            <p className="text-slate-500 uppercase tracking-wide text-[10px]">
-              devices ({encrypted.devices.length})
-            </p>
-            {encrypted.devices.map((dev, i) => (
-              <div key={i} className="bg-slate-800 rounded-lg p-2 space-y-2">
-                <p>
-                  <span className="text-slate-500">deviceId </span>
-                  <span className="text-blue-400">{dev.deviceId}</span>
-                </p>
-                <p className="text-slate-500 text-[10px] uppercase tracking-wide">fields</p>
-                {Object.entries(dev.fields).map(([key, { ciphertext, nonce }]) => (
-                  <div key={key} className="pl-2 border-l border-slate-700 space-y-0.5">
-                    <p className="text-slate-300">{key}</p>
-                    <p>
-                      <span className="text-slate-500">ct  </span>
-                      <span className="text-emerald-400 break-all">{ciphertext.slice(0, 20)}…</span>
-                    </p>
-                    <p>
-                      <span className="text-slate-500">n   </span>
-                      <span className="text-amber-400">{nonce.slice(0, 16)}…</span>
-                    </p>
+          <>
+            <div style={{ color: 'var(--border-strong)' }}>{'{'}</div>
+            <div style={{ paddingLeft: 14 }}>
+              <div style={{ color: 'var(--text-2)', marginBottom: 4 }}>"devices": [</div>
+              {encrypted.devices.map((dev, di) => (
+                <div key={di} style={{ paddingLeft: 14 }}>
+                  <div style={{ color: 'var(--border-strong)' }}>{'{'}</div>
+                  <div style={{ paddingLeft: 14 }}>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <span style={{ color: 'var(--text-2)' }}>"deviceId":</span>
+                      <span style={{ color: 'var(--blue)' }}>"{dev.deviceId}",</span>
+                    </div>
+                    <div style={{ color: 'var(--text-2)', marginTop: 4 }}>"fields": {'{'}</div>
+                    {Object.entries(dev.fields).map(([key, { ciphertext, nonce }]) => (
+                      <div key={key} style={{ paddingLeft: 14, marginBottom: 6 }}>
+                        <span style={{ color: 'var(--text-2)' }}>"{key}":</span>
+                        <div style={{ paddingLeft: 14 }}>
+                          <div style={{ color: 'var(--border-strong)' }}>{'{'}</div>
+                          <div style={{ paddingLeft: 10 }}>
+                            <div>
+                              <span style={{ color: 'var(--text-3)' }}>"ct": </span>
+                              <span style={{ color: 'var(--accent)', wordBreak: 'break-all' }}>
+                                "{ciphertext.slice(0, 18)}…",
+                              </span>
+                            </div>
+                            <div>
+                              <span style={{ color: 'var(--text-3)' }}>"n": </span>
+                              <span style={{ color: 'var(--amber)' }}>"{nonce.slice(0, 14)}…"</span>
+                            </div>
+                          </div>
+                          <div style={{ color: 'var(--border-strong)' }}>{'},'}</div>
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{ color: 'var(--text-2)' }}>{'},'}</div>
                   </div>
-                ))}
-              </div>
-            ))}
-            <p className="text-slate-600 text-[10px] leading-relaxed pt-1">
-              Field <em>names</em> are visible; field <em>values</em> are
-              encrypted with unique nonces — your DB stores only ciphertext.
-            </p>
-          </div>
+                  <div style={{ color: 'var(--border-strong)' }}>
+                    {di < encrypted.devices.length - 1 ? '},' : '}'}
+                  </div>
+                </div>
+              ))}
+              <div style={{ color: 'var(--text-2)' }}>]</div>
+            </div>
+            <div style={{ color: 'var(--border-strong)' }}>{'}'}</div>
+            <div style={{ marginTop: 14, display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <p style={{ color: 'var(--text-3)', fontSize: 10 }}>field names → visible</p>
+              <p style={{ color: 'var(--accent)', fontSize: 10 }}>field values → encrypted ✓</p>
+            </div>
+          </>
         )}
       </div>
     </div>
   )
 }
 
-// ── FormDemo ──────────────────────────────────────────────────────────────────
+// ── FormDemo ───────────────────────────────────────────────────────────────────
 
 export default function FormDemo({ config, sessionId }: Props) {
   const [encrypted, setEncrypted] = useState<EncryptedFields | null>(null)
-
   const aliceId = `alice-form-${sessionId}`
   const bobId   = `bob-form-${sessionId}`
 
   return (
-    <div className="space-y-4 h-full">
-      <div className="flex gap-2 text-xs text-slate-400 bg-slate-900 rounded-lg px-4 py-3 border border-slate-800">
-        <span className="text-blue-400 shrink-0 mt-px">ℹ</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, flex: 1, minHeight: 0 }}>
+      <div className="info-banner">
+        <span style={{ color: 'var(--accent)', flexShrink: 0 }}>ℹ</span>
         <span>
-          Alice (patient) fills in a HIPAA intake form and encrypts it for Bob (doctor).
-          The <strong className="text-slate-300">Wire</strong> panel shows what gets stored on the server —
-          field names in plaintext, field <em>values</em> as ciphertext. Only Bob's private key can decrypt.
+          Alice (patient) encrypts a HIPAA intake form for Bob (doctor). Each field gets a unique nonce.
+          The <span className="mono" style={{ color: 'var(--text-1)' }}>payload.json</span> shows
+          field names in plaintext, values as ciphertext — only Bob's key can decrypt.
         </span>
       </div>
-
-      <div className="grid grid-cols-[1fr_240px_1fr] gap-4" style={{ height: 'calc(100vh - 260px)', minHeight: '500px' }}>
-        <AlicePanel
-          userId={aliceId} recipientId={bobId}
-          config={config} onEncrypted={setEncrypted}
-        />
-        <WirePanel encrypted={encrypted} />
-        <BobPanel
-          userId={bobId} senderId={aliceId}
-          config={config} encrypted={encrypted}
-        />
+      <div style={{ display: 'flex', gap: 12, flex: 1, minHeight: 0 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <AlicePanel userId={aliceId} recipientId={bobId} config={config} onEncrypted={setEncrypted} />
+        </div>
+        <div style={{ width: 240, flexShrink: 0 }}>
+          <WirePanel encrypted={encrypted} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <BobPanel userId={bobId} senderId={aliceId} config={config} encrypted={encrypted} />
+        </div>
       </div>
     </div>
   )
