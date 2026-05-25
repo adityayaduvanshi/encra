@@ -110,10 +110,11 @@ interface WireMessage {
   header?:       MessageHeader
 }
 
-const BACKOFF_BASE_MS  = 1_000
-const BACKOFF_MAX_MS   = 60_000
-const MAX_MESSAGES     = 200
-const ENCRA_SERVER_URL = 'https://api.encra.dev'
+const BACKOFF_BASE_MS    = 1_000
+const BACKOFF_MAX_MS     = 60_000
+const MAX_MESSAGES       = 200
+const PEER_KEY_TTL_MS    = 5 * 60 * 1_000   // 5 minutes — re-fetch to pick up new devices
+const ENCRA_SERVER_URL   = 'https://api.encra.dev'
 
 /** Maximum file size accepted by `encryptFile` (50 MB). */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -144,10 +145,11 @@ export class EncraClient {
   private _isConnecting: boolean    = false
   private _error:        Error|null = null
 
-  private _keyPair:      KeyPair | null                = null
-  private _deviceId:     string | null                 = null
-  private _ratchets:     Map<string, DoubleRatchet>    = new Map()
-  private _peerKeyCache: Map<string, DeviceKey[]>      = new Map()
+  private _keyPair:          KeyPair | null                        = null
+  private _deviceId:         string | null                         = null
+  private _ratchets:         Map<string, DoubleRatchet>            = new Map()
+  private _peerKeyCache:     Map<string, DeviceKey[]>              = new Map()
+  private _peerKeyCacheTime: Map<string, number>                   = new Map()
   private _socket:       WebSocket | null              = null
   private _retryCount:   number                        = 0
   private _retryTimer:   ReturnType<typeof setTimeout>|null = null
@@ -217,6 +219,8 @@ export class EncraClient {
     this._socket       = null
     this._keyPair      = null
     this._ratchets.clear()
+    this._peerKeyCache.clear()
+    this._peerKeyCacheTime.clear()
     this._setReady(false)
     this._setConnecting(false)
   }
@@ -307,11 +311,8 @@ export class EncraClient {
       )
     }
 
+    // _fetchPeerDeviceKeys throws if the user has no keys registered
     const peerDevices = await this._fetchPeerDeviceKeys(from)
-    const senderDevice = peerDevices.find((d) => d.publicKey) ?? peerDevices[0]
-    if (!senderDevice) {
-      throw new DecryptionFailedError(`decryptFile: could not fetch sender key for '${from}'.`)
-    }
 
     const { default: sodium } = await import('libsodium-wrappers')
     await sodium.ready
@@ -465,10 +466,11 @@ export class EncraClient {
     this._emit('message', msg)
   }
 
-  /** Fetch all device keys for a peer, with in-memory caching. */
+  /** Fetch all device keys for a peer, with a 5-minute TTL cache. */
   private async _fetchPeerDeviceKeys(peerId: string): Promise<DeviceKey[]> {
-    const cached = this._peerKeyCache.get(peerId)
-    if (cached) return cached
+    const cached    = this._peerKeyCache.get(peerId)
+    const cachedAt  = this._peerKeyCacheTime.get(peerId) ?? 0
+    if (cached && Date.now() - cachedAt < PEER_KEY_TTL_MS) return cached
 
     const res = await fetch(`${this._httpBase}/v1/keys/${peerId}`, {
       headers: { Authorization: `Bearer ${this._apiKey}` },
@@ -487,6 +489,7 @@ export class EncraClient {
       publicKey: importKey(d.publicKey),
     }))
     this._peerKeyCache.set(peerId, keys)
+    this._peerKeyCacheTime.set(peerId, Date.now())
     return keys
   }
 
@@ -526,10 +529,10 @@ export class EncraClient {
     }
 
     if (!this._keyPair) throw new Error('Key pair not initialised.')
-    // Find the sender's specific device key
+    // Find the sender's specific device key — must match exactly; each device has a unique key pair
     const peerDevices  = await this._fetchPeerDeviceKeys(peerId)
-    const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId) ?? peerDevices[0]
-    if (!senderDevice) throw new Error(`Key not found for device ${fromDeviceId} of '${peerId}'.`)
+    const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId)
+    if (!senderDevice) throw new Error(`Key not found for device '${fromDeviceId}' of '${peerId}'.`)
 
     const shared  = await deriveSharedSecret(this._keyPair.privateKey, senderDevice.publicKey)
     const ratchet = await DoubleRatchet.initReceiver(shared, this._keyPair)
