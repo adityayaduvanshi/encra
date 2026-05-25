@@ -62,6 +62,7 @@ Most apps store user data in plaintext. One breach, one subpoena, one rogue empl
 - 🔒 **HIPAA / GDPR by default** — you can't leak what you can't read
 - ⚡ **5-minute setup** — one hook or one class, no cryptography expertise needed
 - 🔑 **Zero key management** — key generation, exchange, rotation, and persistence handled for you
+- 📱 **Multi-device ready** — each browser/device gets its own key pair; messages are encrypted once per device automatically
 - 🛡️ **Built on libsodium** — the same crypto library used by Signal, WhatsApp, and 1Password
 
 **The alternative is months of work:**
@@ -412,6 +413,22 @@ const { encryptFields, decryptFields, isReady, error } = useE2EForm({
   serverUrl?: string,
   onError?:   (err: Error) => void,
 })
+
+// Shared types (also exported from @encra/client)
+interface DeviceKey { deviceId: string; publicKey: Uint8Array }
+
+// encryptFile / encryptFields return a multi-device envelope —
+// one ciphertext per registered device of the recipient:
+interface EncryptedFile {
+  name: string; mimeType: string; size: number
+  devices: Array<{ deviceId: string; ciphertext: Uint8Array; nonce: Uint8Array }>
+}
+interface EncryptedFields {
+  devices: Array<{
+    deviceId: string
+    fields: Record<string, { ciphertext: string; nonce: string }>
+  }>
+}
 ```
 
 ### `@encra/client` — `EncraClient`
@@ -473,7 +490,7 @@ npx encra ping      # Verify server reachability and API key validity
 |---|---|---|
 | `GET`  | `/health` | Liveness check |
 | `POST` | `/v1/keys` | Register / update a public key |
-| `GET`  | `/v1/keys/:userId` | Fetch a user's public key |
+| `GET`  | `/v1/keys/:userId` | Fetch all device public keys for a user → `{ userId, devices: [{ deviceId, publicKey }] }` |
 | `WS`   | `/v1/relay?token=` | WebSocket relay — routes encrypted messages |
 
 All endpoints require `Authorization: Bearer <api_key>`.
@@ -507,6 +524,7 @@ cp packages/server/.env.example packages/server/.env
 # Migrate
 psql $DATABASE_URL -f packages/server/migrations/001_init.sql
 psql $DATABASE_URL -f packages/server/migrations/002_message_queue_header.sql
+psql $DATABASE_URL -f packages/server/migrations/003_device_keys.sql
 
 # Build & start
 npm run build --workspace=packages/server

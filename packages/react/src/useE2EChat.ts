@@ -75,9 +75,11 @@ interface WireMessage {
   header?: MessageHeader
 }
 
-const BACKOFF_BASE_MS = 1000
-const BACKOFF_MAX_MS  = 60_000
-const MAX_MESSAGES    = 200
+const BACKOFF_BASE_MS  = 1000
+const BACKOFF_MAX_MS   = 60_000
+const MAX_MESSAGES     = 200
+/** Re-fetch peer device list after this many ms — ensures new devices are seen. */
+const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
 
 /**
  * React hook for sending and receiving end-to-end encrypted messages.
@@ -117,11 +119,12 @@ export function useE2EChat({
   const [isConnecting, setIsConnecting] = useState(false)
   const [error,        setError]        = useState<Error | null>(null)
 
-  const keyPairRef      = useRef<KeyPair | null>(null)
-  const deviceIdRef     = useRef<string>('')
-  const ratchetsRef     = useRef<Map<string, DoubleRatchet>>(new Map())
-  const peerKeyCacheRef = useRef<Map<string, DeviceKey[]>>(new Map())
-  const socketRef       = useRef<WebSocket | null>(null)
+  const keyPairRef          = useRef<KeyPair | null>(null)
+  const deviceIdRef         = useRef<string>('')
+  const ratchetsRef         = useRef<Map<string, DoubleRatchet>>(new Map())
+  const peerKeyCacheRef     = useRef<Map<string, DeviceKey[]>>(new Map())
+  const peerKeyCacheTimeRef = useRef<Map<string, number>>(new Map())
+  const socketRef           = useRef<WebSocket | null>(null)
 
   // Stable refs so callbacks can change without restarting the effect
   const onErrorRef       = useRef(onError)
@@ -141,8 +144,9 @@ export function useE2EChat({
    */
   const fetchPeerDeviceKeys = useCallback(
     async (peerId: string): Promise<DeviceKey[]> => {
-      const cached = peerKeyCacheRef.current.get(peerId)
-      if (cached) return cached
+      const cached   = peerKeyCacheRef.current.get(peerId)
+      const cachedAt = peerKeyCacheTimeRef.current.get(peerId) ?? 0
+      if (cached && Date.now() - cachedAt < PEER_KEY_TTL_MS) return cached
 
       const res = await fetch(`${httpBase}/v1/keys/${peerId}`, {
         headers: { Authorization: `Bearer ${apiKey}` },
@@ -162,6 +166,7 @@ export function useE2EChat({
         publicKey: importKey(d.publicKey),
       }))
       peerKeyCacheRef.current.set(peerId, deviceKeys)
+      peerKeyCacheTimeRef.current.set(peerId, Date.now())
       return deviceKeys
     },
     [apiKey, httpBase]
@@ -386,6 +391,7 @@ export function useE2EChat({
       keyPairRef.current = null
       ratchetsRef.current.clear()
       peerKeyCacheRef.current.clear()
+      peerKeyCacheTimeRef.current.clear()
     }
   }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet])
 

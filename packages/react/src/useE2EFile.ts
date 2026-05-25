@@ -109,6 +109,8 @@ function readFileBytes(file: File | Blob): Promise<Uint8Array> {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const ENCRA_SERVER_URL = 'https://api.encra.dev'
+/** Re-fetch peer device list after this many ms — ensures new devices are seen. */
+const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
 
 /** Maximum file size supported in a single encrypt call (50 MB). */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -151,10 +153,11 @@ export function useE2EFile({
   const [isReady, setIsReady] = useState(false)
   const [error,   setError]   = useState<Error | null>(null)
 
-  const keyPairRef      = useRef<KeyPair | null>(null)
-  const deviceIdRef     = useRef<string>('')
-  const peerKeyCacheRef = useRef<Map<string, DeviceKey[]>>(new Map())
-  const httpBase        = serverUrl.replace(/\/$/, '')
+  const keyPairRef          = useRef<KeyPair | null>(null)
+  const deviceIdRef         = useRef<string>('')
+  const peerKeyCacheRef     = useRef<Map<string, DeviceKey[]>>(new Map())
+  const peerKeyCacheTimeRef = useRef<Map<string, number>>(new Map())
+  const httpBase            = serverUrl.replace(/\/$/, '')
 
   // ── Init ────────────────────────────────────────────────────────────────────
 
@@ -221,8 +224,9 @@ export function useE2EFile({
    * @throws {Error} If the server request fails.
    */
   const fetchPeerDeviceKeys = useCallback(async (peerId: string): Promise<DeviceKey[]> => {
-    const cached = peerKeyCacheRef.current.get(peerId)
-    if (cached) return cached
+    const cached   = peerKeyCacheRef.current.get(peerId)
+    const cachedAt = peerKeyCacheTimeRef.current.get(peerId) ?? 0
+    if (cached && Date.now() - cachedAt < PEER_KEY_TTL_MS) return cached
 
     const res = await fetch(`${httpBase}/v1/keys/${peerId}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
@@ -242,6 +246,7 @@ export function useE2EFile({
       publicKey: importKey(d.publicKey),
     }))
     peerKeyCacheRef.current.set(peerId, deviceKeys)
+    peerKeyCacheTimeRef.current.set(peerId, Date.now())
     return deviceKeys
   }, [httpBase, apiKey])
 

@@ -134,9 +134,13 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           socket.send(JSON.stringify({ type: 'error', message: 'register requires userId and deviceId.' }))
           return
         }
+        const newKey = `${msg.userId}:${msg.deviceId}`
+        // Remove previous entry if the client re-registers under a different key
+        // (prevents stale entries accumulating in the clients map)
+        if (registeredKey && registeredKey !== newKey) clients.delete(registeredKey)
         registeredUserId   = msg.userId
         registeredDeviceId = msg.deviceId
-        registeredKey      = `${msg.userId}:${msg.deviceId}`
+        registeredKey      = newKey
         clients.set(registeredKey, socket)
 
         flushQueuedMessages(msg.userId, msg.deviceId, socket).catch(() => {
