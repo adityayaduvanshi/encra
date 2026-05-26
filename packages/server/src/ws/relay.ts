@@ -200,7 +200,9 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
     })
 
     socket.on('close', () => {
-      if (registeredKey) clients.delete(registeredKey)
+      // Only remove this socket if it's still the one registered under the key.
+      // A rapid reconnect may have already replaced it in the map.
+      if (registeredKey && clients.get(registeredKey) === socket) clients.delete(registeredKey)
     })
   })
 

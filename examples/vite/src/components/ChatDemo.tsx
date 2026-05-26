@@ -116,8 +116,10 @@ function ChatPanel({
         ...(isDH ? [{ label: 'DH ratchet', value: 'new ephemeral key pair → new root key' }] : []),
       ],
     })
-    try { await sendMessage(recipientId, input.trim()); setInput('') }
-    catch (e) { console.error(e) }
+    const text = input.trim()
+    setInput('')                           // clear optimistically
+    try { await sendMessage(recipientId, text) }
+    catch (e) { setInput(text); console.error(e) }  // restore on failure
   }
 
   return (
