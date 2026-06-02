@@ -552,10 +552,11 @@ export class EncraClient {
   }
 
   private _connectWS(): void {
-    const ws = new WebSocket(`${this._wsBase}/v1/relay?token=${encodeURIComponent(this._apiKey)}`)
+    const ws = new WebSocket(`${this._wsBase}/v1/relay`)
     this._socket = ws
 
     ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ type: 'auth', token: this._apiKey }))
       ws.send(JSON.stringify({
         type:     'register',
         userId:   this._userId,

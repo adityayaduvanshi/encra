@@ -149,10 +149,12 @@ interface WsClient {
 function connectClient(port: number, token: string): Promise<WsClient> {
   return new Promise((resolve, reject) => {
     const received: Array<Record<string, unknown>> = []
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay?token=${encodeURIComponent(token)}`)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
 
     ws.on('error', reject)
     ws.on('open', () => {
+      // Send auth as first message — token never goes in the URL
+      ws.send(JSON.stringify({ type: 'auth', token }))
       resolve({
         ws,
         received,
@@ -205,13 +207,34 @@ describe('WebSocket relay', () => {
     await stopServer(server)
   })
 
-  it('rejects connection without a valid token', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay?token=bad.token.here`)
-    const closeCode = await new Promise<number>((resolve) => {
-      ws.on('close', (code) => resolve(code))
-      ws.on('error', () => resolve(4001))
+  it('rejects connection when auth message contains invalid token', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', token: 'bad.token.here' }))
+      })
+      ws.on('close', (code) => {
+        if (code === 4001) resolve()
+        else reject(new Error(`Expected close code 4001, got ${code}`))
+      })
+      ws.on('error', () => {})
+      setTimeout(() => reject(new Error('timeout waiting for close')), 2_000)
     })
-    expect(closeCode).toBe(4001)
+  })
+
+  it('rejects connection when non-auth message is sent before authenticating', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'register', userId: 'alice', deviceId: 'dev' }))
+      })
+      ws.on('close', (code) => {
+        if (code === 4001) resolve()
+        else reject(new Error(`Expected close code 4001, got ${code}`))
+      })
+      ws.on('error', () => {})
+      setTimeout(() => reject(new Error('timeout waiting for close')), 2_000)
+    })
   })
 
   it('sends registered confirmation after register message with userId + deviceId', async () => {

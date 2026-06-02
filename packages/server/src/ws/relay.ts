@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken'
 import { getPool } from '../db/pool.js'
 import { getPublisher, getSubscriber } from '../redis.js'
 import { logger } from '../logger.js'
+import { buildVerifyOptions } from '../middleware/auth.js'
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -40,7 +41,9 @@ const RELAY_CHANNEL = 'encra:relay'
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface RelayMessage {
-  type:          'register' | 'message'
+  type:          'auth' | 'register' | 'message'
+  // Authentication (first message after connect)
+  token?:        string
   // Registration
   userId?:       string
   deviceId?:     string
@@ -65,17 +68,19 @@ const clients = new Map<string, WebSocket>()
 
 // ── JWT auth ─────────────────────────────────────────────────────────────────
 
-function authenticateWs(req: IncomingMessage): string | null {
-  const url   = new URL(req.url ?? '', 'http://localhost')
-  const token = url.searchParams.get('token')
-  if (!token) return null
-
+/**
+ * Verify a JWT token string (used for first-message WebSocket auth).
+ * Algorithm is pinned to HS256 via buildVerifyOptions().
+ * Returns developerId on success, null on any failure.
+ */
+function verifyWsToken(token: string): string | null {
   const secret = process.env['JWT_SECRET']
   if (!secret) return null
 
   try {
-    const payload = jwt.verify(token, secret) as { developerId: string }
-    return payload.developerId ?? null
+    const payload = jwt.verify(token, secret, buildVerifyOptions()) as jwt.JwtPayload
+    if (!payload['developerId'] || !payload['exp']) return null
+    return payload['developerId'] as string
   } catch {
     return null
   }
@@ -189,14 +194,7 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
 
   const wss = new WebSocketServer({ server, path: '/v1/relay' })
 
-  wss.on('connection', (socket: WebSocket, req: IncomingMessage) => {
-    // ── Auth ──────────────────────────────────────────────────────────────────
-    const developerId = authenticateWs(req)
-    if (!developerId) {
-      socket.close(4001, 'Unauthorized')
-      return
-    }
-
+  wss.on('connection', (socket: WebSocket, _req: IncomingMessage) => {
     // ── Connection cap ────────────────────────────────────────────────────────
     if (wss.clients.size > MAX_CONNECTIONS) {
       logger.warn({ total: wss.clients.size }, 'WebSocket connection limit reached')
@@ -204,9 +202,13 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
       return
     }
 
-    logger.debug({ developerId, total: wss.clients.size }, 'WebSocket connected')
+    logger.debug({ total: wss.clients.size }, 'WebSocket connected (pending auth)')
 
-    // ── Per-connection state ──────────────────────────────────────────────────
+    // ── Per-connection auth state (set by first 'auth' message) ──────────────
+    let authenticated: boolean    = false
+    let developerId:   string | null = null
+
+    // ── Per-connection session state ──────────────────────────────────────────
     let registeredKey:      string | null = null
     let registeredUserId:   string | null = null
     let registeredDeviceId: string | null = null
@@ -267,6 +269,35 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         return
       }
 
+      // ── auth ────────────────────────────────────────────────────────────────
+      if (msg.type === 'auth') {
+        if (authenticated) {
+          socket.send(JSON.stringify({ type: 'error', message: 'Already authenticated.' }))
+          return
+        }
+        if (!msg.token) {
+          socket.close(4001, 'Unauthorized')
+          return
+        }
+        const devId = verifyWsToken(msg.token)
+        if (!devId) {
+          logger.warn('WebSocket auth failed — invalid or expired token')
+          socket.close(4001, 'Unauthorized')
+          return
+        }
+        authenticated = true
+        developerId   = devId
+        logger.debug({ developerId }, 'WebSocket authenticated')
+        socket.send(JSON.stringify({ type: 'authenticated' }))
+        return
+      }
+
+      // All remaining message types require a valid auth token
+      if (!authenticated) {
+        socket.close(4001, 'Unauthorized')
+        return
+      }
+
       // ── register ────────────────────────────────────────────────────────────
       if (msg.type === 'register') {
         if (!msg.userId || !msg.deviceId) {
@@ -299,7 +330,7 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         })
 
         socket.send(JSON.stringify({ type: 'registered', userId: msg.userId, deviceId: msg.deviceId }))
-        logger.debug({ key: registeredKey, developerId }, 'Client registered')
+        logger.debug({ key: registeredKey, developerId: developerId ?? 'unknown' }, 'Client registered')
         return
       }
 

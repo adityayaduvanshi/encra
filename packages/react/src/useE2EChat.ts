@@ -263,11 +263,11 @@ export function useE2EChat({
     }
 
     function connectWS() {
-      ws = new WebSocket(`${wsBase}/v1/relay?token=${encodeURIComponent(apiKey)}`)
+      ws = new WebSocket(`${wsBase}/v1/relay`)
       socketRef.current = ws
 
       ws.addEventListener('open', () => {
-        // Register with both userId and deviceId so the relay can route by device
+        ws!.send(JSON.stringify({ type: 'auth', token: apiKey }))
         ws!.send(JSON.stringify({ type: 'register', userId, deviceId: deviceIdRef.current }))
         retryCount = 0
         if (!cancelled) { setIsReady(true); setIsConnecting(false) }
