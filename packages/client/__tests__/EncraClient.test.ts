@@ -576,4 +576,118 @@ describe('EncraClient', () => {
     const client = new EncraClient({ apiKey: 'test-key', userId: 'ef2-nc', serverUrl: 'http://localhost:3000' })
     await expect(client.encryptFields({ x: 'y' }, 'other')).rejects.toThrow('not connected')
   })
+
+  // ── Presence ────────────────────────────────────────────────────────────────
+  // Each presence test uses a single connected client so `mockWs` always refers
+  // to that client's own socket (not a second client's socket).
+
+  async function makeConnectedClient(userId: string): Promise<[EncraClient, MockWebSocket, () => void]> {
+    setupMocks()
+    const kp = await generateKeyPair()
+    keyStore.set(userId, exportKey(kp.publicKey))
+    vi.spyOn(ratchetStore, 'loadKeyPair').mockResolvedValue({
+      pub:  exportKey(kp.publicKey),
+      priv: exportKey(kp.privateKey),
+    })
+    vi.spyOn(ratchetStore, 'saveKeyPair').mockResolvedValue()
+    vi.spyOn(ratchetStore, 'saveGhostMode').mockResolvedValue()
+    vi.spyOn(ratchetStore, 'loadGhostMode').mockResolvedValue(false)
+
+    const client = new EncraClient({ apiKey: 'test-key', userId, serverUrl: 'http://localhost:3000' })
+    await client.connect()
+    await new Promise((r) => setTimeout(r, 100))
+
+    return [client, mockWs, () => client.disconnect()]
+  }
+
+  it('sendPresence sends an encrypted presence message over the WebSocket', async () => {
+    const peerKP = await generateKeyPair()
+    const [alice, aliceWs, cleanup] = await makeConnectedClient('pres-alice')
+    keyStore.set('pres-bob', exportKey(peerKP.publicKey))
+
+    await alice.sendPresence('pres-bob', { status: 'online', lastSeenAt: Date.now(), isTyping: false })
+
+    const presMsg = aliceWs.sentMessages
+      .map((m) => JSON.parse(m) as { type: string; to?: string; ciphertext?: string })
+      .find((m) => m.type === 'presence')
+
+    expect(presMsg).toBeDefined()
+    expect(presMsg!.to).toBe('pres-bob')
+    expect(typeof presMsg!.ciphertext).toBe('string')
+    cleanup()
+  })
+
+  it('emits "presence" event with decrypted payload on incoming presence message', async () => {
+    // Alice connects; Bob's key is in the keyStore so Alice can encrypt to Bob.
+    // We send a presence message from Alice to Bob, then replay the wire bytes
+    // back to Alice as "from Bob" — since the key derivation is symmetric
+    // (ECDH(alice_priv, bob_pub) == ECDH(bob_priv, alice_pub)), Alice can
+    // decrypt her own presence message when it comes back as a Bob update.
+    const peerKP = await generateKeyPair()
+    const [alice, aliceWs, cleanup] = await makeConnectedClient('pres2-alice')
+    keyStore.set('pres2-bob', exportKey(peerKP.publicKey))
+
+    const onPresence = vi.fn()
+    alice.on('presence', onPresence)
+
+    await alice.sendPresence('pres2-bob', { status: 'away', lastSeenAt: 1_700_000_000, isTyping: true })
+
+    const presWire = aliceWs.sentMessages
+      .map((m) => JSON.parse(m) as Record<string, unknown>)
+      .find((m) => m['type'] === 'presence')
+    expect(presWire).toBeDefined()
+
+    // Simulate server routing that presence back to Alice as if it came from Bob.
+    // Alice will use her own key derivation (alice_priv × bob_pub) to decrypt —
+    // the same key she used to encrypt — so it round-trips correctly.
+    aliceWs.simulateMessage(JSON.stringify({
+      type:         'presence',
+      from:         'pres2-bob',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   presWire!['ciphertext'],
+      nonce:        presWire!['nonce'],
+    }))
+
+    await new Promise((r) => setTimeout(r, 100))
+    expect(onPresence).toHaveBeenCalledOnce()
+    const event = onPresence.mock.calls[0]![0] as { from: string; payload: { status: string; isTyping: boolean } }
+    expect(event.from).toBe('pres2-bob')
+    expect(event.payload.status).toBe('away')
+    expect(event.payload.isTyping).toBe(true)
+    cleanup()
+  })
+
+  it('sendPresence is a no-op when ghost mode is enabled', async () => {
+    const peerKP = await generateKeyPair()
+    const [alice, aliceWs, cleanup] = await makeConnectedClient('ghost-alice')
+    keyStore.set('ghost-bob', exportKey(peerKP.publicKey))
+
+    await alice.setGhostMode(true)
+    expect(alice.ghostMode).toBe(true)
+
+    const countBefore = aliceWs.sentMessages.filter((m) => JSON.parse(m).type === 'presence').length
+    await alice.sendPresence('ghost-bob', { status: 'online', lastSeenAt: Date.now(), isTyping: false })
+    const countAfter = aliceWs.sentMessages.filter((m) => JSON.parse(m).type === 'presence').length
+
+    expect(countAfter).toBe(countBefore)
+    cleanup()
+  })
+
+  it('setGhostMode broadcasts offline to cached contacts before enabling', async () => {
+    const peerKP = await generateKeyPair()
+    const [alice, aliceWs, cleanup] = await makeConnectedClient('ghost2-alice')
+    keyStore.set('ghost2-bob', exportKey(peerKP.publicKey))
+
+    // Pre-fetch Bob's keys so the peer cache is populated
+    await alice.sendPresence('ghost2-bob', { status: 'online', lastSeenAt: Date.now(), isTyping: false })
+    const countBefore = aliceWs.sentMessages.filter((m) => JSON.parse(m).type === 'presence').length
+
+    await alice.setGhostMode(true)
+    const countAfter = aliceWs.sentMessages.filter((m) => JSON.parse(m).type === 'presence').length
+
+    // At least one offline presence message should have been sent
+    expect(countAfter).toBeGreaterThan(countBefore)
+    expect(alice.ghostMode).toBe(true)
+    cleanup()
+  })
 })

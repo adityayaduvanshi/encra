@@ -1,7 +1,7 @@
 # Encra React Hooks — API Reference
 
-All three hooks are exported from `@encra/react`. They share the same IndexedDB key
-pair per `userId` — mounting all three for the same user only generates one key pair.
+All hooks are exported from `@encra/react`. They share the same IndexedDB key
+pair per `userId` — mounting all hooks for the same user only generates one key pair.
 
 ---
 
@@ -239,6 +239,115 @@ async function handleSubmit(values: Record<string, string>) {
 // Bob (doctor) decrypts
 const fields = await decryptFields(payload, patientId)
 // { fullName: 'Alice Johnson', ssn: '123-45-6789', ... }
+```
+
+---
+
+## useE2EPresence
+
+Encrypted real-time presence: online/offline status, typing indicators, last-seen
+timestamps, and ghost mode. All presence fields travel as XSalsa20-Poly1305 ciphertext
+— the server never sees plaintext status, last-seen times, or typing state.
+
+### Signature
+
+```typescript
+function useE2EPresence(options: UseE2EPresenceOptions): UseE2EPresenceResult
+```
+
+### Options
+
+```typescript
+interface UseE2EPresenceOptions {
+  apiKey:     string          // Developer API key (JWT)
+  userId:     string          // Current user's identifier
+  contacts:   string[]        // User IDs to track and broadcast presence to
+  serverUrl?: string          // Default: 'https://api.encra.dev'
+  onError?:   (err: Error) => void   // Called for recoverable per-message errors
+}
+```
+
+### Result
+
+```typescript
+interface UseE2EPresenceResult {
+  /** Presence map keyed by userId — only populated after the first update arrives. */
+  presence:     Record<string, PeerPresence>
+  /** True when connected and registered with the relay. */
+  isReady:      boolean
+  /** True if ghost mode is active — your presence is hidden from all contacts. */
+  ghostMode:    boolean
+  /**
+   * Enable or disable ghost mode.
+   * Enabling broadcasts `offline` to all contacts then suppresses future updates.
+   * Disabling broadcasts `online` to all contacts.
+   */
+  setGhostMode: (enabled: boolean) => Promise<void>
+  /**
+   * Send a typing indicator to a specific contact.
+   * Debounce in your UI — calling on every keystroke floods the relay.
+   */
+  sendTyping:   (to: string, isTyping: boolean) => Promise<void>
+  /** Broadcast your current status to every contact in `contacts`. */
+  setStatus:    (status: PresenceStatus) => Promise<void>
+  error:        Error | null
+}
+
+interface PeerPresence {
+  status:     PresenceStatus          // 'online' | 'offline' | 'away' | 'busy'
+  lastSeenAt: number | null           // Unix epoch ms from sender's device clock
+  isTyping:   boolean
+}
+```
+
+### Encryption model
+
+Presence uses a symmetric key derived per device pair:
+
+```
+presenceKey = BLAKE2b-256(message: "encra:presence:v1", key: ECDH(myPrivKey, theirPubKey))
+```
+
+Both parties derive the same key independently — no additional handshake.
+The domain separator `encra:presence:v1` cryptographically isolates presence keys
+from message ratchet keys derived from the same ECDH output.
+
+### Behaviour
+
+- On mount: restores key pair from IndexedDB (or generates new one), registers with
+  server, opens WebSocket, restores ghost mode from IndexedDB.
+- On first connection: broadcasts `{ status: 'online', isTyping: false }` to all contacts.
+- Presence updates are **ephemeral** — they are never queued for offline recipients.
+- On unmount: best-effort broadcasts `offline` to all contacts with cached presence keys.
+- Ghost mode persists across page reloads (stored in IndexedDB).
+- `sendPresenceTo` is a no-op when ghost mode is active or the socket is not open.
+- Exponential backoff reconnect: 1s base, 60s max, ±25% jitter.
+
+### Example
+
+```tsx
+const { presence, sendTyping, ghostMode, setGhostMode, setStatus, isReady } = useE2EPresence({
+  apiKey:   process.env.NEXT_PUBLIC_ENCRA_API_KEY!,
+  userId:   session.user.id,
+  contacts: ['bob', 'carol'],
+  onError:  (err) => console.warn('presence error:', err.message),
+})
+
+// Typing indicator (debounce in real usage)
+await sendTyping('bob', true)
+
+// Status change
+await setStatus('away')
+
+// Go invisible
+await setGhostMode(true)
+
+// Render contact status
+{Object.entries(presence).map(([uid, p]) => (
+  <div key={uid}>
+    {uid}: {p.status} {p.isTyping && '(typing...)'}
+  </div>
+))}
 ```
 
 ---

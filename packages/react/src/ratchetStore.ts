@@ -25,10 +25,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: string        // deviceId (UUID)
   }
+  settings: {
+    key:   string        // e.g. `${userId}:ghostMode`
+    value: unknown
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 3
+const DB_VERSION = 4
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -43,6 +47,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('ratchets')) db.createObjectStore('ratchets')
         if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
         if (!db.objectStoreNames.contains('devices'))  db.createObjectStore('devices')
+        if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
       },
     })
   }
@@ -83,6 +88,19 @@ export async function saveMessages(userId: string, messages: StoredMessage[]): P
   try {
     await (await getDB()).put('messages', messages, userId)
   } catch { /* non-fatal: messages still visible in-memory */ }
+}
+
+export async function loadGhostMode(userId: string): Promise<boolean> {
+  try {
+    const val = await (await getDB()).get('settings', `${userId}:ghostMode`)
+    return val === true
+  } catch { return false }
+}
+
+export async function saveGhostMode(userId: string, enabled: boolean): Promise<void> {
+  try {
+    await (await getDB()).put('settings', enabled, `${userId}:ghostMode`)
+  } catch { /* non-fatal */ }
 }
 
 /**

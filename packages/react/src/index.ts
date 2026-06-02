@@ -9,3 +9,12 @@ export type { EncryptedFields, UseE2EFormOptions, UseE2EFormResult } from './use
 
 export { E2EChatProvider, useE2EChatConfig } from './E2EChatProvider.js'
 export type { E2EChatConfig } from './E2EChatProvider.js'
+
+export { useE2EPresence } from './useE2EPresence.js'
+export type {
+  PeerPresence,
+  UseE2EPresenceOptions,
+  UseE2EPresenceResult,
+  PresenceStatus,
+  PresencePayload,
+} from './useE2EPresence.js'

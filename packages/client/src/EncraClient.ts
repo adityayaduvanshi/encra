@@ -6,12 +6,16 @@ import {
   sodiumReady,
   DecryptionFailedError,
   DoubleRatchet,
+  derivePresenceKey,
+  encryptPresence,
+  decryptPresence,
 } from '@encra/core'
-import type { KeyPair, MessageHeader } from '@encra/core'
+import type { KeyPair, MessageHeader, PresencePayload, PresenceStatus } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
+  loadGhostMode, saveGhostMode,
   getOrCreateDeviceId,
 } from './ratchetStore.js'
 
@@ -72,6 +76,18 @@ export interface EncryptedFields {
   }>
 }
 
+export type { PresenceStatus, PresencePayload }
+
+/** Decrypted presence update received from a peer device. */
+export interface PresenceEvent {
+  /** Sender's user ID. */
+  from:         string
+  /** Sender's device UUID. */
+  fromDeviceId: string
+  /** Decrypted presence state. */
+  payload:      PresencePayload
+}
+
 export interface WireEvent {
   direction:  'sent' | 'received'
   ciphertext: string
@@ -95,6 +111,7 @@ interface EventMap {
   message:      [msg: Message]
   error:        [err: Error]
   wire:         [event: WireEvent]
+  presence:     [event: PresenceEvent]
 }
 
 type Listener<K extends keyof EventMap> = (...args: EventMap[K]) => void
@@ -155,6 +172,8 @@ export class EncraClient {
   private _retryTimer:   ReturnType<typeof setTimeout>|null = null
   private _cancelled:    boolean                       = false
   private _connected:    boolean                       = false
+  private _ghostMode:    boolean                       = false
+  private _presenceKeys: Map<string, Uint8Array>       = new Map()
 
   private readonly _listeners = new Map<string, Listener<keyof EventMap>[]>()
 
@@ -180,6 +199,8 @@ export class EncraClient {
   get messages():     Message[]  { return this._messages }
   /** This device's stable ID (available after `connect()` resolves). */
   get deviceId():     string | null { return this._deviceId }
+  /** True if ghost mode is active — presence updates are suppressed. */
+  get ghostMode():    boolean    { return this._ghostMode }
 
   // ── Typed event emitter ───────────────────────────────────────────────────
 
@@ -221,6 +242,7 @@ export class EncraClient {
     this._ratchets.clear()
     this._peerKeyCache.clear()
     this._peerKeyCacheTime.clear()
+    this._presenceKeys.clear()
     this._setReady(false)
     this._setConnecting(false)
   }
@@ -253,6 +275,76 @@ export class EncraClient {
     }
 
     this._addMessage({ from: this._userId, text, timestamp: Date.now() })
+  }
+
+  /**
+   * Encrypt and send a presence update to all registered devices of `to`.
+   * No-op if ghost mode is enabled or the socket is not open.
+   *
+   * Presence updates are ephemeral — if the recipient is offline the update
+   * is silently dropped (never queued).
+   *
+   * @param to      - Recipient user ID.
+   * @param payload - Presence data (status, lastSeenAt, isTyping).
+   * @example
+   * await client.sendPresence('bob', { status: 'online', lastSeenAt: Date.now(), isTyping: false })
+   */
+  async sendPresence(to: string, payload: PresencePayload): Promise<void> {
+    if (this._ghostMode) return
+    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) return
+
+    const peerDevices = await this._fetchPeerDeviceKeys(to)
+    for (const device of peerDevices) {
+      const presenceKey = await this._derivePresenceKeyFor(to, device)
+      const encrypted   = await encryptPresence(payload, presenceKey)
+      this._socket.send(JSON.stringify({
+        type:       'presence',
+        to,
+        toDeviceId: device.deviceId,
+        ciphertext: encrypted.ciphertext,
+        nonce:      encrypted.nonce,
+      }))
+    }
+  }
+
+  /**
+   * Enable or disable ghost mode.
+   *
+   * When enabling: immediately broadcasts `offline` to all currently cached contacts,
+   * then suppresses all future presence updates until disabled.
+   * When disabling: broadcasts `online` to all cached contacts.
+   * State is persisted to IndexedDB across page reloads.
+   *
+   * @param enabled - True to activate ghost mode (hide your presence).
+   * @example
+   * await client.setGhostMode(true)   // go invisible
+   * await client.setGhostMode(false)  // reappear
+   */
+  async setGhostMode(enabled: boolean): Promise<void> {
+    if (enabled === this._ghostMode) return
+
+    if (enabled) {
+      // Broadcast offline BEFORE setting the flag so sendPresence still fires
+      for (const [peerId] of this._peerKeyCache) {
+        await this.sendPresence(peerId, {
+          status:     'offline',
+          lastSeenAt: Date.now(),
+          isTyping:   false,
+        }).catch(() => {})
+      }
+      this._ghostMode = true
+    } else {
+      this._ghostMode = false
+      for (const [peerId] of this._peerKeyCache) {
+        await this.sendPresence(peerId, {
+          status:     'online',
+          lastSeenAt: Date.now(),
+          isTyping:   false,
+        }).catch(() => {})
+      }
+    }
+
+    await saveGhostMode(this._userId, this._ghostMode)
   }
 
   /**
@@ -467,6 +559,18 @@ export class EncraClient {
   }
 
   /** Fetch all device keys for a peer, with a 5-minute TTL cache. */
+  private async _derivePresenceKeyFor(peerId: string, device: DeviceKey): Promise<Uint8Array> {
+    const cacheKey = `${peerId}:${device.deviceId}`
+    const cached   = this._presenceKeys.get(cacheKey)
+    if (cached) return cached
+
+    if (!this._keyPair) throw new Error('Key pair not initialised.')
+    const shared      = await deriveSharedSecret(this._keyPair.privateKey, device.publicKey)
+    const presenceKey = await derivePresenceKey(shared)
+    this._presenceKeys.set(cacheKey, presenceKey)
+    return presenceKey
+  }
+
   private async _fetchPeerDeviceKeys(peerId: string): Promise<DeviceKey[]> {
     const cached    = this._peerKeyCache.get(peerId)
     const cachedAt  = this._peerKeyCacheTime.get(peerId) ?? 0
@@ -541,6 +645,21 @@ export class EncraClient {
     return ratchet
   }
 
+  private async _handlePresenceMessage(msg: WireMessage): Promise<void> {
+    try {
+      const peerDevices  = await this._fetchPeerDeviceKeys(msg.from!)
+      const senderDevice = peerDevices.find((d) => d.deviceId === msg.fromDeviceId)
+      if (!senderDevice) return
+
+      const presenceKey = await this._derivePresenceKeyFor(msg.from!, senderDevice)
+      const payload     = await decryptPresence(
+        { ciphertext: msg.ciphertext!, nonce: msg.nonce! },
+        presenceKey,
+      )
+      this._emit('presence', { from: msg.from!, fromDeviceId: msg.fromDeviceId!, payload })
+    } catch { /* ignore malformed or undecryptable presence updates */ }
+  }
+
   private _scheduleReconnect(): void {
     if (this._cancelled) return
     const base  = Math.min(BACKOFF_BASE_MS * Math.pow(2, this._retryCount++), BACKOFF_MAX_MS)
@@ -573,6 +692,11 @@ export class EncraClient {
       try {
         msg = JSON.parse(event.data as string) as WireMessage
       } catch { return }
+
+      if (msg.type === 'presence' && msg.from && msg.fromDeviceId && msg.ciphertext && msg.nonce) {
+        void this._handlePresenceMessage(msg)
+        return
+      }
 
       if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.header) return
 
@@ -638,6 +762,9 @@ export class EncraClient {
 
     // Restore or generate a stable device ID for this browser/device
     this._deviceId = await getOrCreateDeviceId(this._userId)
+
+    // Restore ghost mode preference
+    this._ghostMode = await loadGhostMode(this._userId)
 
     // Restore message history
     const history = await loadMessages(this._userId)

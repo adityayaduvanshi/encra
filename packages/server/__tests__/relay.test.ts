@@ -342,4 +342,86 @@ describe('WebSocket relay', () => {
     expect(err['message']).toContain('toDeviceId')
     client.close()
   })
+
+  // ── Presence ──────────────────────────────────────────────────────────────
+
+  it('routes a presence update to an online recipient', async () => {
+    const alice = await connectClient(port, token)
+    const bob   = await connectClient(port, token)
+
+    alice.send({ type: 'register', userId: 'alice-p', deviceId: 'alice-dev' })
+    bob.send({ type: 'register', userId: 'bob-p', deviceId: 'bob-dev' })
+    await waitForMessage(alice, (m) => m['type'] === 'registered')
+    await waitForMessage(bob,   (m) => m['type'] === 'registered')
+
+    alice.send({
+      type:       'presence',
+      to:         'bob-p',
+      toDeviceId: 'bob-dev',
+      ciphertext: 'cHJlc2VuY2VDdA',
+      nonce:      'cHJlc2VuY2VOb25jZQ',
+    })
+
+    const msg = await waitForMessage(bob, (m) => m['type'] === 'presence')
+    expect(msg['from']).toBe('alice-p')
+    expect(msg['fromDeviceId']).toBe('alice-dev')
+    expect(msg['ciphertext']).toBe('cHJlc2VuY2VDdA')
+    expect(msg['nonce']).toBe('cHJlc2VuY2VOb25jZQ')
+
+    alice.close()
+    bob.close()
+  })
+
+  it('drops a presence update if recipient is offline (no queue)', async () => {
+    const alice = await connectClient(port, token)
+    alice.send({ type: 'register', userId: 'alice-ghost', deviceId: 'alice-dev' })
+    await waitForMessage(alice, (m) => m['type'] === 'registered')
+
+    // Bob is not connected — presence should be silently dropped
+    alice.send({
+      type:       'presence',
+      to:         'bob-ghost',
+      toDeviceId: 'bob-dev',
+      ciphertext: 'abc',
+      nonce:      'xyz',
+    })
+
+    // Give server time to process
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Bob connects later — should NOT receive any presence update
+    const bob = await connectClient(port, token)
+    bob.send({ type: 'register', userId: 'bob-ghost', deviceId: 'bob-dev' })
+    await waitForMessage(bob, (m) => m['type'] === 'registered')
+
+    await new Promise((r) => setTimeout(r, 100))
+    const presenceMsg = bob.received.find((m) => m['type'] === 'presence')
+    expect(presenceMsg).toBeUndefined()
+
+    alice.close()
+    bob.close()
+  })
+
+  it('returns error for presence sent without prior register', async () => {
+    const client = await connectClient(port, token)
+    client.send({
+      type: 'presence', to: 'someone', toDeviceId: 'dev', ciphertext: 'abc', nonce: 'xyz',
+    })
+
+    const err = await waitForMessage(client, (m) => m['type'] === 'error')
+    expect(err['message']).toContain('register')
+    client.close()
+  })
+
+  it('returns error for presence missing required fields', async () => {
+    const client = await connectClient(port, token)
+    client.send({ type: 'register', userId: 'test-pres', deviceId: 'dev-pres' })
+    await waitForMessage(client, (m) => m['type'] === 'registered')
+
+    client.send({ type: 'presence', to: 'someone' }) // missing toDeviceId, ciphertext, nonce
+
+    const err = await waitForMessage(client, (m) => m['type'] === 'error')
+    expect(err['message']).toContain('presence requires')
+    client.close()
+  })
 })

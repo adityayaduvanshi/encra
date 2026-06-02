@@ -15,3 +15,6 @@ export { DoubleRatchet, MAX_SKIP_KEYS, RATCHET_VERSION } from './crypto/ratchet.
 export type { MessageHeader, RatchetMessage, RatchetStateExport } from './crypto/ratchet.js'
 
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'
+
+export { derivePresenceKey, encryptPresence, decryptPresence } from './crypto/presence.js'
+export type { PresenceStatus, PresencePayload, EncryptedPresence } from './crypto/presence.js'
