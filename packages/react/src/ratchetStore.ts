@@ -8,6 +8,22 @@ export interface StoredMessage {
   timestamp: number
 }
 
+/**
+ * This device's X3DH prekey material (private halves included). Persisted so
+ * sessions survive reloads and incoming prekey messages can be answered.
+ */
+export interface StoredPreKeys {
+  /** Ed25519 identity key (base64). */
+  identityPub:  string
+  identityPriv: string
+  /** Current signed prekey: X25519 pair + identity signature over its public key. */
+  signedPreKey: { keyId: number; pub: string; priv: string; signature: string }
+  /** Unused one-time prekey pool (X25519 pairs). Consumed on inbound sessions. */
+  oneTimePreKeys: Array<{ keyId: number; pub: string; priv: string }>
+  /** Next one-time prekey id to allocate when replenishing the pool. */
+  nextOtpId: number
+}
+
 interface EncraSchema extends DBSchema {
   keypairs: {
     key:   string
@@ -25,10 +41,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: string        // deviceId (UUID)
   }
+  prekeys: {
+    key:   string        // userId
+    value: StoredPreKeys
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 3
+const DB_VERSION = 4
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -43,6 +63,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('ratchets')) db.createObjectStore('ratchets')
         if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
         if (!db.objectStoreNames.contains('devices'))  db.createObjectStore('devices')
+        if (!db.objectStoreNames.contains('prekeys'))  db.createObjectStore('prekeys')
       },
     })
   }
@@ -71,6 +92,18 @@ export async function saveRatchet(userId: string, peerKey: string, state: Ratche
   try {
     await (await getDB()).put('ratchets', state, `${userId}:${peerKey}`)
   } catch { /* non-fatal: ratchet still works in-memory */ }
+}
+
+export async function loadPreKeys(userId: string): Promise<StoredPreKeys | undefined> {
+  try {
+    return (await getDB()).get('prekeys', userId)
+  } catch { return undefined }
+}
+
+export async function savePreKeys(userId: string, prekeys: StoredPreKeys): Promise<void> {
+  try {
+    await (await getDB()).put('prekeys', prekeys, userId)
+  } catch { /* non-fatal: prekeys still held in-memory for this session */ }
 }
 
 export async function loadMessages(userId: string): Promise<StoredMessage[]> {
