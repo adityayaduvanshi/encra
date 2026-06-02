@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react'
 import ChatDemo from './components/ChatDemo'
 import FileDemo from './components/FileDemo'
 import FormDemo from './components/FormDemo'
+import FieldDemo from './components/FieldDemo'
 import { LogsDialog } from './components/LogsDialog'
 import { onLog } from './lib/logger'
 
@@ -10,12 +11,13 @@ export interface Config {
   serverUrl: string
 }
 
-type Tab = 'chat' | 'file' | 'form'
+type Tab = 'chat' | 'file' | 'form' | 'field'
 
 const TABS: { id: Tab; icon: string; label: string; hook: string; desc: string }[] = [
-  { id: 'chat', icon: '↔', label: 'Chat',  hook: 'useE2EChat', desc: 'Real-time messaging' },
-  { id: 'file', icon: '⊞', label: 'File',  hook: 'useE2EFile', desc: 'File encryption'    },
-  { id: 'form', icon: '≡', label: 'Form',  hook: 'useE2EForm', desc: 'Field encryption'   },
+  { id: 'chat',  icon: '↔', label: 'Chat',  hook: 'useE2EChat',  desc: 'Real-time messaging'  },
+  { id: 'file',  icon: '⊞', label: 'File',  hook: 'useE2EFile',  desc: 'File encryption'      },
+  { id: 'form',  icon: '≡', label: 'Form',  hook: 'useE2EForm',  desc: 'Form encryption'      },
+  { id: 'field', icon: '◈', label: 'Field', hook: 'useE2EField', desc: 'Local field encryption'},
 ]
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -264,9 +266,10 @@ export default function App() {
           key={tab}
           style={{ overflow: 'hidden', padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}
         >
-          {tab === 'chat' && <ChatDemo config={config} sessionId={sessionId} />}
-          {tab === 'file' && <FileDemo config={config} sessionId={sessionId} />}
-          {tab === 'form' && <FormDemo config={config} sessionId={sessionId} />}
+          {tab === 'chat'  && <ChatDemo  config={config} sessionId={sessionId} />}
+          {tab === 'file'  && <FileDemo  config={config} sessionId={sessionId} />}
+          {tab === 'form'  && <FormDemo  config={config} sessionId={sessionId} />}
+          {tab === 'field' && <FieldDemo sessionId={sessionId} />}
         </div>
       </div>
     </div>

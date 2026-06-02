@@ -45,10 +45,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: StoredPreKeys
   }
+  fieldkeys: {
+    key:   string        // userId
+    value: string        // base64url symmetric key (32 bytes)
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 4
+const DB_VERSION = 5
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -63,7 +67,8 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('ratchets')) db.createObjectStore('ratchets')
         if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
         if (!db.objectStoreNames.contains('devices'))  db.createObjectStore('devices')
-        if (!db.objectStoreNames.contains('prekeys'))  db.createObjectStore('prekeys')
+        if (!db.objectStoreNames.contains('prekeys'))   db.createObjectStore('prekeys')
+        if (!db.objectStoreNames.contains('fieldkeys')) db.createObjectStore('fieldkeys')
       },
     })
   }
@@ -116,6 +121,18 @@ export async function saveMessages(userId: string, messages: StoredMessage[]): P
   try {
     await (await getDB()).put('messages', messages, userId)
   } catch { /* non-fatal: messages still visible in-memory */ }
+}
+
+export async function loadFieldKey(userId: string): Promise<string | undefined> {
+  try {
+    return (await getDB()).get('fieldkeys', userId)
+  } catch { return undefined }
+}
+
+export async function saveFieldKey(userId: string, b64: string): Promise<void> {
+  try {
+    await (await getDB()).put('fieldkeys', b64, userId)
+  } catch { /* non-fatal: key still works in-memory */ }
 }
 
 /**

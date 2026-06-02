@@ -20,9 +20,10 @@ program
 
 program
   .command('keygen')
-  .description('Generate a test X25519 key pair (useful for debugging and integration tests)')
-  .action(async () => {
-    await runKeygen()
+  .description('Generate a key pair. Use --field for a symmetric field-encryption key.')
+  .option('-f, --field', 'Generate a symmetric field-encryption key (32-byte, base64url)')
+  .action(async (opts: { field?: boolean }) => {
+    await runKeygen(opts)
   })
 
 program

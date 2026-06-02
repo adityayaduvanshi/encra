@@ -11,8 +11,13 @@ import {
   buildPreKeyBundle,
   x3dhInitiate,
   x3dhRespond,
+  encryptField as coreEncryptField,
+  decryptField as coreDecryptField,
+  generateFieldKey as coreGenerateFieldKey,
 } from '@encra/core'
-import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage, EncryptedField } from '@encra/core'
+
+export type { EncryptedField }
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
@@ -857,5 +862,32 @@ export class EncraClient {
     await this._initPreKeys()
 
     if (!this._cancelled) this._connectWS()
+  }
+
+  // ── Field encryption (local, no server required) ──────────────────────────
+
+  /**
+   * Generate a fresh 32-byte symmetric key for field encryption.
+   * Store it securely (env var, secrets manager) — never in the DB.
+   */
+  async generateFieldKey(): Promise<Uint8Array> {
+    return coreGenerateFieldKey()
+  }
+
+  /**
+   * Encrypt a string value with a 32-byte field key.
+   * Returns `{ ciphertext, nonce }` as base64url strings — store both in your DB.
+   * Does not require `connect()`.
+   */
+  async encryptField(value: string, key: Uint8Array): Promise<EncryptedField> {
+    return coreEncryptField(value, key)
+  }
+
+  /**
+   * Decrypt a value produced by `encryptField`.
+   * Does not require `connect()`.
+   */
+  async decryptField(encrypted: EncryptedField, key: Uint8Array): Promise<string> {
+    return coreDecryptField(encrypted, key)
   }
 }

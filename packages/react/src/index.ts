@@ -9,3 +9,6 @@ export type { EncryptedFields, UseE2EFormOptions, UseE2EFormResult } from './use
 
 export { E2EChatProvider, useE2EChatConfig } from './E2EChatProvider.js'
 export type { E2EChatConfig } from './E2EChatProvider.js'
+
+export { useE2EField } from './useE2EField.js'
+export type { EncryptedField, UseE2EFieldOptions, UseE2EFieldResult } from './useE2EField.js'

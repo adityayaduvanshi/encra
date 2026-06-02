@@ -1,18 +1,47 @@
 import chalk from 'chalk'
-import { spinner, divider } from '../utils/print.js'
+import { spinner, divider, s } from '../utils/print.js'
 
 /**
  * Generate a fresh X25519 key pair and print both keys to stdout.
- * Useful for testing key exchange manually or verifying the crypto layer works.
+ * Pass --field to generate a symmetric field-encryption key instead.
  */
-export async function runKeygen(): Promise<void> {
-  const { generateKeyPair, exportKey, generateFingerprint, sodiumReady } = await import('@encra/core')
+export async function runKeygen(opts: { field?: boolean } = {}): Promise<void> {
+  const { generateKeyPair, exportKey, generateFingerprint, generateFieldKey, sodiumReady } = await import('@encra/core')
 
   console.log()
   const spin = spinner('Initializing libsodium…')
   await sodiumReady()
   spin.stop()
 
+  // ── Field key mode ───────────────────────────────────────────────────────
+  if (opts.field) {
+    const key = await generateFieldKey()
+    const b64 = exportKey(key)
+
+    console.log(chalk.bold('  Field Encryption Key') + chalk.dim('  (XSalsa20-Poly1305 · 32 bytes)'))
+    divider()
+    console.log()
+
+    console.log(`  ${chalk.dim('Key (base64url):')}`)
+    console.log(`  ${chalk.cyan(b64)}`)
+    console.log()
+
+    console.log(`  ${s.warn}  ${chalk.yellow('Store in AWS Secrets Manager, Vault, or .env')}`)
+    console.log(`  ${chalk.dim('     Never commit to source control.')}`)
+    console.log()
+
+    console.log(`  ${chalk.dim('Usage:')}`)
+    console.log(`  ${chalk.dim('  import { encryptField, decryptField, importKey } from \'@encra/core\'')}`)
+    console.log(`  ${chalk.dim('  const key       = importKey(process.env.FIELD_KEY)')}`)
+    console.log(`  ${chalk.dim('  const encrypted = await encryptField(ssn, key)')}`)
+    console.log()
+
+    divider()
+    console.log()
+    return
+  }
+
+  // ── X25519 key pair mode (default) ───────────────────────────────────────
   const kp          = await generateKeyPair()
   const pub         = exportKey(kp.publicKey)
   const priv        = exportKey(kp.privateKey)
