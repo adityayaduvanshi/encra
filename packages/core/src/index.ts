@@ -14,4 +14,29 @@ export { generateFingerprint } from './crypto/fingerprint.js'
 export { DoubleRatchet, MAX_SKIP_KEYS, RATCHET_VERSION } from './crypto/ratchet.js'
 export type { MessageHeader, RatchetMessage, RatchetStateExport } from './crypto/ratchet.js'
 
+export {
+  generateIdentityKeyPair,
+  sign,
+  verify,
+  identityPublicToX25519,
+  identityPrivateToX25519,
+} from './crypto/identity.js'
+export type { IdentityKeyPair } from './crypto/identity.js'
+
+export {
+  generateSignedPreKey,
+  generateOneTimePreKeys,
+  buildPreKeyBundle,
+  x3dhInitiate,
+  x3dhRespond,
+} from './crypto/x3dh.js'
+export type {
+  SignedPreKey,
+  OneTimePreKey,
+  PreKeyBundle,
+  PreKeyMessage,
+  X3DHInitiation,
+  SessionKeys,
+} from './crypto/x3dh.js'
+
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

@@ -51,7 +51,7 @@ describe('auth middleware edge cases', () => {
     } as unknown as Pool
     setPool(pool)
     const jwt = await import('jsonwebtoken')
-    const token = jwt.default.sign({ developerId: 'dev' }, 'test-secret-do-not-use-in-production')
+    const token = jwt.default.sign({ developerId: 'dev' }, 'test-secret-do-not-use-in-production', { expiresIn: '1h' })
 
     const app = createApp()
     const res = await request(app)

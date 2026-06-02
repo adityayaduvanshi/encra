@@ -6,6 +6,7 @@ import { logger } from './logger.js'
 import { globalLimiter, keyRegistrationLimiter } from './middleware/rateLimiter.js'
 import healthRouter from './routes/health.js'
 import keysRouter from './routes/keys.js'
+import prekeysRouter from './routes/prekeys.js'
 
 const ALLOWED_ORIGINS = (process.env['ALLOWED_ORIGINS'] ?? '*').split(',').map(s => s.trim())
 
@@ -57,10 +58,12 @@ export function createApp(): express.Application {
   // ── Rate limiting ────────────────────────────────────────────────────────────
   app.use(globalLimiter)
   app.use('/v1/keys', keyRegistrationLimiter)
+  app.use('/v1/prekeys', keyRegistrationLimiter)
 
   // ── Routes ───────────────────────────────────────────────────────────────────
   app.use(healthRouter)
   app.use(keysRouter)
+  app.use(prekeysRouter)
 
   // ── Global error handler ─────────────────────────────────────────────────────
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

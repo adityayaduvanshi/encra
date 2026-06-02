@@ -7,6 +7,10 @@ import {
   generateKeyPair,
   DoubleRatchet,
   exportKey,
+  generateIdentityKeyPair,
+  generateSignedPreKey,
+  generateOneTimePreKeys,
+  buildPreKeyBundle,
 } from '@encra/core'
 
 // ── WebSocket mock ────────────────────────────────────────────────────────────
@@ -56,14 +60,59 @@ class MockWebSocket {
 
 const TEST_DEVICE_ID = 'test-device'
 
+interface PreKeyRecord {
+  identityKey:    string
+  signedPreKey:   { keyId: number; publicKey: string; signature: string }
+  oneTimePreKeys: Array<{ keyId: number; publicKey: string }>
+}
+
 /**
- * Returns a fetch mock that speaks the multi-device key-server protocol:
- *   POST /v1/keys     → { userId, deviceId }
- *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ * Returns a fetch mock that speaks the multi-device key-server + X3DH prekey
+ * protocol:
+ *   POST /v1/keys                  → { userId, deviceId }
+ *   GET  /v1/keys/:id              → { userId, devices: [{ deviceId, publicKey }] }
+ *   POST /v1/prekeys               → stores the device's prekey bundle
+ *   GET  /v1/prekeys/:user/:device → serves a bundle, consuming one one-time prekey
  */
-function makeFetchMock(keyStore: Map<string, string>) {
+function makeFetchMock(
+  keyStore: Map<string, string>,
+  preKeyStore: Map<string, PreKeyRecord> = new Map(),
+) {
+  const pkKey = (u: string, d: string) => `${u}:${d}`
+
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
+
+    if (url.includes('/v1/prekeys') && init?.method === 'POST') {
+      const body = JSON.parse(init.body as string) as {
+        userId: string; deviceId: string; identityKey: string
+        signedPreKey: { keyId: number; publicKey: string; signature: string }
+        oneTimePreKeys: Array<{ keyId: number; publicKey: string }>
+      }
+      const k        = pkKey(body.userId, body.deviceId)
+      const existing = preKeyStore.get(k)
+      preKeyStore.set(k, {
+        identityKey:    body.identityKey,
+        signedPreKey:   body.signedPreKey,
+        oneTimePreKeys: [...(existing?.oneTimePreKeys ?? []), ...body.oneTimePreKeys],
+      })
+      return { ok: true, status: 201, json: async () => ({ userId: body.userId, deviceId: body.deviceId }) } as Response
+    }
+
+    const preMatch = url.match(/\/v1\/prekeys\/([^/]+)\/([^/?]+)$/)
+    if (preMatch) {
+      const rec = preKeyStore.get(pkKey(preMatch[1]!, preMatch[2]!))
+      if (!rec) return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
+      const otp = rec.oneTimePreKeys.shift()
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          identityKey:  rec.identityKey,
+          signedPreKey: rec.signedPreKey,
+          ...(otp ? { oneTimePreKey: otp } : {}),
+        }),
+      } as Response
+    }
 
     if (url.includes('/v1/keys') && init?.method === 'POST') {
       const body = JSON.parse(init.body as string) as {
@@ -96,10 +145,24 @@ function makeFetchMock(keyStore: Map<string, string>) {
   })
 }
 
+/** Build and store a valid prekey bundle for a peer so X3DH initiation succeeds. */
+async function seedPreKeyBundle(preKeyStore: Map<string, PreKeyRecord>, userId: string): Promise<void> {
+  const identity = await generateIdentityKeyPair()
+  const spk      = await generateSignedPreKey(identity, 1)
+  const [otp]    = await generateOneTimePreKeys(1, 1)
+  const bundle   = buildPreKeyBundle(identity, spk, otp)
+  preKeyStore.set(`${userId}:${TEST_DEVICE_ID}`, {
+    identityKey:    bundle.identityKey,
+    signedPreKey:   bundle.signedPreKey,
+    oneTimePreKeys: [bundle.oneTimePreKey!],
+  })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('useE2EChat', () => {
-  const keyStore = new Map<string, string>()
+  const keyStore    = new Map<string, string>()
+  const preKeyStore = new Map<string, PreKeyRecord>()
   let mockWs: MockWebSocket
 
   beforeAll(async () => {
@@ -108,11 +171,12 @@ describe('useE2EChat', () => {
 
   afterEach(() => {
     keyStore.clear()
+    preKeyStore.clear()
     vi.restoreAllMocks()
   })
 
   function setupMocks() {
-    vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.stubGlobal('fetch', makeFetchMock(keyStore, preKeyStore))
     vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     vi.stubGlobal(
       'WebSocket',
@@ -172,17 +236,16 @@ describe('useE2EChat', () => {
 
     await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
 
-    // fromDeviceId is now required for per-device ratchet keying.
-    // Send a message with arbitrary bytes — decryption will fail (wrong shared secret),
-    // but the hook must still attempt to fetch Carol's public key (cache miss path)
-    // and handle the DecryptionFailedError without crashing.
+    // Old-style inbound message with no X3DH prekey header and no existing
+    // session — the hook cannot bootstrap a session, so it drops the message
+    // gracefully (no crash) rather than fetching a public key.
     const wireMsg = JSON.stringify({
       type:         'message',
       from:         'carol',
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xaa)),
       nonce:        exportKey(new Uint8Array(24).fill(0xbb)),
-      header:       { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xcc)),
     })
 
     await act(async () => {
@@ -190,16 +253,9 @@ describe('useE2EChat', () => {
       await new Promise((r) => setTimeout(r, 200))
     })
 
-    // Hook should have tried to fetch Carol's key (verifiable via fetch mock call count)
-    const fetchMock = vi.mocked(globalThis.fetch as ReturnType<typeof vi.fn>)
-    const keyFetch = fetchMock.mock.calls.find(
-      (call) => typeof call[0] === 'string' && (call[0] as string).includes('/v1/keys/carol')
-    )
-    expect(keyFetch).toBeDefined()
-
-    // Decryption failed (wrong bytes), so no message should be in state
+    // No session could be established, so no message lands in state.
     expect(result.current.messages).toHaveLength(0)
-    // Hook must remain functional after a decryption failure
+    // Hook must remain functional after dropping the message.
     expect(result.current.isReady).toBe(true)
   })
 
@@ -308,7 +364,7 @@ describe('useE2EChat', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xcc)),
       nonce:        exportKey(new Uint8Array(24).fill(0xdd)),
-      header:       { dh: exportKey(ivyKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xee)),
     })
 
     await act(async () => {
@@ -359,20 +415,23 @@ describe('useE2EChat', () => {
   it('sendMessage encrypts and routes the payload, fires onWireMessage with direction sent', async () => {
     setupMocks()
 
-    // Register the peer's key so fetchPeerDeviceKeys succeeds
+    // Register the peer's key so fetchPeerDeviceKeys (device discovery) succeeds,
+    // and publish a valid prekey bundle so X3DH initiation can verify and run.
     const peerKP = await generateKeyPair()
     keyStore.set('mallory', exportKey(peerKP.publicKey))
+    await seedPreKeyBundle(preKeyStore, 'mallory')
 
     // Spy on DoubleRatchet.initSender so ratchet.encrypt() does not call
     // crypto_secretbox_easy — that function has a cross-realm Uint8Array issue
-    // in jsdom.  We just need to verify the hook wires things up correctly.
+    // in jsdom. The real x3dhInitiate still runs; we mock only the ratchet so
+    // we can verify the hook wires routing + the prekey frame correctly.
     const fakeRatchet = {
       encrypt: vi.fn().mockResolvedValue({
-        header:     { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
+        encHeader:  new Uint8Array(40).fill(0x03),
         ciphertext: new Uint8Array(48).fill(0x01),
         nonce:      new Uint8Array(24).fill(0x02),
       }),
-      export: vi.fn().mockReturnValue({ version: 1 }),
+      export: vi.fn().mockReturnValue({ version: 2 }),
     }
     vi.spyOn(DoubleRatchet, 'initSender').mockResolvedValue(
       fakeRatchet as unknown as InstanceType<typeof DoubleRatchet>
@@ -399,11 +458,16 @@ describe('useE2EChat', () => {
     })
     expect(sentFrames).toHaveLength(2)
 
-    // Frames must include toDeviceId for relay routing
+    // Frames must include toDeviceId for relay routing and an encrypted header.
     for (const frame of sentFrames) {
-      const p = JSON.parse(frame) as { toDeviceId?: string }
+      const p = JSON.parse(frame) as { toDeviceId?: string; encHeader?: string }
       expect(p.toDeviceId).toBe(TEST_DEVICE_ID)
+      expect(p.encHeader).toBeTruthy()
     }
+
+    // The first message of the session must carry the X3DH prekey as its own field.
+    const firstFrame = JSON.parse(sentFrames[0]!) as { prekey?: { ephemeralKey?: string } }
+    expect(firstFrame.prekey?.ephemeralKey).toBeTruthy()
 
     // onWireMessage should have fired with direction 'sent' for each message
     const sentEvents = onWireMessage.mock.calls.filter(
@@ -430,7 +494,7 @@ describe('useE2EChat', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xee)),
       nonce:        exportKey(new Uint8Array(24).fill(0xff)),
-      header:       { dh: exportKey(senderKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0x11)),
     })
 
     await act(async () => {

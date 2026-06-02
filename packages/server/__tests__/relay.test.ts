@@ -32,7 +32,8 @@ interface QueueRow {
   sender_device_id:    string
   ciphertext:          string
   nonce:               string
-  header:              unknown
+  enc_header:          string
+  prekey:              unknown
   sender_name:         string | null
 }
 
@@ -68,7 +69,7 @@ function makePool(): { pool: Pool; keys: Map<string, string>; queue: QueueRow[] 
       }
 
       // INSERT INTO message_queue (recipient_id, recipient_device_id, sender_id,
-      //   sender_device_id, ciphertext, nonce, header, sender_name) VALUES ($1...$8)
+      //   sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name) VALUES ($1...$9)
       if (s.startsWith('INSERT INTO MESSAGE_QUEUE')) {
         const row: QueueRow = {
           id:                  nextId++,
@@ -78,15 +79,17 @@ function makePool(): { pool: Pool; keys: Map<string, string>; queue: QueueRow[] 
           sender_device_id:    params[3] as string,
           ciphertext:          params[4] as string,
           nonce:               params[5] as string,
-          header:              params[6],
-          sender_name:         params[7] as string | null,
+          enc_header:          params[6] as string,
+          // Emulate JSONB: relay stores a JSON string; pg returns a parsed object.
+          prekey:              params[7] == null ? null : JSON.parse(params[7] as string),
+          sender_name:         params[8] as string | null,
         }
         queue.push(row)
         return { rows: [], rowCount: 1 } as unknown as QueryResult
       }
 
       // DELETE FROM message_queue WHERE recipient_id=$1 AND recipient_device_id=$2
-      // RETURNING id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name
+      // RETURNING id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name
       if (s.startsWith('DELETE FROM MESSAGE_QUEUE')) {
         const recipientId       = params[0] as string
         const recipientDeviceId = params[1] as string
@@ -105,7 +108,8 @@ function makePool(): { pool: Pool; keys: Map<string, string>; queue: QueueRow[] 
             sender_device_id: m.sender_device_id,
             ciphertext:       m.ciphertext,
             nonce:            m.nonce,
-            header:           m.header,
+            enc_header:       m.enc_header,
+            prekey:           m.prekey,
             sender_name:      m.sender_name,
           })),
           rowCount: pending.length,
@@ -149,10 +153,12 @@ interface WsClient {
 function connectClient(port: number, token: string): Promise<WsClient> {
   return new Promise((resolve, reject) => {
     const received: Array<Record<string, unknown>> = []
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay?token=${encodeURIComponent(token)}`)
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
 
     ws.on('error', reject)
     ws.on('open', () => {
+      // Send auth as first message — token never goes in the URL
+      ws.send(JSON.stringify({ type: 'auth', token }))
       resolve({
         ws,
         received,
@@ -205,13 +211,34 @@ describe('WebSocket relay', () => {
     await stopServer(server)
   })
 
-  it('rejects connection without a valid token', async () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay?token=bad.token.here`)
-    const closeCode = await new Promise<number>((resolve) => {
-      ws.on('close', (code) => resolve(code))
-      ws.on('error', () => resolve(4001))
+  it('rejects connection when auth message contains invalid token', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'auth', token: 'bad.token.here' }))
+      })
+      ws.on('close', (code) => {
+        if (code === 4001) resolve()
+        else reject(new Error(`Expected close code 4001, got ${code}`))
+      })
+      ws.on('error', () => {})
+      setTimeout(() => reject(new Error('timeout waiting for close')), 2_000)
     })
-    expect(closeCode).toBe(4001)
+  })
+
+  it('rejects connection when non-auth message is sent before authenticating', async () => {
+    await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/v1/relay`)
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ type: 'register', userId: 'alice', deviceId: 'dev' }))
+      })
+      ws.on('close', (code) => {
+        if (code === 4001) resolve()
+        else reject(new Error(`Expected close code 4001, got ${code}`))
+      })
+      ws.on('error', () => {})
+      setTimeout(() => reject(new Error('timeout waiting for close')), 2_000)
+    })
   })
 
   it('sends registered confirmation after register message with userId + deviceId', async () => {
@@ -249,6 +276,7 @@ describe('WebSocket relay', () => {
       toDeviceId: 'bob-dev',
       ciphertext: 'dGVzdC1jaXBoZXJ0ZXh0',
       nonce:      'dGVzdC1ub25jZQ',
+      encHeader:  'ZW5jLWhlYWRlcg',
     })
 
     const received = await waitForMessage(bob, (m) => m['type'] === 'message')
@@ -256,6 +284,7 @@ describe('WebSocket relay', () => {
     expect(received['fromDeviceId']).toBe('alice-dev')
     expect(received['ciphertext']).toBe('dGVzdC1jaXBoZXJ0ZXh0')
     expect(received['nonce']).toBe('dGVzdC1ub25jZQ')
+    expect(received['encHeader']).toBe('ZW5jLWhlYWRlcg')
 
     alice.close()
     bob.close()
@@ -273,6 +302,8 @@ describe('WebSocket relay', () => {
       toDeviceId: 'bob-dev',
       ciphertext: 'cXVldWVkLW1lc3NhZ2U',
       nonce:      'cXVldWVkLW5vbmNl',
+      encHeader:  'cXVldWVkLWhlYWRlcg',
+      prekey:     { identityKey: 'ik', ephemeralKey: 'ek', signedPreKeyId: 1, oneTimePreKeyId: 1 },
     })
 
     // Give the server a moment to process the queue insert
@@ -285,6 +316,9 @@ describe('WebSocket relay', () => {
     const queued = await waitForMessage(bob, (m) => m['type'] === 'message')
     expect(queued['from']).toBe('alice-queue')
     expect(queued['ciphertext']).toBe('cXVldWVkLW1lc3NhZ2U')
+    // The encrypted header and X3DH prekey must survive the offline queue round-trip.
+    expect(queued['encHeader']).toBe('cXVldWVkLWhlYWRlcg')
+    expect(queued['prekey']).toMatchObject({ signedPreKeyId: 1, oneTimePreKeyId: 1 })
 
     alice.close()
     bob.close()

@@ -4,6 +4,7 @@ import jwt from 'jsonwebtoken'
 import { getPool } from '../db/pool.js'
 import { getPublisher, getSubscriber } from '../redis.js'
 import { logger } from '../logger.js'
+import { buildVerifyOptions } from '../middleware/auth.js'
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -40,7 +41,9 @@ const RELAY_CHANNEL = 'encra:relay'
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface RelayMessage {
-  type:          'register' | 'message'
+  type:          'auth' | 'register' | 'message'
+  // Authentication (first message after connect)
+  token?:        string
   // Registration
   userId?:       string
   deviceId?:     string
@@ -49,7 +52,8 @@ interface RelayMessage {
   toDeviceId?:   string
   ciphertext?:   string
   nonce?:        string
-  header?:       unknown   // Opaque ratchet header — forwarded as-is
+  encHeader?:    string    // Encrypted ratchet header (base64) — forwarded as-is
+  prekey?:       unknown   // X3DH prekey message on session-initiating frames
   senderName?:   string
 }
 
@@ -65,17 +69,19 @@ const clients = new Map<string, WebSocket>()
 
 // ── JWT auth ─────────────────────────────────────────────────────────────────
 
-function authenticateWs(req: IncomingMessage): string | null {
-  const url   = new URL(req.url ?? '', 'http://localhost')
-  const token = url.searchParams.get('token')
-  if (!token) return null
-
+/**
+ * Verify a JWT token string (used for first-message WebSocket auth).
+ * Algorithm is pinned to HS256 via buildVerifyOptions().
+ * Returns developerId on success, null on any failure.
+ */
+function verifyWsToken(token: string): string | null {
   const secret = process.env['JWT_SECRET']
   if (!secret) return null
 
   try {
-    const payload = jwt.verify(token, secret) as { developerId: string }
-    return payload.developerId ?? null
+    const payload = jwt.verify(token, secret, buildVerifyOptions()) as jwt.JwtPayload
+    if (!payload['developerId'] || !payload['exp']) return null
+    return payload['developerId'] as string
   } catch {
     return null
   }
@@ -90,13 +96,14 @@ async function queueOfflineMessage(
   senderDeviceId:    string,
   ciphertext:        string,
   nonce:             string,
-  header:            unknown,
+  encHeader:         string,
+  prekey:            unknown,
   senderName:        string | undefined,
 ): Promise<void> {
   await getPool().query(
     `INSERT INTO message_queue
-       (recipient_id, recipient_device_id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       (recipient_id, recipient_device_id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       recipientId,
       recipientDeviceId,
@@ -104,7 +111,8 @@ async function queueOfflineMessage(
       senderDeviceId,
       ciphertext,
       nonce,
-      JSON.stringify(header ?? {}),
+      encHeader,
+      prekey === undefined ? null : JSON.stringify(prekey),
       senderName ?? null,
     ],
   )
@@ -121,12 +129,13 @@ async function flushQueuedMessages(
     sender_device_id:  string
     ciphertext:        string
     nonce:             string
-    header:            unknown
+    enc_header:        string
+    prekey:            unknown
     sender_name:       string | null
   }>(
     `DELETE FROM message_queue
      WHERE recipient_id = $1 AND recipient_device_id = $2
-     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name`,
+     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name`,
     [userId, deviceId],
   )
 
@@ -138,7 +147,8 @@ async function flushQueuedMessages(
       fromDeviceId: row.sender_device_id,
       ciphertext:   row.ciphertext,
       nonce:        row.nonce,
-      header:       row.header,
+      encHeader:    row.enc_header,
+      ...(row.prekey      !== null && { prekey:     row.prekey }),
       ...(row.sender_name !== null && { senderName: row.sender_name }),
     }))
   }
@@ -189,14 +199,7 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
 
   const wss = new WebSocketServer({ server, path: '/v1/relay' })
 
-  wss.on('connection', (socket: WebSocket, req: IncomingMessage) => {
-    // ── Auth ──────────────────────────────────────────────────────────────────
-    const developerId = authenticateWs(req)
-    if (!developerId) {
-      socket.close(4001, 'Unauthorized')
-      return
-    }
-
+  wss.on('connection', (socket: WebSocket, _req: IncomingMessage) => {
     // ── Connection cap ────────────────────────────────────────────────────────
     if (wss.clients.size > MAX_CONNECTIONS) {
       logger.warn({ total: wss.clients.size }, 'WebSocket connection limit reached')
@@ -204,9 +207,13 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
       return
     }
 
-    logger.debug({ developerId, total: wss.clients.size }, 'WebSocket connected')
+    logger.debug({ total: wss.clients.size }, 'WebSocket connected (pending auth)')
 
-    // ── Per-connection state ──────────────────────────────────────────────────
+    // ── Per-connection auth state (set by first 'auth' message) ──────────────
+    let authenticated: boolean    = false
+    let developerId:   string | null = null
+
+    // ── Per-connection session state ──────────────────────────────────────────
     let registeredKey:      string | null = null
     let registeredUserId:   string | null = null
     let registeredDeviceId: string | null = null
@@ -267,6 +274,35 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         return
       }
 
+      // ── auth ────────────────────────────────────────────────────────────────
+      if (msg.type === 'auth') {
+        if (authenticated) {
+          socket.send(JSON.stringify({ type: 'error', message: 'Already authenticated.' }))
+          return
+        }
+        if (!msg.token) {
+          socket.close(4001, 'Unauthorized')
+          return
+        }
+        const devId = verifyWsToken(msg.token)
+        if (!devId) {
+          logger.warn('WebSocket auth failed — invalid or expired token')
+          socket.close(4001, 'Unauthorized')
+          return
+        }
+        authenticated = true
+        developerId   = devId
+        logger.debug({ developerId }, 'WebSocket authenticated')
+        socket.send(JSON.stringify({ type: 'authenticated' }))
+        return
+      }
+
+      // All remaining message types require a valid auth token
+      if (!authenticated) {
+        socket.close(4001, 'Unauthorized')
+        return
+      }
+
       // ── register ────────────────────────────────────────────────────────────
       if (msg.type === 'register') {
         if (!msg.userId || !msg.deviceId) {
@@ -299,7 +335,7 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         })
 
         socket.send(JSON.stringify({ type: 'registered', userId: msg.userId, deviceId: msg.deviceId }))
-        logger.debug({ key: registeredKey, developerId }, 'Client registered')
+        logger.debug({ key: registeredKey, developerId: developerId ?? 'unknown' }, 'Client registered')
         return
       }
 
@@ -309,10 +345,10 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           socket.send(JSON.stringify({ type: 'error', message: 'Must register before sending messages.' }))
           return
         }
-        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce) {
+        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce || !msg.encHeader) {
           socket.send(JSON.stringify({
             type:    'error',
-            message: 'message requires to, toDeviceId, ciphertext, and nonce.',
+            message: 'message requires to, toDeviceId, ciphertext, nonce, and encHeader.',
           }))
           return
         }
@@ -324,7 +360,8 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           fromDeviceId: registeredDeviceId,
           ciphertext:   msg.ciphertext,
           nonce:        msg.nonce,
-          ...(msg.header     !== undefined && { header:     msg.header }),
+          encHeader:    msg.encHeader,
+          ...(msg.prekey     !== undefined && { prekey:     msg.prekey }),
           ...(msg.senderName !== undefined && { senderName: msg.senderName }),
         })
 
@@ -337,7 +374,8 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           registeredDeviceId,
           msg.ciphertext,
           msg.nonce,
-          msg.header,
+          msg.encHeader,
+          msg.prekey,
           msg.senderName,
           socket,
         ).catch((err: Error) => {
@@ -401,7 +439,8 @@ async function deliverMessage(
   senderDeviceId:    string,
   ciphertext:        string,
   nonce:             string,
-  header:            unknown,
+  encHeader:         string,
+  prekey:            unknown,
   senderName:        string | undefined,
   senderSocket:      WebSocket,
 ): Promise<void> {
@@ -435,7 +474,8 @@ async function deliverMessage(
     senderDeviceId,
     ciphertext,
     nonce,
-    header,
+    encHeader,
+    prekey,
     senderName,
   )
 

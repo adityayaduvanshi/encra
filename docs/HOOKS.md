@@ -272,6 +272,21 @@ function ChatComponent() {
 2. On subsequent mounts: restore key pair from IndexedDB → `POST /v1/keys` (idempotent upsert)
 3. The same key pair is reused by all three hooks for the same `userId`
 
+### X3DH prekey lifecycle (chat)
+1. On first connect for a `userId`: `useE2EChat` generates an Ed25519 **identity key**,
+   a **signed prekey**, and a pool of **one-time prekeys**, persists them to IndexedDB,
+   and publishes the public bundle via `POST /v1/prekeys`.
+2. The **first** message to a peer device fetches that device's bundle
+   (`GET /v1/prekeys/:userId/:deviceId`), verifies the signed-prekey signature, runs
+   X3DH, and seeds the Double Ratchet. The X3DH prekey message rides on the first
+   outbound frame(s) until the peer replies.
+3. When an inbound session consumes one of our one-time prekeys, it is deleted locally;
+   the pool is automatically replenished (and re-published) when it runs low.
+
+Headers are encrypted: the wire frame carries an opaque `encHeader` (never the
+plaintext ratchet public key or counters). `useE2EFile` / `useE2EForm` do not use the
+ratchet — they encrypt per recipient device with the long-term key pair.
+
 ### Peer key cache
 Device public keys for a peer are cached in memory for **5 minutes** (`PEER_KEY_TTL_MS`).
 After TTL expiry the next operation re-fetches from the server, picking up any newly

@@ -1,19 +1,25 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import {
   generateKeyPair,
-  deriveSharedSecret,
   exportKey,
   importKey,
   sodiumReady,
   DecryptionFailedError,
   DoubleRatchet,
+  generateIdentityKeyPair,
+  generateSignedPreKey,
+  generateOneTimePreKeys,
+  x3dhInitiate,
+  x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, MessageHeader } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
+  loadPreKeys,   savePreKeys,
   getOrCreateDeviceId,
+  type StoredPreKeys,
 } from './ratchetStore.js'
 
 export interface Message {
@@ -65,6 +71,13 @@ export interface UseE2EChatResult {
   error: Error | null
 }
 
+/**
+ * A message on the wire. `encHeader` is the ratchet header encrypted under the
+ * sending header key (the relay never sees ratchet metadata). `prekey` carries
+ * the X3DH prekey message on a session's first inbound message(s); it travels
+ * alongside the encrypted header because it must be readable before any header
+ * key exists.
+ */
 interface WireMessage {
   type: string
   from?: string
@@ -72,7 +85,8 @@ interface WireMessage {
   fromDeviceId?: string
   ciphertext?: string
   nonce?: string
-  header?: MessageHeader
+  encHeader?: string
+  prekey?: PreKeyMessage
 }
 
 const BACKOFF_BASE_MS  = 1000
@@ -80,6 +94,10 @@ const BACKOFF_MAX_MS   = 60_000
 const MAX_MESSAGES     = 200
 /** Re-fetch peer device list after this many ms — ensures new devices are seen. */
 const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
+/** Number of one-time prekeys to publish when first registering. */
+const OTP_POOL_SIZE    = 100
+/** Replenish the one-time prekey pool when it drops to this many or fewer. */
+const OTP_LOW_WATER    = 20
 
 /**
  * React hook for sending and receiving end-to-end encrypted messages.
@@ -120,8 +138,12 @@ export function useE2EChat({
   const [error,        setError]        = useState<Error | null>(null)
 
   const keyPairRef          = useRef<KeyPair | null>(null)
+  const identityRef         = useRef<IdentityKeyPair | null>(null)
+  const prekeysRef          = useRef<StoredPreKeys | null>(null)
   const deviceIdRef         = useRef<string>('')
   const ratchetsRef         = useRef<Map<string, DoubleRatchet>>(new Map())
+  /** Pending X3DH prekey messages, keyed `${peerId}:${deviceId}` (sender side). */
+  const pendingPrekeyRef    = useRef<Map<string, PreKeyMessage>>(new Map())
   const peerKeyCacheRef     = useRef<Map<string, DeviceKey[]>>(new Map())
   const peerKeyCacheTimeRef = useRef<Map<string, number>>(new Map())
   const socketRef           = useRef<WebSocket | null>(null)
@@ -172,6 +194,130 @@ export function useE2EChat({
     [apiKey, httpBase]
   )
 
+  // ── X3DH prekey management ──────────────────────────────────────────────────
+
+  /**
+   * Publish identity + signed prekey (idempotent) plus any supplied one-time
+   * prekeys. Best-effort: a failure is surfaced via `onError` but does not abort
+   * the connection — peers just can't open new sessions until it lands.
+   */
+  const publishPreKeys = useCallback(
+    async (oneTimePreKeys: Array<{ keyId: number; publicKey: string }>): Promise<void> => {
+      const pk = prekeysRef.current
+      if (!pk || !deviceIdRef.current) return
+      try {
+        const res = await fetch(`${httpBase}/v1/prekeys`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body:    JSON.stringify({
+            userId,
+            deviceId:     deviceIdRef.current,
+            identityKey:  pk.identityPub,
+            signedPreKey: {
+              keyId:     pk.signedPreKey.keyId,
+              publicKey: pk.signedPreKey.pub,
+              signature: pk.signedPreKey.signature,
+            },
+            oneTimePreKeys,
+          }),
+        })
+        if (!res.ok) onErrorRef.current?.(new Error(`Prekey publish failed: ${res.status}`))
+      } catch (err) {
+        onErrorRef.current?.(err instanceof Error ? err : new Error('Prekey publish failed.'))
+      }
+    },
+    [apiKey, httpBase, userId]
+  )
+
+  /**
+   * Restore or generate this device's identity key, signed prekey, and one-time
+   * prekey pool, then publish the public material to the key server.
+   */
+  const initPreKeys = useCallback(async (): Promise<void> => {
+    const stored = await loadPreKeys(userId)
+    if (stored) {
+      prekeysRef.current  = stored
+      identityRef.current = {
+        publicKey:  importKey(stored.identityPub),
+        privateKey: importKey(stored.identityPriv),
+      }
+      // Re-assert identity + signed prekey (idempotent). Don't re-publish
+      // existing one-time prekeys — some may already be reserved by senders.
+      await publishPreKeys([])
+      return
+    }
+
+    const identity = await generateIdentityKeyPair()
+    const spk      = await generateSignedPreKey(identity, 1)
+    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
+
+    identityRef.current = identity
+    prekeysRef.current  = {
+      identityPub:  exportKey(identity.publicKey),
+      identityPriv: exportKey(identity.privateKey),
+      signedPreKey: {
+        keyId:     spk.keyId,
+        pub:       exportKey(spk.keyPair.publicKey),
+        priv:      exportKey(spk.keyPair.privateKey),
+        signature: exportKey(spk.signature),
+      },
+      oneTimePreKeys: otps.map((o) => ({
+        keyId: o.keyId,
+        pub:   exportKey(o.keyPair.publicKey),
+        priv:  exportKey(o.keyPair.privateKey),
+      })),
+      nextOtpId: OTP_POOL_SIZE + 1,
+    }
+    await savePreKeys(userId, prekeysRef.current)
+    await publishPreKeys(prekeysRef.current.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })))
+  }, [userId, publishPreKeys])
+
+  /** Fetch a peer device's prekey bundle (consumes one of their one-time prekeys). */
+  const fetchPreKeyBundle = useCallback(
+    async (peerId: string, deviceId: string): Promise<PreKeyBundle> => {
+      const res = await fetch(
+        `${httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(deviceId)}`,
+        { headers: { Authorization: `Bearer ${apiKey}` } },
+      )
+      if (!res.ok) {
+        throw new Error(
+          `Could not fetch prekey bundle for '${peerId}' device '${deviceId}': ${res.status}. ` +
+          `Make sure ${peerId} has published prekeys.`,
+        )
+      }
+      return (await res.json()) as PreKeyBundle
+    },
+    [apiKey, httpBase]
+  )
+
+  /** Top the one-time prekey pool back up to OTP_POOL_SIZE and publish the new keys. */
+  const replenishOneTimePreKeys = useCallback(async (): Promise<void> => {
+    const pk = prekeysRef.current
+    if (!identityRef.current || !pk) return
+    const need = OTP_POOL_SIZE - pk.oneTimePreKeys.length
+    if (need <= 0) return
+
+    const fresh = await generateOneTimePreKeys(pk.nextOtpId, need)
+    pk.nextOtpId += need
+    for (const o of fresh) {
+      pk.oneTimePreKeys.push({ keyId: o.keyId, pub: exportKey(o.keyPair.publicKey), priv: exportKey(o.keyPair.privateKey) })
+    }
+    await savePreKeys(userId, pk)
+    await publishPreKeys(fresh.map((o) => ({ keyId: o.keyId, publicKey: exportKey(o.keyPair.publicKey) })))
+  }, [userId, publishPreKeys])
+
+  /** Remove a consumed one-time prekey from the local pool and replenish if low. */
+  const consumeOneTimePreKey = useCallback(
+    async (keyId: number): Promise<void> => {
+      const pk = prekeysRef.current
+      if (!pk) return
+      pk.oneTimePreKeys = pk.oneTimePreKeys.filter((o) => o.keyId !== keyId)
+      await savePreKeys(userId, pk)
+      if (pk.oneTimePreKeys.length <= OTP_LOW_WATER) await replenishOneTimePreKeys()
+    },
+    [userId, replenishOneTimePreKeys]
+  )
+
   /**
    * Returns the sender ratchet for a specific peer device, restoring it from
    * IndexedDB if available or initialising a new one on first contact.
@@ -182,8 +328,8 @@ export function useE2EChat({
    * @param device - The specific recipient device (from `fetchPeerDeviceKeys`).
    */
   const getOrInitSenderRatchet = useCallback(
-    async (peerId: string, device: DeviceKey): Promise<DoubleRatchet> => {
-      const key      = `s:${peerId}:${device.deviceId}`
+    async (peerId: string, deviceId: string): Promise<DoubleRatchet> => {
+      const key      = `s:${peerId}:${deviceId}`
       const existing = ratchetsRef.current.get(key)
       if (existing) return existing
 
@@ -194,15 +340,22 @@ export function useE2EChat({
         return ratchet
       }
 
-      const myKP = keyPairRef.current
-      if (!myKP) throw new Error('Key pair not initialised.')
-      const shared  = await deriveSharedSecret(myKP.privateKey, device.publicKey)
-      const ratchet = await DoubleRatchet.initSender(shared, device.publicKey)
+      const myIdentity = identityRef.current
+      if (!myIdentity) throw new Error('Identity key not initialised.')
+
+      // New outbound session: fetch the peer device's prekey bundle and run
+      // X3DH. x3dhInitiate verifies the signed-prekey signature and aborts on
+      // mismatch (MITM guard).
+      const bundle  = await fetchPreKeyBundle(peerId, deviceId)
+      const init    = await x3dhInitiate(myIdentity, bundle)
+      const ratchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
       ratchetsRef.current.set(key, ratchet)
+      // Carry the prekey message on outgoing frames until the peer replies.
+      pendingPrekeyRef.current.set(`${peerId}:${deviceId}`, init.message)
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId]
+    [userId, fetchPreKeyBundle]
   )
 
   /**
@@ -215,7 +368,7 @@ export function useE2EChat({
    * @param fromDeviceId - Sender's device UUID (from the wire message).
    */
   const getOrInitReceiverRatchet = useCallback(
-    async (peerId: string, fromDeviceId: string): Promise<DoubleRatchet> => {
+    async (peerId: string, fromDeviceId: string, prekey?: PreKeyMessage): Promise<DoubleRatchet> => {
       const key      = `r:${peerId}:${fromDeviceId}`
       const existing = ratchetsRef.current.get(key)
       if (existing) return existing
@@ -227,23 +380,42 @@ export function useE2EChat({
         return ratchet
       }
 
-      const myKP = keyPairRef.current
-      if (!myKP) throw new Error('Key pair not initialised.')
-
-      // Look up the sender's specific device public key
-      const peerDevices  = await fetchPeerDeviceKeys(peerId)
-      const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId)
-      if (!senderDevice) {
-        throw new Error(`Unknown device '${fromDeviceId}' for peer '${peerId}'.`)
+      const myIdentity = identityRef.current
+      const pk         = prekeysRef.current
+      if (!myIdentity || !pk) throw new Error('Prekeys not initialised.')
+      // A brand-new inbound session can only be established from an X3DH prekey
+      // message. Without it we cannot derive the shared secret.
+      if (!prekey) {
+        throw new DecryptionFailedError(
+          `No session with '${peerId}' device '${fromDeviceId}' and no prekey message to establish one.`,
+        )
       }
 
-      const shared  = await deriveSharedSecret(myKP.privateKey, senderDevice.publicKey)
-      const ratchet = await DoubleRatchet.initReceiver(shared, myKP)
+      if (prekey.signedPreKeyId !== pk.signedPreKey.keyId) {
+        throw new DecryptionFailedError(
+          `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${pk.signedPreKey.keyId}).`,
+        )
+      }
+      const signedPair: KeyPair = {
+        publicKey:  importKey(pk.signedPreKey.pub),
+        privateKey: importKey(pk.signedPreKey.priv),
+      }
+      let oneTimePair: KeyPair | null = null
+      if (prekey.oneTimePreKeyId !== null) {
+        const found = pk.oneTimePreKeys.find((o) => o.keyId === prekey.oneTimePreKeyId)
+        if (!found) throw new DecryptionFailedError(`One-time prekey ${prekey.oneTimePreKeyId} not found locally.`)
+        oneTimePair = { publicKey: importKey(found.pub), privateKey: importKey(found.priv) }
+      }
+
+      const keys    = await x3dhRespond(myIdentity, signedPair, oneTimePair, prekey)
+      const ratchet = await DoubleRatchet.initReceiver(keys, signedPair)
       ratchetsRef.current.set(key, ratchet)
+      // The one-time prekey is now spent — remove it locally and replenish if low.
+      if (prekey.oneTimePreKeyId !== null) await consumeOneTimePreKey(prekey.oneTimePreKeyId)
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId, fetchPeerDeviceKeys]
+    [userId, consumeOneTimePreKey]
   )
 
   useEffect(() => {
@@ -263,11 +435,11 @@ export function useE2EChat({
     }
 
     function connectWS() {
-      ws = new WebSocket(`${wsBase}/v1/relay?token=${encodeURIComponent(apiKey)}`)
+      ws = new WebSocket(`${wsBase}/v1/relay`)
       socketRef.current = ws
 
       ws.addEventListener('open', () => {
-        // Register with both userId and deviceId so the relay can route by device
+        ws!.send(JSON.stringify({ type: 'auth', token: apiKey }))
         ws!.send(JSON.stringify({ type: 'register', userId, deviceId: deviceIdRef.current }))
         retryCount = 0
         if (!cancelled) { setIsReady(true); setIsConnecting(false) }
@@ -285,7 +457,7 @@ export function useE2EChat({
           !msg.fromDeviceId ||
           !msg.ciphertext ||
           !msg.nonce ||
-          !msg.header
+          !msg.encHeader
         ) return
 
         onWireMessageRef.current?.({
@@ -296,13 +468,15 @@ export function useE2EChat({
         })
 
         try {
-          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId)
+          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
           const text = await ratchet.decrypt({
-            header:     msg.header,
+            encHeader:  importKey(msg.encHeader),
             ciphertext: importKey(msg.ciphertext),
             nonce:      importKey(msg.nonce),
           })
           await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
+          // We've heard from this peer device — stop attaching our prekey message.
+          pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
           if (!cancelled) {
             setMessages((prev) => {
               const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
@@ -372,6 +546,12 @@ export function useE2EChat({
         if (!regRes.ok) throw new Error(`Key registration failed: ${regRes.status}`)
 
         if (cancelled) return
+
+        // Set up X3DH prekeys (identity key, signed prekey, one-time prekey
+        // pool) and publish them so peers can open sessions asynchronously.
+        await initPreKeys()
+
+        if (cancelled) return
         connectWS()
       } catch (err) {
         if (!cancelled) {
@@ -389,11 +569,14 @@ export function useE2EChat({
       ws?.close()
       socketRef.current = null
       keyPairRef.current = null
+      identityRef.current = null
+      prekeysRef.current = null
       ratchetsRef.current.clear()
+      pendingPrekeyRef.current.clear()
       peerKeyCacheRef.current.clear()
       peerKeyCacheTimeRef.current.clear()
     }
-  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet])
+  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys])
 
   /**
    * Encrypts `text` and delivers it to every registered device of `to`.
@@ -419,12 +602,17 @@ export function useE2EChat({
 
       // Send one encrypted message per recipient device
       for (const device of peerDevices) {
-        const ratchet = await getOrInitSenderRatchet(to, device)
-        const { header, ciphertext, nonce } = await ratchet.encrypt(text)
+        const ratchet = await getOrInitSenderRatchet(to, device.deviceId)
+        const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
         await saveRatchet(userId, `s:${to}:${device.deviceId}`, ratchet.export())
+
+        // Attach the X3DH prekey message until we hear back from this device, so
+        // the recipient can establish the session even if earlier frames were lost.
+        const pending = pendingPrekeyRef.current.get(`${to}:${device.deviceId}`)
 
         const ctB64 = exportKey(ciphertext)
         const nB64  = exportKey(nonce)
+        const ehB64 = exportKey(encHeader)
 
         socket.send(JSON.stringify({
           type:       'message',
@@ -432,7 +620,8 @@ export function useE2EChat({
           toDeviceId: device.deviceId,
           ciphertext: ctB64,
           nonce:      nB64,
-          header,
+          encHeader:  ehB64,
+          ...(pending && { prekey: pending }),
         }))
 
         onWireMessageRef.current?.({
