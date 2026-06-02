@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { EncraClient, MAX_FILE_BYTES } from '../src/EncraClient.js'
 import type { EncryptedFile, EncryptedFields } from '../src/EncraClient.js'
 import * as ratchetStore from '../src/ratchetStore.js'
-import { sodiumReady, generateKeyPair, exportKey, DoubleRatchet } from '@encra/core'
+import { sodiumReady, generateKeyPair, exportKey } from '@encra/core'
 
 // ── WebSocket mock ────────────────────────────────────────────────────────────
 
@@ -44,15 +44,65 @@ class MockWebSocket {
 
 const TEST_DEVICE_ID = 'test-device'
 
+interface PreKeyRecord {
+  identityKey:    string
+  signedPreKey:   { keyId: number; publicKey: string; signature: string }
+  oneTimePreKeys: Array<{ keyId: number; publicKey: string }>
+}
+
 /**
- * Returns a fetch mock that speaks the multi-device key-server protocol:
- *   POST /v1/keys     → { userId, deviceId }
- *   GET  /v1/keys/:id → { userId, devices: [{ deviceId, publicKey }] }
+ * Returns a fetch mock that speaks the multi-device key-server + X3DH prekey
+ * protocol:
+ *   POST /v1/keys                  → { userId, deviceId }
+ *   GET  /v1/keys/:id              → { userId, devices: [{ deviceId, publicKey }] }
+ *   POST /v1/prekeys               → stores the device's prekey bundle
+ *   GET  /v1/prekeys/:user/:device → serves a bundle, consuming one one-time prekey
  */
-function makeFetchMock(keyStore: Map<string, string>) {
+function makeFetchMock(
+  keyStore: Map<string, string>,
+  preKeyStore: Map<string, PreKeyRecord> = new Map(),
+) {
+  const pkKey = (u: string, d: string) => `${u}:${d}`
+
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === 'string' ? input : input.toString()
 
+    // ── Prekeys ───────────────────────────────────────────────────────────────
+    if (url.includes('/v1/prekeys') && init?.method === 'POST') {
+      const body = JSON.parse(init.body as string) as {
+        userId: string; deviceId: string; identityKey: string
+        signedPreKey: { keyId: number; publicKey: string; signature: string }
+        oneTimePreKeys: Array<{ keyId: number; publicKey: string }>
+      }
+      const k        = pkKey(body.userId, body.deviceId)
+      const existing = preKeyStore.get(k)
+      preKeyStore.set(k, {
+        identityKey:    body.identityKey,
+        signedPreKey:   body.signedPreKey,
+        oneTimePreKeys: [...(existing?.oneTimePreKeys ?? []), ...body.oneTimePreKeys],
+      })
+      return {
+        ok: true, status: 201,
+        json: async () => ({ userId: body.userId, deviceId: body.deviceId, oneTimePreKeyCount: preKeyStore.get(k)!.oneTimePreKeys.length }),
+      } as Response
+    }
+
+    const preMatch = url.match(/\/v1\/prekeys\/([^/]+)\/([^/?]+)$/)
+    if (preMatch) {
+      const rec = preKeyStore.get(pkKey(preMatch[1]!, preMatch[2]!))
+      if (!rec) return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
+      const otp = rec.oneTimePreKeys.shift()
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          identityKey:  rec.identityKey,
+          signedPreKey: rec.signedPreKey,
+          ...(otp ? { oneTimePreKey: otp } : {}),
+        }),
+      } as Response
+    }
+
+    // ── Public keys ─────────────────────────────────────────────────────────────
     if (url.includes('/v1/keys') && init?.method === 'POST') {
       const body = JSON.parse(init.body as string) as {
         userId: string; publicKey: string; deviceId?: string
@@ -87,23 +137,39 @@ function makeFetchMock(keyStore: Map<string, string>) {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('EncraClient', () => {
-  const keyStore = new Map<string, string>()
+  const keyStore    = new Map<string, string>()
+  const preKeyStore = new Map<string, PreKeyRecord>()
   let mockWs: MockWebSocket
+  let wsInstances: MockWebSocket[] = []
 
   beforeAll(async () => { await sodiumReady() })
 
   afterEach(() => {
     keyStore.clear()
+    preKeyStore.clear()
+    wsInstances = []
     vi.restoreAllMocks()
   })
 
+  /** Find the mock socket a given userId registered on. */
+  function socketFor(userId: string): MockWebSocket | undefined {
+    return wsInstances.find((ws) =>
+      ws.sentMessages.some((m) => {
+        try {
+          const p = JSON.parse(m) as { type: string; userId?: string }
+          return p.type === 'register' && p.userId === userId
+        } catch { return false }
+      }),
+    )
+  }
+
   function setupMocks() {
-    vi.stubGlobal('fetch', makeFetchMock(keyStore))
+    vi.stubGlobal('fetch', makeFetchMock(keyStore, preKeyStore))
     vi.spyOn(ratchetStore, 'getOrCreateDeviceId').mockResolvedValue(TEST_DEVICE_ID)
     vi.stubGlobal(
       'WebSocket',
       class extends MockWebSocket {
-        constructor(url: string) { super(url); mockWs = this }
+        constructor(url: string) { super(url); mockWs = this; wsInstances.push(this) }
       }
     )
   }
@@ -195,7 +261,7 @@ describe('EncraClient', () => {
     await expect(client.connect()).rejects.toThrow('Key registration failed')
   })
 
-  it('fetches sender public key on first incoming message (cache miss)', async () => {
+  it('drops an inbound message that has no session and no prekey to establish one', async () => {
     setupMocks()
     const carolKP = await generateKeyPair()
     keyStore.set('carol', exportKey(carolKP.publicKey))
@@ -204,7 +270,7 @@ describe('EncraClient', () => {
     await client.connect()
     await new Promise((r) => setTimeout(r, 100))
 
-    // fromDeviceId is required for per-device ratchet keying
+    // Old-style message with no X3DH prekey header — cannot bootstrap a session.
     const wireMsg = JSON.stringify({
       type:         'message',
       from:         'carol',
@@ -217,12 +283,8 @@ describe('EncraClient', () => {
     mockWs.simulateMessage(wireMsg)
     await new Promise((r) => setTimeout(r, 200))
 
-    const fetchMock = vi.mocked(globalThis.fetch as ReturnType<typeof vi.fn>)
-    const keyFetch  = fetchMock.mock.calls.find(
-      (c) => typeof c[0] === 'string' && (c[0] as string).includes('/v1/keys/carol')
-    )
-    expect(keyFetch).toBeDefined()
-    expect(client.messages).toHaveLength(0) // decryption fails — wrong bytes
+    // No session can be established → message is dropped, connection stays healthy.
+    expect(client.messages).toHaveLength(0)
     expect(client.isReady).toBe(true)
     client.disconnect()
   })
@@ -271,48 +333,69 @@ describe('EncraClient', () => {
     client.disconnect()
   })
 
-  it('sendMessage encrypts, sends via WebSocket, and emits wire + message events', async () => {
-    setupMocks()
-    const peerKP = await generateKeyPair()
-    keyStore.set('mallory', exportKey(peerKP.publicKey))
-
-    const fakeRatchet = {
-      encrypt: vi.fn().mockResolvedValue({
-        header:     { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
-        ciphertext: new Uint8Array(48).fill(0x01),
-        nonce:      new Uint8Array(24).fill(0x02),
-      }),
-      export: vi.fn().mockReturnValue({ version: 1 }),
-    }
-    vi.spyOn(DoubleRatchet, 'initSender').mockResolvedValue(
-      fakeRatchet as unknown as InstanceType<typeof DoubleRatchet>
-    )
+  it('sendMessage encrypts via X3DH, sends a prekey frame, and emits wire + message events', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('nina', 'mallory')
+    const aliceSocket = socketFor('nina')!
 
     const onWire    = vi.fn()
     const onMessage = vi.fn()
-    const client    = new EncraClient({ apiKey: 'test-key', userId: 'nina', serverUrl: 'http://localhost:3000' })
-    client.on('wire',    onWire)
-    client.on('message', onMessage)
+    alice.on('wire',    onWire)
+    alice.on('message', onMessage)
 
-    await client.connect()
-    await new Promise((r) => setTimeout(r, 100))
-    await client.sendMessage('mallory', 'hello')
+    await alice.sendMessage('mallory', 'hello')
 
     // mallory has 1 device → 1 wire frame
-    const frame = mockWs.sentMessages.find((m) => {
+    const frame = aliceSocket.sentMessages.find((m) => {
       const p = JSON.parse(m) as { type: string; to?: string }
       return p.type === 'message' && p.to === 'mallory'
     })
     expect(frame).toBeDefined()
 
-    // Frame must include toDeviceId for relay routing
-    const parsedFrame = JSON.parse(frame!) as { toDeviceId?: string }
+    // Frame must include toDeviceId for routing and an X3DH prekey on the header
+    // (this is the first message of the session).
+    const parsedFrame = JSON.parse(frame!) as {
+      toDeviceId?: string
+      header?: { prekey?: { identityKey: string; ephemeralKey: string } }
+    }
     expect(parsedFrame.toDeviceId).toBe(TEST_DEVICE_ID)
+    expect(parsedFrame.header?.prekey).toBeDefined()
+    expect(parsedFrame.header?.prekey?.ephemeralKey).toBeTruthy()
 
     expect(onWire).toHaveBeenCalledWith(expect.objectContaining({ direction: 'sent' }))
     expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ from: 'nina', text: 'hello' }))
-    expect(client.messages).toHaveLength(1)
-    client.disconnect()
+    expect(alice.messages).toHaveLength(1)
+    void bob
+    cleanup()
+  })
+
+  it('end-to-end: Alice establishes a session via X3DH and Bob decrypts the message', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('e2e-alice', 'e2e-bob')
+    const bobReceived: string[] = []
+    bob.on('message', (m) => { if (m.from === 'e2e-alice') bobReceived.push(m.text) })
+
+    const aliceSocket = socketFor('e2e-alice')!
+    const bobSocket   = socketFor('e2e-bob')!
+
+    await alice.sendMessage('e2e-bob', 'hello bob 🔐')
+
+    // Relay the captured wire frame from Alice's socket into Bob's socket.
+    const frame = aliceSocket.sentMessages.find((m) => {
+      const p = JSON.parse(m) as { type: string; to?: string }
+      return p.type === 'message' && p.to === 'e2e-bob'
+    })!
+    const sent = JSON.parse(frame) as Record<string, unknown>
+    bobSocket.simulateMessage(JSON.stringify({
+      type:         'message',
+      from:         'e2e-alice',
+      fromDeviceId: TEST_DEVICE_ID,
+      ciphertext:   sent['ciphertext'],
+      nonce:        sent['nonce'],
+      header:       sent['header'],
+    }))
+    await new Promise((r) => setTimeout(r, 100))
+
+    expect(bobReceived).toEqual(['hello bob 🔐'])
+    cleanup()
   })
 
   it('restores key pair from IndexedDB without generating a new one', async () => {
@@ -397,12 +480,7 @@ describe('EncraClient', () => {
     expect(enc.devices[0]!.nonce).toBeInstanceOf(Uint8Array)
 
     const decrypted = await bob.decryptFile(enc, 'ef-alice')
-    const text = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload  = () => resolve(reader.result as string)
-      reader.onerror = () => reject(reader.error)
-      reader.readAsText(decrypted)
-    })
+    const text = await decrypted.text()
     expect(text).toBe('Hello from EncraClient!')
     expect(decrypted.name).toBe('hello.txt')
     expect(decrypted.type).toBe('text/plain')

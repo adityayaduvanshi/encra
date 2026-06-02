@@ -122,12 +122,17 @@ function unb64(s: string): Uint8Array {
  * has no HKDF-SHA256, and keyed BLAKE2b is an equally sound PRF here).
  */
 function x3dhKDF(dhConcat: Uint8Array): Uint8Array {
-  const F = new Uint8Array(32).fill(0xff)
-  const input = new Uint8Array(F.length + dhConcat.length)
+  // Per the X3DH spec the input is prefixed with 32 0xFF bytes (Curve25519
+  // domain-separation prefix). We additionally prepend a versioned label for
+  // domain separation, folding it into the hashed message rather than using it
+  // as a BLAKE2b key (which has length constraints).
+  const F     = new Uint8Array(32).fill(0xff)
+  const label = _sodium.from_string(X3DH_KDF_INFO)
+  const input = new Uint8Array(F.length + label.length + dhConcat.length)
   input.set(F, 0)
-  input.set(dhConcat, F.length)
-  const key = _sodium.from_string(X3DH_KDF_INFO)
-  return new Uint8Array(_sodium.crypto_generichash(32, input, key))
+  input.set(label, F.length)
+  input.set(dhConcat, F.length + label.length)
+  return new Uint8Array(_sodium.crypto_generichash(32, input))
 }
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {

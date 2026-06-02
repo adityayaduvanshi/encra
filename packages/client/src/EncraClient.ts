@@ -1,18 +1,25 @@
 import {
   generateKeyPair,
-  deriveSharedSecret,
   exportKey,
   importKey,
   sodiumReady,
   DecryptionFailedError,
   DoubleRatchet,
+  generateIdentityKeyPair,
+  generateSignedPreKey,
+  generateOneTimePreKeys,
+  buildPreKeyBundle,
+  x3dhInitiate,
+  x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, MessageHeader } from '@encra/core'
+import type { KeyPair, MessageHeader, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
+  loadPreKeys,   savePreKeys,
   getOrCreateDeviceId,
+  type StoredPreKeys,
 } from './ratchetStore.js'
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -101,13 +108,22 @@ type Listener<K extends keyof EventMap> = (...args: EventMap[K]) => void
 
 // ── Internal wire shape ───────────────────────────────────────────────────────
 
+/**
+ * The ratchet header as it travels on the wire. The optional `prekey` field
+ * rides along on a session's first inbound message(s) so the recipient can run
+ * X3DH. The Double Ratchet ignores fields beyond `dh`/`pn`/`n`, and the relay
+ * forwards (and queues) the whole header opaquely, so no protocol change is
+ * needed to carry it.
+ */
+type WireHeader = MessageHeader & { prekey?: PreKeyMessage }
+
 interface WireMessage {
   type:          string
   from?:         string
   fromDeviceId?: string
   ciphertext?:   string
   nonce?:        string
-  header?:       MessageHeader
+  header?:       WireHeader
 }
 
 const BACKOFF_BASE_MS    = 1_000
@@ -115,6 +131,11 @@ const BACKOFF_MAX_MS     = 60_000
 const MAX_MESSAGES       = 200
 const PEER_KEY_TTL_MS    = 5 * 60 * 1_000   // 5 minutes — re-fetch to pick up new devices
 const ENCRA_SERVER_URL   = 'https://api.encra.dev'
+
+/** Number of one-time prekeys to publish when first registering. */
+const OTP_POOL_SIZE      = 100
+/** Replenish the one-time prekey pool when it drops to this many or fewer. */
+const OTP_LOW_WATER      = 20
 
 /** Maximum file size accepted by `encryptFile` (50 MB). */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -146,8 +167,12 @@ export class EncraClient {
   private _error:        Error|null = null
 
   private _keyPair:          KeyPair | null                        = null
+  private _identity:         IdentityKeyPair | null                = null
+  private _prekeys:          StoredPreKeys | null                  = null
   private _deviceId:         string | null                         = null
   private _ratchets:         Map<string, DoubleRatchet>            = new Map()
+  /** Pending X3DH prekey messages, keyed `${peerId}:${deviceId}` (sender side). */
+  private _pendingPrekey:    Map<string, PreKeyMessage>            = new Map()
   private _peerKeyCache:     Map<string, DeviceKey[]>              = new Map()
   private _peerKeyCacheTime: Map<string, number>                   = new Map()
   private _socket:       WebSocket | null              = null
@@ -218,7 +243,10 @@ export class EncraClient {
     this._socket?.close()
     this._socket       = null
     this._keyPair      = null
+    this._identity     = null
+    this._prekeys      = null
     this._ratchets.clear()
+    this._pendingPrekey.clear()
     this._peerKeyCache.clear()
     this._peerKeyCacheTime.clear()
     this._setReady(false)
@@ -237,16 +265,21 @@ export class EncraClient {
     const peerDevices = await this._fetchPeerDeviceKeys(to)
 
     for (const device of peerDevices) {
-      const ratchet     = await this._getOrInitSenderRatchet(to, device)
+      const ratchet     = await this._getOrInitSenderRatchet(to, device.deviceId)
       const { header, ciphertext, nonce } = await ratchet.encrypt(text)
       await saveRatchet(this._userId, `s:${to}:${device.deviceId}`, ratchet.export())
+
+      // Attach the X3DH prekey message until we hear back from this device, so
+      // the recipient can establish the session even if earlier frames were lost.
+      const pending    = this._pendingPrekey.get(`${to}:${device.deviceId}`)
+      const wireHeader: WireHeader = pending ? { ...header, prekey: pending } : header
 
       const ctB64 = exportKey(ciphertext)
       const nB64  = exportKey(nonce)
 
       this._socket.send(JSON.stringify({
         type: 'message', to, toDeviceId: device.deviceId,
-        ciphertext: ctB64, nonce: nB64, header,
+        ciphertext: ctB64, nonce: nB64, header: wireHeader,
       }))
 
       this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
@@ -493,8 +526,8 @@ export class EncraClient {
     return keys
   }
 
-  private async _getOrInitSenderRatchet(peerId: string, device: DeviceKey): Promise<DoubleRatchet> {
-    const ratchetKey = `s:${peerId}:${device.deviceId}`
+  private async _getOrInitSenderRatchet(peerId: string, deviceId: string): Promise<DoubleRatchet> {
+    const ratchetKey = `s:${peerId}:${deviceId}`
     const existing   = this._ratchets.get(ratchetKey)
     if (existing) return existing
 
@@ -505,10 +538,16 @@ export class EncraClient {
       return ratchet
     }
 
-    if (!this._keyPair) throw new Error('Key pair not initialised.')
-    const shared  = await deriveSharedSecret(this._keyPair.privateKey, device.publicKey)
-    const ratchet = await DoubleRatchet.initSender(shared, device.publicKey)
+    if (!this._identity) throw new Error('Identity key not initialised.')
+
+    // New outbound session: fetch the peer device's prekey bundle and run X3DH.
+    // x3dhInitiate verifies the signed-prekey signature and aborts on mismatch.
+    const bundle = await this._fetchPreKeyBundle(peerId, deviceId)
+    const init   = await x3dhInitiate(this._identity, bundle)
+    const ratchet = await DoubleRatchet.initSender(init.sharedSecret, init.signedPreKeyPublic)
     this._ratchets.set(ratchetKey, ratchet)
+    // Carry the prekey message on outgoing frames until the peer replies.
+    this._pendingPrekey.set(`${peerId}:${deviceId}`, init.message)
     await saveRatchet(this._userId, ratchetKey, ratchet.export())
     return ratchet
   }
@@ -516,6 +555,7 @@ export class EncraClient {
   private async _getOrInitReceiverRatchet(
     peerId:       string,
     fromDeviceId: string,
+    prekey?:      PreKeyMessage,
   ): Promise<DoubleRatchet> {
     const ratchetKey = `r:${peerId}:${fromDeviceId}`
     const existing   = this._ratchets.get(ratchetKey)
@@ -528,17 +568,171 @@ export class EncraClient {
       return ratchet
     }
 
-    if (!this._keyPair) throw new Error('Key pair not initialised.')
-    // Find the sender's specific device key — must match exactly; each device has a unique key pair
-    const peerDevices  = await this._fetchPeerDeviceKeys(peerId)
-    const senderDevice = peerDevices.find((d) => d.deviceId === fromDeviceId)
-    if (!senderDevice) throw new Error(`Key not found for device '${fromDeviceId}' of '${peerId}'.`)
+    if (!this._identity || !this._prekeys) throw new Error('Prekeys not initialised.')
+    // A brand-new inbound session can only be established from an X3DH prekey
+    // message. Without it we cannot derive the shared secret.
+    if (!prekey) {
+      throw new DecryptionFailedError(
+        `No session with '${peerId}' device '${fromDeviceId}' and no prekey message to establish one.`,
+      )
+    }
 
-    const shared  = await deriveSharedSecret(this._keyPair.privateKey, senderDevice.publicKey)
-    const ratchet = await DoubleRatchet.initReceiver(shared, this._keyPair)
+    const { signedPair, oneTimePair } = this._resolveResponderKeys(prekey)
+    const shared  = await x3dhRespond(this._identity, signedPair, oneTimePair, prekey)
+    const ratchet = await DoubleRatchet.initReceiver(shared, signedPair)
     this._ratchets.set(ratchetKey, ratchet)
+    // The one-time prekey is now spent — remove it locally and replenish if low.
+    if (prekey.oneTimePreKeyId !== null) {
+      await this._consumeOneTimePreKey(prekey.oneTimePreKeyId)
+    }
     await saveRatchet(this._userId, ratchetKey, ratchet.export())
     return ratchet
+  }
+
+  // ── X3DH prekey management ──────────────────────────────────────────────────
+
+  /**
+   * Restore or generate this device's identity key, signed prekey, and
+   * one-time prekey pool, then publish the public material to the key server.
+   */
+  private async _initPreKeys(): Promise<void> {
+    const stored = await loadPreKeys(this._userId)
+    if (stored) {
+      this._prekeys  = stored
+      this._identity = {
+        publicKey:  importKey(stored.identityPub),
+        privateKey: importKey(stored.identityPriv),
+      }
+      // Re-assert identity + signed prekey (idempotent upserts). Don't re-publish
+      // existing one-time prekeys — some may already be reserved by senders.
+      await this._publishPreKeys([])
+      return
+    }
+
+    const identity = await generateIdentityKeyPair()
+    const spk      = await generateSignedPreKey(identity, 1)
+    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
+
+    this._identity = identity
+    this._prekeys  = {
+      identityPub:  exportKey(identity.publicKey),
+      identityPriv: exportKey(identity.privateKey),
+      signedPreKey: {
+        keyId:     spk.keyId,
+        pub:       exportKey(spk.keyPair.publicKey),
+        priv:      exportKey(spk.keyPair.privateKey),
+        signature: exportKey(spk.signature),
+      },
+      oneTimePreKeys: otps.map((o) => ({
+        keyId: o.keyId,
+        pub:   exportKey(o.keyPair.publicKey),
+        priv:  exportKey(o.keyPair.privateKey),
+      })),
+      nextOtpId: OTP_POOL_SIZE + 1,
+    }
+    await savePreKeys(this._userId, this._prekeys)
+    await this._publishPreKeys(this._prekeys.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })))
+  }
+
+  /**
+   * Publish identity + signed prekey (idempotent) plus any supplied one-time
+   * prekeys. Best-effort: a failure is surfaced as an `error` event but does not
+   * abort the connection — peers simply can't open new sessions until it lands.
+   */
+  private async _publishPreKeys(
+    oneTimePreKeys: Array<{ keyId: number; publicKey: string }>,
+  ): Promise<void> {
+    if (!this._prekeys || !this._deviceId) return
+    const pk = this._prekeys
+    try {
+      const res = await fetch(`${this._httpBase}/v1/prekeys`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this._apiKey}` },
+        body:    JSON.stringify({
+          userId:       this._userId,
+          deviceId:     this._deviceId,
+          identityKey:  pk.identityPub,
+          signedPreKey: {
+            keyId:     pk.signedPreKey.keyId,
+            publicKey: pk.signedPreKey.pub,
+            signature: pk.signedPreKey.signature,
+          },
+          oneTimePreKeys,
+        }),
+      })
+      if (!res.ok) {
+        this._emit('error', new Error(`Prekey publish failed: ${res.status}`))
+      }
+    } catch (err) {
+      this._emit('error', err instanceof Error ? err : new Error('Prekey publish failed.'))
+    }
+  }
+
+  /** Fetch a peer device's prekey bundle (consumes one of their one-time prekeys). */
+  private async _fetchPreKeyBundle(peerId: string, deviceId: string): Promise<PreKeyBundle> {
+    const res = await fetch(`${this._httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(deviceId)}`, {
+      headers: { Authorization: `Bearer ${this._apiKey}` },
+    })
+    if (!res.ok) {
+      throw new Error(
+        `Could not fetch prekey bundle for '${peerId}' device '${deviceId}': ${res.status}. ` +
+        `Make sure ${peerId} has published prekeys.`,
+      )
+    }
+    return (await res.json()) as PreKeyBundle
+  }
+
+  /** Resolve the local private prekeys a prekey message refers to (responder side). */
+  private _resolveResponderKeys(prekey: PreKeyMessage): { signedPair: KeyPair; oneTimePair: KeyPair | null } {
+    const pk = this._prekeys!
+    if (prekey.signedPreKeyId !== pk.signedPreKey.keyId) {
+      throw new DecryptionFailedError(
+        `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${pk.signedPreKey.keyId}).`,
+      )
+    }
+    const signedPair: KeyPair = {
+      publicKey:  importKey(pk.signedPreKey.pub),
+      privateKey: importKey(pk.signedPreKey.priv),
+    }
+
+    let oneTimePair: KeyPair | null = null
+    if (prekey.oneTimePreKeyId !== null) {
+      const found = pk.oneTimePreKeys.find((o) => o.keyId === prekey.oneTimePreKeyId)
+      if (!found) {
+        throw new DecryptionFailedError(`One-time prekey ${prekey.oneTimePreKeyId} not found locally.`)
+      }
+      oneTimePair = { publicKey: importKey(found.pub), privateKey: importKey(found.priv) }
+    }
+    return { signedPair, oneTimePair }
+  }
+
+  /** Remove a consumed one-time prekey from the local pool and replenish if low. */
+  private async _consumeOneTimePreKey(keyId: number): Promise<void> {
+    if (!this._prekeys) return
+    this._prekeys.oneTimePreKeys = this._prekeys.oneTimePreKeys.filter((o) => o.keyId !== keyId)
+    await savePreKeys(this._userId, this._prekeys)
+    if (this._prekeys.oneTimePreKeys.length <= OTP_LOW_WATER) {
+      await this._replenishOneTimePreKeys()
+    }
+  }
+
+  /** Top the one-time prekey pool back up to OTP_POOL_SIZE and publish the new keys. */
+  private async _replenishOneTimePreKeys(): Promise<void> {
+    if (!this._identity || !this._prekeys) return
+    const need = OTP_POOL_SIZE - this._prekeys.oneTimePreKeys.length
+    if (need <= 0) return
+
+    const fresh = await generateOneTimePreKeys(this._prekeys.nextOtpId, need)
+    this._prekeys.nextOtpId += need
+    for (const o of fresh) {
+      this._prekeys.oneTimePreKeys.push({
+        keyId: o.keyId,
+        pub:   exportKey(o.keyPair.publicKey),
+        priv:  exportKey(o.keyPair.privateKey),
+      })
+    }
+    await savePreKeys(this._userId, this._prekeys)
+    await this._publishPreKeys(fresh.map((o) => ({ keyId: o.keyId, publicKey: exportKey(o.keyPair.publicKey) })))
   }
 
   private _scheduleReconnect(): void {
@@ -585,13 +779,15 @@ export class EncraClient {
       })
 
       try {
-        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId)
+        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.header.prekey)
         const text    = await ratchet.decrypt({
           header:     msg.header,
           ciphertext: importKey(msg.ciphertext),
           nonce:      importKey(msg.nonce),
         })
         await saveRatchet(this._userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
+        // We've heard from this peer device — stop attaching our prekey message.
+        this._pendingPrekey.delete(`${msg.from}:${msg.fromDeviceId}`)
         if (!this._cancelled) {
           this._addMessage({ from: msg.from, text, timestamp: Date.now() })
         }
@@ -655,6 +851,10 @@ export class EncraClient {
       }),
     })
     if (!regRes.ok) throw new Error(`Key registration failed: ${regRes.status}`)
+
+    // Set up X3DH prekeys (identity key, signed prekey, one-time prekey pool)
+    // and publish them so peers can open sessions with us asynchronously.
+    await this._initPreKeys()
 
     if (!this._cancelled) this._connectWS()
   }
