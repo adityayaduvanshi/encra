@@ -245,7 +245,7 @@ describe('useE2EChat', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xaa)),
       nonce:        exportKey(new Uint8Array(24).fill(0xbb)),
-      header:       { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xcc)),
     })
 
     await act(async () => {
@@ -364,7 +364,7 @@ describe('useE2EChat', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xcc)),
       nonce:        exportKey(new Uint8Array(24).fill(0xdd)),
-      header:       { dh: exportKey(ivyKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xee)),
     })
 
     await act(async () => {
@@ -427,11 +427,11 @@ describe('useE2EChat', () => {
     // we can verify the hook wires routing + the prekey frame correctly.
     const fakeRatchet = {
       encrypt: vi.fn().mockResolvedValue({
-        header:     { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
+        encHeader:  new Uint8Array(40).fill(0x03),
         ciphertext: new Uint8Array(48).fill(0x01),
         nonce:      new Uint8Array(24).fill(0x02),
       }),
-      export: vi.fn().mockReturnValue({ version: 1 }),
+      export: vi.fn().mockReturnValue({ version: 2 }),
     }
     vi.spyOn(DoubleRatchet, 'initSender').mockResolvedValue(
       fakeRatchet as unknown as InstanceType<typeof DoubleRatchet>
@@ -458,15 +458,16 @@ describe('useE2EChat', () => {
     })
     expect(sentFrames).toHaveLength(2)
 
-    // Frames must include toDeviceId for relay routing
+    // Frames must include toDeviceId for relay routing and an encrypted header.
     for (const frame of sentFrames) {
-      const p = JSON.parse(frame) as { toDeviceId?: string }
+      const p = JSON.parse(frame) as { toDeviceId?: string; encHeader?: string }
       expect(p.toDeviceId).toBe(TEST_DEVICE_ID)
+      expect(p.encHeader).toBeTruthy()
     }
 
-    // The first message of the session must carry the X3DH prekey on its header.
-    const firstFrame = JSON.parse(sentFrames[0]!) as { header?: { prekey?: { ephemeralKey?: string } } }
-    expect(firstFrame.header?.prekey?.ephemeralKey).toBeTruthy()
+    // The first message of the session must carry the X3DH prekey as its own field.
+    const firstFrame = JSON.parse(sentFrames[0]!) as { prekey?: { ephemeralKey?: string } }
+    expect(firstFrame.prekey?.ephemeralKey).toBeTruthy()
 
     // onWireMessage should have fired with direction 'sent' for each message
     const sentEvents = onWireMessage.mock.calls.filter(
@@ -493,7 +494,7 @@ describe('useE2EChat', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xee)),
       nonce:        exportKey(new Uint8Array(24).fill(0xff)),
-      header:       { dh: exportKey(senderKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0x11)),
     })
 
     await act(async () => {

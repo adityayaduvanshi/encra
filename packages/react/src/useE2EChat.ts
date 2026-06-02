@@ -12,7 +12,7 @@ import {
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, MessageHeader, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
@@ -72,14 +72,12 @@ export interface UseE2EChatResult {
 }
 
 /**
- * The ratchet header as it travels on the wire. The optional `prekey` field
- * rides along on a session's first inbound message(s) so the recipient can run
- * X3DH. The Double Ratchet ignores fields beyond `dh`/`pn`/`n`, and the relay
- * forwards (and queues) the whole header opaquely, so no protocol change is
- * needed to carry it.
+ * A message on the wire. `encHeader` is the ratchet header encrypted under the
+ * sending header key (the relay never sees ratchet metadata). `prekey` carries
+ * the X3DH prekey message on a session's first inbound message(s); it travels
+ * alongside the encrypted header because it must be readable before any header
+ * key exists.
  */
-type WireHeader = MessageHeader & { prekey?: PreKeyMessage }
-
 interface WireMessage {
   type: string
   from?: string
@@ -87,7 +85,8 @@ interface WireMessage {
   fromDeviceId?: string
   ciphertext?: string
   nonce?: string
-  header?: WireHeader
+  encHeader?: string
+  prekey?: PreKeyMessage
 }
 
 const BACKOFF_BASE_MS  = 1000
@@ -349,7 +348,7 @@ export function useE2EChat({
       // mismatch (MITM guard).
       const bundle  = await fetchPreKeyBundle(peerId, deviceId)
       const init    = await x3dhInitiate(myIdentity, bundle)
-      const ratchet = await DoubleRatchet.initSender(init.sharedSecret, init.signedPreKeyPublic)
+      const ratchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
       ratchetsRef.current.set(key, ratchet)
       // Carry the prekey message on outgoing frames until the peer replies.
       pendingPrekeyRef.current.set(`${peerId}:${deviceId}`, init.message)
@@ -408,8 +407,8 @@ export function useE2EChat({
         oneTimePair = { publicKey: importKey(found.pub), privateKey: importKey(found.priv) }
       }
 
-      const shared  = await x3dhRespond(myIdentity, signedPair, oneTimePair, prekey)
-      const ratchet = await DoubleRatchet.initReceiver(shared, signedPair)
+      const keys    = await x3dhRespond(myIdentity, signedPair, oneTimePair, prekey)
+      const ratchet = await DoubleRatchet.initReceiver(keys, signedPair)
       ratchetsRef.current.set(key, ratchet)
       // The one-time prekey is now spent — remove it locally and replenish if low.
       if (prekey.oneTimePreKeyId !== null) await consumeOneTimePreKey(prekey.oneTimePreKeyId)
@@ -458,7 +457,7 @@ export function useE2EChat({
           !msg.fromDeviceId ||
           !msg.ciphertext ||
           !msg.nonce ||
-          !msg.header
+          !msg.encHeader
         ) return
 
         onWireMessageRef.current?.({
@@ -469,9 +468,9 @@ export function useE2EChat({
         })
 
         try {
-          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.header.prekey)
+          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
           const text = await ratchet.decrypt({
-            header:     msg.header,
+            encHeader:  importKey(msg.encHeader),
             ciphertext: importKey(msg.ciphertext),
             nonce:      importKey(msg.nonce),
           })
@@ -604,16 +603,16 @@ export function useE2EChat({
       // Send one encrypted message per recipient device
       for (const device of peerDevices) {
         const ratchet = await getOrInitSenderRatchet(to, device.deviceId)
-        const { header, ciphertext, nonce } = await ratchet.encrypt(text)
+        const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
         await saveRatchet(userId, `s:${to}:${device.deviceId}`, ratchet.export())
 
         // Attach the X3DH prekey message until we hear back from this device, so
         // the recipient can establish the session even if earlier frames were lost.
-        const pending    = pendingPrekeyRef.current.get(`${to}:${device.deviceId}`)
-        const wireHeader: WireHeader = pending ? { ...header, prekey: pending } : header
+        const pending = pendingPrekeyRef.current.get(`${to}:${device.deviceId}`)
 
         const ctB64 = exportKey(ciphertext)
         const nB64  = exportKey(nonce)
+        const ehB64 = exportKey(encHeader)
 
         socket.send(JSON.stringify({
           type:       'message',
@@ -621,7 +620,8 @@ export function useE2EChat({
           toDeviceId: device.deviceId,
           ciphertext: ctB64,
           nonce:      nB64,
-          header:     wireHeader,
+          encHeader:  ehB64,
+          ...(pending && { prekey: pending }),
         }))
 
         onWireMessageRef.current?.({

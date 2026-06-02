@@ -12,7 +12,7 @@ import {
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, MessageHeader, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
@@ -109,21 +109,20 @@ type Listener<K extends keyof EventMap> = (...args: EventMap[K]) => void
 // ── Internal wire shape ───────────────────────────────────────────────────────
 
 /**
- * The ratchet header as it travels on the wire. The optional `prekey` field
- * rides along on a session's first inbound message(s) so the recipient can run
- * X3DH. The Double Ratchet ignores fields beyond `dh`/`pn`/`n`, and the relay
- * forwards (and queues) the whole header opaquely, so no protocol change is
- * needed to carry it.
+ * A message on the wire. `encHeader` is the ratchet header encrypted under the
+ * sending header key (the relay never sees the ratchet public key or counters).
+ * `prekey` carries the X3DH prekey message on a session's first inbound
+ * message(s) so the recipient can establish the session; it travels alongside
+ * the encrypted header because it must be readable before any header key exists.
  */
-type WireHeader = MessageHeader & { prekey?: PreKeyMessage }
-
 interface WireMessage {
   type:          string
   from?:         string
   fromDeviceId?: string
   ciphertext?:   string
   nonce?:        string
-  header?:       WireHeader
+  encHeader?:    string
+  prekey?:       PreKeyMessage
 }
 
 const BACKOFF_BASE_MS    = 1_000
@@ -266,20 +265,21 @@ export class EncraClient {
 
     for (const device of peerDevices) {
       const ratchet     = await this._getOrInitSenderRatchet(to, device.deviceId)
-      const { header, ciphertext, nonce } = await ratchet.encrypt(text)
+      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
       await saveRatchet(this._userId, `s:${to}:${device.deviceId}`, ratchet.export())
 
       // Attach the X3DH prekey message until we hear back from this device, so
       // the recipient can establish the session even if earlier frames were lost.
-      const pending    = this._pendingPrekey.get(`${to}:${device.deviceId}`)
-      const wireHeader: WireHeader = pending ? { ...header, prekey: pending } : header
+      const pending = this._pendingPrekey.get(`${to}:${device.deviceId}`)
 
-      const ctB64 = exportKey(ciphertext)
-      const nB64  = exportKey(nonce)
+      const ctB64  = exportKey(ciphertext)
+      const nB64   = exportKey(nonce)
+      const ehB64  = exportKey(encHeader)
 
       this._socket.send(JSON.stringify({
         type: 'message', to, toDeviceId: device.deviceId,
-        ciphertext: ctB64, nonce: nB64, header: wireHeader,
+        ciphertext: ctB64, nonce: nB64, encHeader: ehB64,
+        ...(pending && { prekey: pending }),
       }))
 
       this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
@@ -544,7 +544,7 @@ export class EncraClient {
     // x3dhInitiate verifies the signed-prekey signature and aborts on mismatch.
     const bundle = await this._fetchPreKeyBundle(peerId, deviceId)
     const init   = await x3dhInitiate(this._identity, bundle)
-    const ratchet = await DoubleRatchet.initSender(init.sharedSecret, init.signedPreKeyPublic)
+    const ratchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
     this._ratchets.set(ratchetKey, ratchet)
     // Carry the prekey message on outgoing frames until the peer replies.
     this._pendingPrekey.set(`${peerId}:${deviceId}`, init.message)
@@ -578,8 +578,8 @@ export class EncraClient {
     }
 
     const { signedPair, oneTimePair } = this._resolveResponderKeys(prekey)
-    const shared  = await x3dhRespond(this._identity, signedPair, oneTimePair, prekey)
-    const ratchet = await DoubleRatchet.initReceiver(shared, signedPair)
+    const keys    = await x3dhRespond(this._identity, signedPair, oneTimePair, prekey)
+    const ratchet = await DoubleRatchet.initReceiver(keys, signedPair)
     this._ratchets.set(ratchetKey, ratchet)
     // The one-time prekey is now spent — remove it locally and replenish if low.
     if (prekey.oneTimePreKeyId !== null) {
@@ -769,7 +769,7 @@ export class EncraClient {
         msg = JSON.parse(event.data as string) as WireMessage
       } catch { return }
 
-      if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.header) return
+      if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.encHeader) return
 
       this._emit('wire', {
         direction:  'received',
@@ -779,9 +779,9 @@ export class EncraClient {
       })
 
       try {
-        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.header.prekey)
+        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
         const text    = await ratchet.decrypt({
-          header:     msg.header,
+          encHeader:  importKey(msg.encHeader),
           ciphertext: importKey(msg.ciphertext),
           nonce:      importKey(msg.nonce),
         })

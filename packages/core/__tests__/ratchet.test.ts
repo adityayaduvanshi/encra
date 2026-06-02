@@ -1,20 +1,29 @@
 import { describe, it, expect, beforeAll } from 'vitest'
+import _sodium from 'libsodium-wrappers'
 import { sodiumReady, generateKeyPair } from '../src/crypto/keyPair.js'
-import { deriveSharedSecret } from '../src/crypto/keyExchange.js'
 import { DoubleRatchet, MAX_SKIP_KEYS } from '../src/crypto/ratchet.js'
+import type { SessionKeys } from '../src/crypto/x3dh.js'
 import { DecryptionFailedError, InvalidKeyError } from '../src/errors.js'
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
+/** Build a matching SessionKeys (root + header keys) shared by both parties. */
+function makeKeys(): SessionKeys {
+  return {
+    rootKey:       _sodium.randombytes_buf(32),
+    headerKey:     _sodium.randombytes_buf(32),
+    nextHeaderKey: _sodium.randombytes_buf(32),
+  }
+}
+
 async function makeSession() {
-  // Simulate a real session: both sides derive the same shared secret first
-  const aliceKP = await generateKeyPair()
-  const bobKP   = await generateKeyPair()
-  const shared  = await deriveSharedSecret(aliceKP.privateKey, bobKP.publicKey)
+  // Both sides are seeded with the same session keys (as X3DH would produce).
+  const bobKP = await generateKeyPair()
+  const keys  = makeKeys()
 
   // Bob keeps his keypair as his ratchet identity; Alice knows Bob's public key
-  const alice = await DoubleRatchet.initSender(shared, bobKP.publicKey)
-  const bob   = await DoubleRatchet.initReceiver(shared, bobKP)
+  const alice = await DoubleRatchet.initSender(keys, bobKP.publicKey)
+  const bob   = await DoubleRatchet.initReceiver(keys, bobKP)
 
   return { alice, bob }
 }
@@ -171,6 +180,51 @@ describe('forward secrecy', () => {
   })
 })
 
+// ── Header encryption ─────────────────────────────────────────────────────────
+
+describe('header encryption', () => {
+  it('the wire message carries an encrypted header, not plaintext dh/pn/n', async () => {
+    const { alice } = await makeSession()
+    const msg = await alice.encrypt('hi')
+    // New wire shape: encHeader replaces the plaintext { dh, pn, n } header.
+    expect(msg.encHeader).toBeInstanceOf(Uint8Array)
+    expect(msg.encHeader.length).toBeGreaterThan(0)
+    expect((msg as unknown as { header?: unknown }).header).toBeUndefined()
+  })
+
+  it('the encrypted header does not leak the ratchet public key', async () => {
+    const { alice } = await makeSession()
+    const exported  = alice.export()
+    const dhPub     = exported.DHs_pub  // base64 of the sender's ratchet pubkey
+    const msg       = await alice.encrypt('hi')
+    const encHeaderB64 = Buffer.from(msg.encHeader).toString('base64')
+    // The plaintext dh public key must not appear anywhere in the encrypted header.
+    expect(encHeaderB64).not.toContain(dhPub)
+  })
+
+  it('a message with a corrupted header fails to decrypt', async () => {
+    const { alice, bob } = await makeSession()
+    const msg = await alice.encrypt('secret')
+    msg.encHeader[msg.encHeader.length - 1] ^= 0xff // tamper the header ciphertext
+    await expect(bob.decrypt(msg)).rejects.toThrow(DecryptionFailedError)
+  })
+
+  it('header keys rotate on a DH ratchet step', async () => {
+    const { alice, bob } = await makeSession()
+    await bob.decrypt(await alice.encrypt('m1'))
+
+    const aliceHKsBefore = alice.export().HKs
+    // Bob replies (DH ratchet on Alice when she decrypts), then Alice replies
+    // again which advances her sending header key.
+    await alice.decrypt(await bob.encrypt('r1'))
+    await bob.decrypt(await alice.encrypt('m2'))
+    const aliceHKsAfter = alice.export().HKs
+
+    expect(aliceHKsAfter).not.toBeNull()
+    expect(aliceHKsAfter).not.toBe(aliceHKsBefore)
+  })
+})
+
 // ── State export / import ─────────────────────────────────────────────────────
 
 describe('state persistence (export / import)', () => {
@@ -208,19 +262,20 @@ describe('error handling', () => {
     await expect(bob.encrypt('hi')).rejects.toThrow(InvalidKeyError)
   })
 
-  it('initSender throws InvalidKeyError for wrong-length sharedSecret', async () => {
+  it('initSender throws InvalidKeyError for wrong-length rootKey', async () => {
     const bobKP = await generateKeyPair()
-    await expect(DoubleRatchet.initSender(new Uint8Array(16), bobKP.publicKey)).rejects.toThrow(InvalidKeyError)
+    const badKeys = { ...makeKeys(), rootKey: new Uint8Array(16) }
+    await expect(DoubleRatchet.initSender(badKeys, bobKP.publicKey)).rejects.toThrow(InvalidKeyError)
   })
 
   it('initSender throws InvalidKeyError for wrong-length theirPublicKey', async () => {
-    const secret = new Uint8Array(32).fill(1)
-    await expect(DoubleRatchet.initSender(secret, new Uint8Array(16))).rejects.toThrow(InvalidKeyError)
+    await expect(DoubleRatchet.initSender(makeKeys(), new Uint8Array(16))).rejects.toThrow(InvalidKeyError)
   })
 
-  it('initReceiver throws InvalidKeyError for wrong-length sharedSecret', async () => {
+  it('initReceiver throws InvalidKeyError for wrong-length rootKey', async () => {
     const bobKP = await generateKeyPair()
-    await expect(DoubleRatchet.initReceiver(new Uint8Array(16), bobKP)).rejects.toThrow(InvalidKeyError)
+    const badKeys = { ...makeKeys(), rootKey: new Uint8Array(16) }
+    await expect(DoubleRatchet.initReceiver(badKeys, bobKP)).rejects.toThrow(InvalidKeyError)
   })
 
   it('throws DecryptionFailedError when skip limit exceeded', async () => {

@@ -270,14 +270,14 @@ describe('EncraClient', () => {
     await client.connect()
     await new Promise((r) => setTimeout(r, 100))
 
-    // Old-style message with no X3DH prekey header — cannot bootstrap a session.
+    // Message with no X3DH prekey — cannot bootstrap a session.
     const wireMsg = JSON.stringify({
       type:         'message',
       from:         'carol',
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xaa)),
       nonce:        exportKey(new Uint8Array(24).fill(0xbb)),
-      header:       { dh: exportKey(carolKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xcc)),
     })
 
     mockWs.simulateMessage(wireMsg)
@@ -325,7 +325,7 @@ describe('EncraClient', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   exportKey(new Uint8Array(48).fill(0xcc)),
       nonce:        exportKey(new Uint8Array(24).fill(0xdd)),
-      header:       { dh: exportKey(peerKP.publicKey), pn: 0, n: 0 },
+      encHeader:    exportKey(new Uint8Array(40).fill(0xee)),
     }))
     await new Promise((r) => setTimeout(r, 200))
 
@@ -351,15 +351,18 @@ describe('EncraClient', () => {
     })
     expect(frame).toBeDefined()
 
-    // Frame must include toDeviceId for routing and an X3DH prekey on the header
+    // Frame must include toDeviceId for routing, an encrypted header (no
+    // plaintext ratchet metadata), and the X3DH prekey as a separate field
     // (this is the first message of the session).
     const parsedFrame = JSON.parse(frame!) as {
       toDeviceId?: string
-      header?: { prekey?: { identityKey: string; ephemeralKey: string } }
+      encHeader?: string
+      prekey?: { identityKey: string; ephemeralKey: string }
     }
     expect(parsedFrame.toDeviceId).toBe(TEST_DEVICE_ID)
-    expect(parsedFrame.header?.prekey).toBeDefined()
-    expect(parsedFrame.header?.prekey?.ephemeralKey).toBeTruthy()
+    expect(parsedFrame.encHeader).toBeTruthy()
+    expect(parsedFrame.prekey).toBeDefined()
+    expect(parsedFrame.prekey?.ephemeralKey).toBeTruthy()
 
     expect(onWire).toHaveBeenCalledWith(expect.objectContaining({ direction: 'sent' }))
     expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ from: 'nina', text: 'hello' }))
@@ -390,7 +393,8 @@ describe('EncraClient', () => {
       fromDeviceId: TEST_DEVICE_ID,
       ciphertext:   sent['ciphertext'],
       nonce:        sent['nonce'],
-      header:       sent['header'],
+      encHeader:    sent['encHeader'],
+      prekey:       sent['prekey'],
     }))
     await new Promise((r) => setTimeout(r, 100))
 

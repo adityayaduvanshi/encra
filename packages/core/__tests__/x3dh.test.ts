@@ -122,15 +122,22 @@ describe('X3DH handshake', () => {
     const bundle = buildPreKeyBundle(bob.identity, bob.signedPreKey, bob.oneTimePreKey)
 
     const init = await x3dhInitiate(alice, bundle)
-    const bobSecret = await x3dhRespond(
+    const bobKeys = await x3dhRespond(
       bob.identity,
       bob.signedPreKey.keyPair,
       bob.oneTimePreKey!.keyPair,
       init.message
     )
 
-    expect(init.sharedSecret.length).toBe(32)
-    expect(init.sharedSecret).toEqual(bobSecret)
+    expect(init.sessionKeys.rootKey.length).toBe(32)
+    expect(init.sessionKeys.headerKey.length).toBe(32)
+    expect(init.sessionKeys.nextHeaderKey.length).toBe(32)
+    expect(init.sessionKeys.rootKey).toEqual(bobKeys.rootKey)
+    expect(init.sessionKeys.headerKey).toEqual(bobKeys.headerKey)
+    expect(init.sessionKeys.nextHeaderKey).toEqual(bobKeys.nextHeaderKey)
+    // The three derived keys must be independent of one another.
+    expect(init.sessionKeys.rootKey).not.toEqual(init.sessionKeys.headerKey)
+    expect(init.sessionKeys.headerKey).not.toEqual(init.sessionKeys.nextHeaderKey)
     expect(init.message.oneTimePreKeyId).toBe(1)
   })
 
@@ -140,10 +147,12 @@ describe('X3DH handshake', () => {
     const bundle = buildPreKeyBundle(bob.identity, bob.signedPreKey) // no OTP
 
     const init = await x3dhInitiate(alice, bundle)
-    const bobSecret = await x3dhRespond(bob.identity, bob.signedPreKey.keyPair, null, init.message)
+    const bobKeys = await x3dhRespond(bob.identity, bob.signedPreKey.keyPair, null, init.message)
 
     expect(init.message.oneTimePreKeyId).toBeNull()
-    expect(init.sharedSecret).toEqual(bobSecret)
+    expect(init.sessionKeys.rootKey).toEqual(bobKeys.rootKey)
+    expect(init.sessionKeys.headerKey).toEqual(bobKeys.headerKey)
+    expect(init.sessionKeys.nextHeaderKey).toEqual(bobKeys.nextHeaderKey)
   })
 
   it('exposes the signed-prekey public key for ratchet seeding', async () => {
@@ -186,7 +195,7 @@ describe('X3DH handshake', () => {
 
     const initA = await x3dhInitiate(aliceA, bundle)
     const initB = await x3dhInitiate(aliceB, bundle)
-    expect(initA.sharedSecret).not.toEqual(initB.sharedSecret)
+    expect(initA.sessionKeys.rootKey).not.toEqual(initB.sessionKeys.rootKey)
   })
 
   it('end-to-end: X3DH secret seeds a working Double Ratchet session', async () => {
@@ -196,16 +205,16 @@ describe('X3DH handshake', () => {
 
     // Alice initiates and seeds her sending ratchet with Bob's signed prekey.
     const init = await x3dhInitiate(alice, bundle)
-    const aliceRatchet = await DoubleRatchet.initSender(init.sharedSecret, init.signedPreKeyPublic)
+    const aliceRatchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
 
-    // Bob derives the same secret and seeds his receiving ratchet with his SPK pair.
-    const bobSecret = await x3dhRespond(
+    // Bob derives the same keys and seeds his receiving ratchet with his SPK pair.
+    const bobKeys = await x3dhRespond(
       bob.identity,
       bob.signedPreKey.keyPair,
       bob.oneTimePreKey!.keyPair,
       init.message
     )
-    const bobRatchet = await DoubleRatchet.initReceiver(bobSecret, bob.signedPreKey.keyPair)
+    const bobRatchet = await DoubleRatchet.initReceiver(bobKeys, bob.signedPreKey.keyPair)
 
     const msg1 = await aliceRatchet.encrypt('hello bob')
     expect(await bobRatchet.decrypt(msg1)).toBe('hello bob')

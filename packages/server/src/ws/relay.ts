@@ -52,7 +52,8 @@ interface RelayMessage {
   toDeviceId?:   string
   ciphertext?:   string
   nonce?:        string
-  header?:       unknown   // Opaque ratchet header — forwarded as-is
+  encHeader?:    string    // Encrypted ratchet header (base64) — forwarded as-is
+  prekey?:       unknown   // X3DH prekey message on session-initiating frames
   senderName?:   string
 }
 
@@ -95,13 +96,14 @@ async function queueOfflineMessage(
   senderDeviceId:    string,
   ciphertext:        string,
   nonce:             string,
-  header:            unknown,
+  encHeader:         string,
+  prekey:            unknown,
   senderName:        string | undefined,
 ): Promise<void> {
   await getPool().query(
     `INSERT INTO message_queue
-       (recipient_id, recipient_device_id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+       (recipient_id, recipient_device_id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       recipientId,
       recipientDeviceId,
@@ -109,7 +111,8 @@ async function queueOfflineMessage(
       senderDeviceId,
       ciphertext,
       nonce,
-      JSON.stringify(header ?? {}),
+      encHeader,
+      prekey === undefined ? null : JSON.stringify(prekey),
       senderName ?? null,
     ],
   )
@@ -126,12 +129,13 @@ async function flushQueuedMessages(
     sender_device_id:  string
     ciphertext:        string
     nonce:             string
-    header:            unknown
+    enc_header:        string
+    prekey:            unknown
     sender_name:       string | null
   }>(
     `DELETE FROM message_queue
      WHERE recipient_id = $1 AND recipient_device_id = $2
-     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, header, sender_name`,
+     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name`,
     [userId, deviceId],
   )
 
@@ -143,7 +147,8 @@ async function flushQueuedMessages(
       fromDeviceId: row.sender_device_id,
       ciphertext:   row.ciphertext,
       nonce:        row.nonce,
-      header:       row.header,
+      encHeader:    row.enc_header,
+      ...(row.prekey      !== null && { prekey:     row.prekey }),
       ...(row.sender_name !== null && { senderName: row.sender_name }),
     }))
   }
@@ -340,10 +345,10 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           socket.send(JSON.stringify({ type: 'error', message: 'Must register before sending messages.' }))
           return
         }
-        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce) {
+        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce || !msg.encHeader) {
           socket.send(JSON.stringify({
             type:    'error',
-            message: 'message requires to, toDeviceId, ciphertext, and nonce.',
+            message: 'message requires to, toDeviceId, ciphertext, nonce, and encHeader.',
           }))
           return
         }
@@ -355,7 +360,8 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           fromDeviceId: registeredDeviceId,
           ciphertext:   msg.ciphertext,
           nonce:        msg.nonce,
-          ...(msg.header     !== undefined && { header:     msg.header }),
+          encHeader:    msg.encHeader,
+          ...(msg.prekey     !== undefined && { prekey:     msg.prekey }),
           ...(msg.senderName !== undefined && { senderName: msg.senderName }),
         })
 
@@ -368,7 +374,8 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
           registeredDeviceId,
           msg.ciphertext,
           msg.nonce,
-          msg.header,
+          msg.encHeader,
+          msg.prekey,
           msg.senderName,
           socket,
         ).catch((err: Error) => {
@@ -432,7 +439,8 @@ async function deliverMessage(
   senderDeviceId:    string,
   ciphertext:        string,
   nonce:             string,
-  header:            unknown,
+  encHeader:         string,
+  prekey:            unknown,
   senderName:        string | undefined,
   senderSocket:      WebSocket,
 ): Promise<void> {
@@ -466,7 +474,8 @@ async function deliverMessage(
     senderDeviceId,
     ciphertext,
     nonce,
-    header,
+    encHeader,
+    prekey,
     senderName,
   )
 

@@ -36,6 +36,7 @@ export type {
   PreKeyBundle,
   PreKeyMessage,
   X3DHInitiation,
+  SessionKeys,
 } from './crypto/x3dh.js'
 
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

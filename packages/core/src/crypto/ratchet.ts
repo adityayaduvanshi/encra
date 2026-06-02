@@ -1,12 +1,17 @@
 import _sodium from 'libsodium-wrappers'
 import { KeyPair } from './keyPair.js'
+import type { SessionKeys } from './x3dh.js'
 import { DecryptionFailedError, InvalidKeyError } from '../errors.js'
 
 export const MAX_SKIP_KEYS = 1000
-export const RATCHET_VERSION = 1
+export const RATCHET_VERSION = 2
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+/**
+ * The ratchet header. With header encryption this never travels in plaintext —
+ * it is encrypted under the sending header key and recovered by the receiver.
+ */
 export interface MessageHeader {
   /** Sender's current DH ratchet public key (base64). */
   dh: string
@@ -16,8 +21,13 @@ export interface MessageHeader {
   n: number
 }
 
+/**
+ * An encrypted message on the wire. `encHeader` is the header encrypted under a
+ * header key (so the relay can't read the ratchet public key or counters);
+ * `ciphertext`/`nonce` are the body encrypted under a per-message key.
+ */
 export interface RatchetMessage {
-  header: MessageHeader
+  encHeader: Uint8Array
   ciphertext: Uint8Array
   nonce: Uint8Array
 }
@@ -33,7 +43,12 @@ export interface RatchetStateExport {
   Ns: number
   Nr: number
   PN: number
-  MKSKIPPED: Array<[string, string]>
+  HKs: string | null
+  HKr: string | null
+  NHKs: string | null
+  NHKr: string | null
+  /** Skipped message keys: [headerKeyB64, [[n, messageKeyB64], ...]]. */
+  MKSKIPPED: Array<[string, Array<[number, string]>]>
 }
 
 interface State {
@@ -45,7 +60,13 @@ interface State {
   Ns: number
   Nr: number
   PN: number
-  MKSKIPPED: Map<string, Uint8Array>
+  // Header keys (Double Ratchet with header encryption)
+  HKs: Uint8Array | null   // sending header key
+  HKr: Uint8Array | null   // receiving header key
+  NHKs: Uint8Array | null  // next sending header key
+  NHKr: Uint8Array | null  // next receiving header key
+  /** Skipped message keys, grouped by the receiving header key they belong to. */
+  MKSKIPPED: Map<string, Map<number, Uint8Array>>
 }
 
 // ── KDF primitives ────────────────────────────────────────────────────────────
@@ -62,14 +83,16 @@ function prf(key: Uint8Array, data: Uint8Array): Uint8Array {
 }
 
 /**
- * KDF_RK: HKDF-SHA256 using the root key as salt and a DH output as IKM.
- * Returns [new_root_key, new_chain_key].
+ * KDF_RK (header-encryption variant): derives a new root key, a chain key, and
+ * the next header key from the current root key and a DH output.
+ * Returns [new_root_key, chain_key, next_header_key].
  */
-function kdfRK(rk: Uint8Array, dhOut: Uint8Array): [Uint8Array, Uint8Array] {
-  const prk    = prf(rk, dhOut)
-  const newRK  = prf(prk, new Uint8Array([1]))
-  const newCK  = prf(prk, new Uint8Array([...newRK, 2]))
-  return [newRK, newCK]
+function kdfRKHE(rk: Uint8Array, dhOut: Uint8Array): [Uint8Array, Uint8Array, Uint8Array] {
+  const prk = prf(rk, dhOut)
+  const newRK = prf(prk, new Uint8Array([1]))
+  const newCK = prf(prk, new Uint8Array([2]))
+  const newNHK = prf(prk, new Uint8Array([3]))
+  return [newRK, newCK, newNHK]
 }
 
 /**
@@ -78,7 +101,7 @@ function kdfRK(rk: Uint8Array, dhOut: Uint8Array): [Uint8Array, Uint8Array] {
  * Message key must be used once then wiped.
  */
 function kdfCK(ck: Uint8Array): [Uint8Array, Uint8Array] {
-  const mk     = prf(ck, new Uint8Array([1]))
+  const mk = prf(ck, new Uint8Array([1]))
   const ckNext = prf(ck, new Uint8Array([2]))
   return [ckNext, mk]
 }
@@ -93,28 +116,65 @@ function unb64(s: string): Uint8Array {
   return _sodium.from_base64(s, _sodium.base64_variants.URLSAFE_NO_PADDING)
 }
 
-function skippedMapKey(dhPub: Uint8Array, n: number): string {
-  return `${b64(dhPub)}:${n}`
+// ── Header encryption ───────────────────────────────────────────────────────────
+
+/** Encrypt a header under a header key. Output is `nonce || ciphertext`. */
+function encryptHeader(hk: Uint8Array, header: MessageHeader): Uint8Array {
+  const nonce = _sodium.randombytes_buf(_sodium.crypto_secretbox_NONCEBYTES)
+  // Compact field names keep the encrypted header small.
+  const data  = _sodium.from_string(JSON.stringify({ d: header.dh, p: header.pn, n: header.n }))
+  const ct    = _sodium.crypto_secretbox_easy(data, nonce, hk)
+  const out   = new Uint8Array(nonce.length + ct.length)
+  out.set(nonce, 0)
+  out.set(ct, nonce.length)
+  return out
+}
+
+/**
+ * Try to decrypt a header with a header key.
+ * Returns the header on success, or null if this key doesn't match (so the
+ * caller can try the next header key without throwing).
+ */
+function decryptHeader(hk: Uint8Array, encHeader: Uint8Array): MessageHeader | null {
+  const nbytes = _sodium.crypto_secretbox_NONCEBYTES
+  if (encHeader.length <= nbytes) return null
+  const nonce = encHeader.slice(0, nbytes)
+  const ct    = encHeader.slice(nbytes)
+  try {
+    const data = _sodium.crypto_secretbox_open_easy(ct, nonce, hk)
+    if (!data) return null
+    const obj = JSON.parse(_sodium.to_string(data)) as { d: string; p: number; n: number }
+    if (typeof obj.d !== 'string' || typeof obj.p !== 'number' || typeof obj.n !== 'number') return null
+    return { dh: obj.d, pn: obj.p, n: obj.n }
+  } catch {
+    return null
+  }
+}
+
+function copy(b: Uint8Array): Uint8Array {
+  return new Uint8Array(b)
 }
 
 // ── DoubleRatchet ─────────────────────────────────────────────────────────────
 
 /**
- * Signal Double Ratchet implementation.
+ * Signal Double Ratchet with header encryption.
  *
  * Combines a symmetric-key ratchet (one message key per message, deleted after
  * use) with a Diffie-Hellman ratchet (new DH key pair on every direction change)
- * to provide both forward secrecy and break-in recovery.
+ * to provide forward secrecy and break-in recovery. In addition, every message
+ * header (the ratchet public key and message counters) is encrypted under a
+ * per-direction header key, so a relay never sees ratchet metadata.
  *
- * Usage:
+ * Seed the session with the `SessionKeys` produced by X3DH:
  * ```typescript
- * // Alice (sender)
- * const alice = await DoubleRatchet.initSender(sharedSecret, bobPublicKey)
- * const msg   = await alice.encrypt('Hello Bob!')
+ * // Alice (initiator)
+ * const init  = await x3dhInitiate(myIdentity, bobBundle)
+ * const alice = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
  *
- * // Bob (receiver — keeps his key pair from the initial key exchange)
- * const bob   = await DoubleRatchet.initReceiver(sharedSecret, bobKeyPair)
- * const text  = await bob.decrypt(msg)   // 'Hello Bob!'
+ * // Bob (responder)
+ * const keys = await x3dhRespond(bobIdentity, bobSpk, bobOtp, init.message)
+ * const bob  = await DoubleRatchet.initReceiver(keys, bobSpkKeyPair)
  * ```
  */
 export class DoubleRatchet {
@@ -128,36 +188,38 @@ export class DoubleRatchet {
 
   /**
    * Initialise as the message sender (Alice).
-   * Performs the first DH ratchet step immediately so the first message
-   * already uses a fresh chain key derived from a new ephemeral DH pair.
+   * Performs the first DH ratchet step immediately so the first message already
+   * uses a fresh chain key derived from a new ephemeral DH pair.
    *
-   * @param sharedSecret  - 32-byte shared secret from the initial key exchange.
-   * @param theirPublicKey - Recipient's DH ratchet public key (Bob's identity/ratchet key).
+   * @param keys           - Session keys from `x3dhInitiate` (root + header keys).
+   * @param theirPublicKey - Recipient's signed-prekey public key (initial DHr).
    * @throws {InvalidKeyError} If key lengths are wrong.
-   * @example
-   * const alice = await DoubleRatchet.initSender(sharedSecret, bob.publicKey)
    */
-  static async initSender(sharedSecret: Uint8Array, theirPublicKey: Uint8Array): Promise<DoubleRatchet> {
+  static async initSender(keys: SessionKeys, theirPublicKey: Uint8Array): Promise<DoubleRatchet> {
     await _sodium.ready
 
-    if (sharedSecret.length !== 32) throw new InvalidKeyError(`sharedSecret must be 32 bytes, got ${sharedSecret.length}.`)
+    validateSessionKeys(keys)
     if (theirPublicKey.length !== _sodium.crypto_box_PUBLICKEYBYTES) {
       throw new InvalidKeyError(`theirPublicKey must be ${_sodium.crypto_box_PUBLICKEYBYTES} bytes.`)
     }
 
     const DHs   = _sodium.crypto_box_keypair()
     const dhOut = _sodium.crypto_scalarmult(DHs.privateKey, theirPublicKey)
-    const [RK, CKs] = kdfRK(sharedSecret, dhOut)
+    const [RK, CKs, NHKs] = kdfRKHE(keys.rootKey, dhOut)
 
     return new DoubleRatchet({
       DHs: { publicKey: DHs.publicKey, privateKey: DHs.privateKey },
-      DHr: theirPublicKey,
+      DHr: copy(theirPublicKey),
       RK,
       CKs,
       CKr: null,
       Ns: 0,
       Nr: 0,
       PN: 0,
+      HKs: copy(keys.headerKey),
+      HKr: null,
+      NHKs,
+      NHKr: copy(keys.nextHeaderKey),
       MKSKIPPED: new Map(),
     })
   }
@@ -166,26 +228,28 @@ export class DoubleRatchet {
    * Initialise as the message receiver (Bob).
    * Waits for Alice's first message to derive the receiving chain.
    *
-   * @param sharedSecret - 32-byte shared secret from the initial key exchange.
-   * @param ourKeyPair   - Bob's DH ratchet key pair (the one Alice used above).
+   * @param keys       - Session keys from `x3dhRespond` (root + header keys).
+   * @param ourKeyPair - Our signed-prekey key pair (the initial DH ratchet key).
    * @throws {InvalidKeyError} If key lengths are wrong.
-   * @example
-   * const bob = await DoubleRatchet.initReceiver(sharedSecret, bobKeyPair)
    */
-  static async initReceiver(sharedSecret: Uint8Array, ourKeyPair: KeyPair): Promise<DoubleRatchet> {
+  static async initReceiver(keys: SessionKeys, ourKeyPair: KeyPair): Promise<DoubleRatchet> {
     await _sodium.ready
 
-    if (sharedSecret.length !== 32) throw new InvalidKeyError(`sharedSecret must be 32 bytes, got ${sharedSecret.length}.`)
+    validateSessionKeys(keys)
 
     return new DoubleRatchet({
       DHs: ourKeyPair,
       DHr: null,
-      RK: sharedSecret,
+      RK: copy(keys.rootKey),
       CKs: null,
       CKr: null,
       Ns: 0,
       Nr: 0,
       PN: 0,
+      HKs: null,
+      HKr: null,
+      NHKs: copy(keys.nextHeaderKey),
+      NHKr: copy(keys.headerKey),
       MKSKIPPED: new Map(),
     })
   }
@@ -193,20 +257,15 @@ export class DoubleRatchet {
   // ── Encrypt / Decrypt ───────────────────────────────────────────────────────
 
   /**
-   * Encrypt a plaintext string. Advances the sending chain by one step.
-   * Each call produces a unique message key that is wiped after use.
+   * Encrypt a plaintext string. Advances the sending chain by one step and
+   * encrypts the header under the sending header key.
    *
-   * @param plaintext - UTF-8 string to encrypt.
-   * @returns `RatchetMessage` containing the header and ciphertext.
-   * @throws {InvalidKeyError} If the sending chain is not yet initialised
-   *   (i.e. the receiver tries to send before receiving the first message).
-   * @example
-   * const msg = await alice.encrypt('Hello!')
+   * @throws {InvalidKeyError} If the sending chain is not yet initialised.
    */
   async encrypt(plaintext: string): Promise<RatchetMessage> {
     await _sodium.ready
 
-    if (!this.s.CKs) {
+    if (!this.s.CKs || !this.s.HKs) {
       throw new InvalidKeyError(
         'Sending chain not initialised. The receiver must decrypt at least one message before sending.'
       )
@@ -220,58 +279,50 @@ export class DoubleRatchet {
       pn: this.s.PN,
       n: this.s.Ns,
     }
+    const encHeader = encryptHeader(this.s.HKs, header)
     this.s.Ns++
 
     const nonce      = _sodium.randombytes_buf(_sodium.crypto_secretbox_NONCEBYTES)
-    // from_string works in both Node.js and browsers; Buffer.from is Node-only
     const msgBytes   = _sodium.from_string(plaintext)
     const ciphertext = new Uint8Array(_sodium.crypto_secretbox_easy(msgBytes, nonce, mk))
     const nonceCopy  = new Uint8Array(nonce)
 
     _sodium.memzero(mk)
 
-    return { header, ciphertext, nonce: nonceCopy }
+    return { encHeader, ciphertext, nonce: nonceCopy }
   }
 
   /**
-   * Decrypt a `RatchetMessage`. Automatically advances the receiving chain
-   * and performs a DH ratchet step when the sender's DH key changes.
-   * Out-of-order messages are supported up to `MAX_SKIP_KEYS` gaps.
+   * Decrypt a `RatchetMessage`. Recovers the header by trying the receiving
+   * header key (and the next one, which signals a DH ratchet step), advances
+   * the receiving chain, and tolerates out-of-order messages up to
+   * `MAX_SKIP_KEYS` gaps.
    *
-   * @param message - Message produced by the sender's `encrypt()`.
-   * @returns Decrypted UTF-8 plaintext.
-   * @throws {DecryptionFailedError} If authentication fails, the key was already used,
-   *   the ciphertext was tampered with, or too many messages were skipped.
-   * @example
-   * const text = await bob.decrypt(msg)
+   * @throws {DecryptionFailedError} If the header can't be decrypted with any
+   *   known header key, authentication fails, the key was already used, or too
+   *   many messages were skipped.
    */
   async decrypt(message: RatchetMessage): Promise<string> {
     await _sodium.ready
 
-    const { header, ciphertext, nonce } = message
-    const headerDHBytes = unb64(header.dh)
+    const { encHeader, ciphertext, nonce } = message
 
-    // 1. Check if this is a skipped message we saved a key for
-    const skipKey    = skippedMapKey(headerDHBytes, header.n)
-    const skippedMK  = this.s.MKSKIPPED.get(skipKey)
-    if (skippedMK) {
-      this.s.MKSKIPPED.delete(skipKey)
-      const plain = this.decryptWithKey(ciphertext, nonce, skippedMK)
-      _sodium.memzero(skippedMK)
-      return plain
-    }
+    // 1. Check skipped message keys (try each stored header key on the header).
+    const skipped = this.trySkippedMessageKeys(encHeader, ciphertext, nonce)
+    if (skipped !== null) return skipped
 
-    // 2. If sender's DH key changed — perform DH ratchet step
-    const isDHNew = !this.s.DHr || b64(headerDHBytes) !== b64(this.s.DHr)
-    if (isDHNew) {
+    // 2. Decrypt the header. HKr → current chain; NHKr → a DH ratchet step.
+    const { header, dhRatchet } = this.decryptHeaderWithRatchetFlag(encHeader)
+
+    if (dhRatchet) {
       this.skipMessageKeys(header.pn)
-      this.dhRatchetStep(headerDHBytes)
+      this.dhRatchetStep(header)
     }
 
-    // 3. Skip any messages we haven't seen yet in the current chain
+    // 3. Skip any messages we haven't seen yet in the current chain.
     this.skipMessageKeys(header.n)
 
-    // 4. Advance the receiving chain
+    // 4. Advance the receiving chain.
     const [CKr, mk] = kdfCK(this.s.CKr!)
     this.s.CKr = CKr
     this.s.Nr++
@@ -291,45 +342,101 @@ export class DoubleRatchet {
       throw new DecryptionFailedError()
     }
     if (!plain) throw new DecryptionFailedError()
-    // to_string works in both Node.js and browsers; Buffer.from is Node-only
     return _sodium.to_string(plain)
+  }
+
+  /**
+   * Decrypt the header, returning whether it implies a DH ratchet step.
+   * Tries the current receiving header key first, then the next one.
+   */
+  private decryptHeaderWithRatchetFlag(encHeader: Uint8Array): { header: MessageHeader; dhRatchet: boolean } {
+    if (this.s.HKr) {
+      const h = decryptHeader(this.s.HKr, encHeader)
+      if (h) return { header: h, dhRatchet: false }
+    }
+    if (this.s.NHKr) {
+      const h = decryptHeader(this.s.NHKr, encHeader)
+      if (h) return { header: h, dhRatchet: true }
+    }
+    throw new DecryptionFailedError('Header could not be decrypted with any known header key.')
+  }
+
+  /**
+   * Try to decrypt the message using a previously skipped message key.
+   * Each stored header key is tried against the encrypted header; if one
+   * decrypts it and a message key for that counter is held, it is consumed.
+   */
+  private trySkippedMessageKeys(
+    encHeader: Uint8Array,
+    ciphertext: Uint8Array,
+    nonce: Uint8Array,
+  ): string | null {
+    for (const [hkB64, inner] of this.s.MKSKIPPED) {
+      const hk = unb64(hkB64)
+      const header = decryptHeader(hk, encHeader)
+      if (!header) continue
+
+      const mk = inner.get(header.n)
+      if (!mk) {
+        // Header matches this chain but no skipped key for this counter — it's a
+        // normal in-order message; let the main path handle it.
+        return null
+      }
+      inner.delete(header.n)
+      if (inner.size === 0) this.s.MKSKIPPED.delete(hkB64)
+
+      const plain = this.decryptWithKey(ciphertext, nonce, mk)
+      _sodium.memzero(mk)
+      return plain
+    }
+    return null
   }
 
   private skipMessageKeys(until: number): void {
     if (this.s.Nr + MAX_SKIP_KEYS < until) {
       throw new DecryptionFailedError(`Too many skipped messages (limit: ${MAX_SKIP_KEYS}).`)
     }
-    if (!this.s.CKr) return
+    if (!this.s.CKr || !this.s.HKr) return
 
+    const hkB64 = b64(this.s.HKr)
+    let inner = this.s.MKSKIPPED.get(hkB64)
     while (this.s.Nr < until) {
       const [CKr, mk] = kdfCK(this.s.CKr)
       this.s.CKr = CKr
-      this.s.MKSKIPPED.set(skippedMapKey(this.s.DHr!, this.s.Nr), mk)
+      if (!inner) {
+        inner = new Map()
+        this.s.MKSKIPPED.set(hkB64, inner)
+      }
+      inner.set(this.s.Nr, mk)
       this.s.Nr++
     }
   }
 
-  private dhRatchetStep(theirDHPublicKey: Uint8Array): void {
+  private dhRatchetStep(header: MessageHeader): void {
     this.s.PN = this.s.Ns
     this.s.Ns = 0
     this.s.Nr = 0
-    this.s.DHr = theirDHPublicKey
+    this.s.HKs = this.s.NHKs
+    this.s.HKr = this.s.NHKr
+    this.s.DHr = unb64(header.dh)
 
-    // Receiving step: derive new root key + receiving chain key
+    // Receiving step: derive new root key, receiving chain key, next receiving header key
     const dhOut1 = _sodium.crypto_scalarmult(this.s.DHs.privateKey, this.s.DHr)
-    const [RK1, CKr] = kdfRK(this.s.RK, dhOut1)
-    this.s.RK  = RK1
-    this.s.CKr = CKr
+    const [RK1, CKr, NHKr] = kdfRKHE(this.s.RK, dhOut1)
+    this.s.RK   = RK1
+    this.s.CKr  = CKr
+    this.s.NHKr = NHKr
 
     // Generate a fresh DH sending key pair
     const newDHs = _sodium.crypto_box_keypair()
     this.s.DHs   = { publicKey: newDHs.publicKey, privateKey: newDHs.privateKey }
 
-    // Sending step: derive new root key + sending chain key
+    // Sending step: derive new root key, sending chain key, next sending header key
     const dhOut2 = _sodium.crypto_scalarmult(this.s.DHs.privateKey, this.s.DHr)
-    const [RK2, CKs] = kdfRK(this.s.RK, dhOut2)
-    this.s.RK  = RK2
-    this.s.CKs = CKs
+    const [RK2, CKs, NHKs] = kdfRKHE(this.s.RK, dhOut2)
+    this.s.RK   = RK2
+    this.s.CKs  = CKs
+    this.s.NHKs = NHKs
   }
 
   // ── Persistence ─────────────────────────────────────────────────────────────
@@ -337,10 +444,6 @@ export class DoubleRatchet {
   /**
    * Export the full ratchet state as a JSON-serialisable object.
    * Store this in IndexedDB (never localStorage) and restore with `fromExport`.
-   *
-   * @returns `RatchetStateExport` — all keys are base64 strings.
-   * @example
-   * await idb.put('ratchet', alice.export())
    */
   export(): RatchetStateExport {
     const s = this.s
@@ -355,18 +458,21 @@ export class DoubleRatchet {
       Ns:         s.Ns,
       Nr:         s.Nr,
       PN:         s.PN,
-      MKSKIPPED:  Array.from(s.MKSKIPPED.entries()).map(([k, v]) => [k, b64(v)]),
+      HKs:        s.HKs  ? b64(s.HKs)  : null,
+      HKr:        s.HKr  ? b64(s.HKr)  : null,
+      NHKs:       s.NHKs ? b64(s.NHKs) : null,
+      NHKr:       s.NHKr ? b64(s.NHKr) : null,
+      MKSKIPPED:  Array.from(s.MKSKIPPED.entries()).map(([hk, inner]) => [
+        hk,
+        Array.from(inner.entries()).map(([n, mk]) => [n, b64(mk)] as [number, string]),
+      ]),
     }
   }
 
   /**
    * Restore a `DoubleRatchet` from a previously exported state.
    *
-   * @param data - Object produced by `export()`.
-   * @returns Restored `DoubleRatchet` ready to send/receive.
    * @throws {InvalidKeyError} If the version field doesn't match `RATCHET_VERSION`.
-   * @example
-   * const alice = await DoubleRatchet.fromExport(await idb.get('ratchet'))
    */
   static async fromExport(data: RatchetStateExport): Promise<DoubleRatchet> {
     await _sodium.ready
@@ -375,6 +481,11 @@ export class DoubleRatchet {
       throw new InvalidKeyError(
         `Unsupported ratchet state version: ${data.version}. Expected ${RATCHET_VERSION}.`
       )
+    }
+
+    const mkskipped = new Map<string, Map<number, Uint8Array>>()
+    for (const [hk, inner] of data.MKSKIPPED) {
+      mkskipped.set(hk, new Map(inner.map(([n, mk]) => [n, unb64(mk)])))
     }
 
     return new DoubleRatchet({
@@ -386,7 +497,17 @@ export class DoubleRatchet {
       Ns:   data.Ns,
       Nr:   data.Nr,
       PN:   data.PN,
-      MKSKIPPED: new Map(data.MKSKIPPED.map(([k, v]) => [k, unb64(v)])),
+      HKs:  data.HKs  ? unb64(data.HKs)  : null,
+      HKr:  data.HKr  ? unb64(data.HKr)  : null,
+      NHKs: data.NHKs ? unb64(data.NHKs) : null,
+      NHKr: data.NHKr ? unb64(data.NHKr) : null,
+      MKSKIPPED: mkskipped,
     })
   }
+}
+
+function validateSessionKeys(keys: SessionKeys): void {
+  if (keys.rootKey.length !== 32) throw new InvalidKeyError(`rootKey must be 32 bytes, got ${keys.rootKey.length}.`)
+  if (keys.headerKey.length !== 32) throw new InvalidKeyError(`headerKey must be 32 bytes, got ${keys.headerKey.length}.`)
+  if (keys.nextHeaderKey.length !== 32) throw new InvalidKeyError(`nextHeaderKey must be 32 bytes, got ${keys.nextHeaderKey.length}.`)
 }

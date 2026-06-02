@@ -67,16 +67,33 @@ export interface PreKeyBundle {
 }
 
 /**
+ * The symmetric key material an X3DH handshake produces. Both parties derive an
+ * identical `SessionKeys` and feed it into the header-encrypted Double Ratchet.
+ *
+ * The Double Ratchet with header encryption needs, besides the root key, two
+ * additional shared secrets to seed the header keys for each direction (the
+ * X3DH spec calls these `shared_hka` and `shared_nhkb`).
+ */
+export interface SessionKeys {
+  /** Root key (SK) — seeds the Double Ratchet root chain. */
+  rootKey: Uint8Array
+  /** Initiator's first sending header key (`shared_hka`). */
+  headerKey: Uint8Array
+  /** Responder's first sending header key (`shared_nhkb`). */
+  nextHeaderKey: Uint8Array
+}
+
+/**
  * The result of a sender-side X3DH handshake.
  *
- * `sharedSecret` seeds the Double Ratchet (`initSender(sharedSecret,
- * signedPreKeyPublic)`). The remaining fields make up the prekey message the
- * initiator sends alongside the first ciphertext so the recipient can derive
- * the same secret.
+ * `sessionKeys` seeds the Double Ratchet
+ * (`initSender(sessionKeys, signedPreKeyPublic)`). The remaining fields make up
+ * the prekey message the initiator sends alongside the first ciphertext so the
+ * recipient can derive the same keys.
  */
 export interface X3DHInitiation {
-  /** 32-byte shared secret. Feed into `DoubleRatchet.initSender`. */
-  sharedSecret: Uint8Array
+  /** Root + header key material. Feed into `DoubleRatchet.initSender`. */
+  sessionKeys: SessionKeys
   /**
    * The recipient's signed-prekey public key (raw). Used as the initial DH
    * ratchet key when seeding the Double Ratchet.
@@ -121,18 +138,33 @@ function unb64(s: string): Uint8Array {
  * PRF, matching the Double Ratchet's KDF choice (the standard libsodium build
  * has no HKDF-SHA256, and keyed BLAKE2b is an equally sound PRF here).
  */
-function x3dhKDF(dhConcat: Uint8Array): Uint8Array {
+function x3dhKDF(dhConcat: Uint8Array, domain: number): Uint8Array {
   // Per the X3DH spec the input is prefixed with 32 0xFF bytes (Curve25519
-  // domain-separation prefix). We additionally prepend a versioned label for
-  // domain separation, folding it into the hashed message rather than using it
-  // as a BLAKE2b key (which has length constraints).
+  // domain-separation prefix). We additionally prepend a one-byte domain label
+  // (so we can derive several independent keys from one handshake) plus a
+  // versioned info string, folding them into the hashed message rather than
+  // using a BLAKE2b key (which has length constraints).
   const F     = new Uint8Array(32).fill(0xff)
   const label = _sodium.from_string(X3DH_KDF_INFO)
-  const input = new Uint8Array(F.length + label.length + dhConcat.length)
-  input.set(F, 0)
-  input.set(label, F.length)
-  input.set(dhConcat, F.length + label.length)
+  const input = new Uint8Array(1 + F.length + label.length + dhConcat.length)
+  input[0] = domain
+  input.set(F, 1)
+  input.set(label, 1 + F.length)
+  input.set(dhConcat, 1 + F.length + label.length)
   return new Uint8Array(_sodium.crypto_generichash(32, input))
+}
+
+/**
+ * Derives the full session key material (root key + the two header-key secrets
+ * the header-encrypted ratchet needs) from the concatenated DH outputs. Both
+ * parties run this over identical input and get identical keys.
+ */
+function deriveSessionKeys(dhConcat: Uint8Array): SessionKeys {
+  return {
+    rootKey:       x3dhKDF(dhConcat, 1),
+    headerKey:     x3dhKDF(dhConcat, 2),
+    nextHeaderKey: x3dhKDF(dhConcat, 3),
+  }
 }
 
 function concatBytes(parts: Uint8Array[]): Uint8Array {
@@ -282,14 +314,14 @@ export async function x3dhInitiate(
     oneTimePreKeyId = theirBundle.oneTimePreKey.keyId
   }
 
-  const sharedSecret = x3dhKDF(concatBytes(parts))
+  const sessionKeys = deriveSessionKeys(concatBytes(parts))
 
   // Wipe DH outputs and the X25519 identity private scalar.
   for (const p of parts) _sodium.memzero(p)
   _sodium.memzero(myIdentityX25519Priv)
 
   return {
-    sharedSecret,
+    sessionKeys,
     signedPreKeyPublic: spkPublic,
     message: {
       identityKey: b64(myIdentity.publicKey),
@@ -316,16 +348,18 @@ export async function x3dhInitiate(
  * @returns The 32-byte shared secret. Feed into `DoubleRatchet.initReceiver`.
  * @throws {DecryptionFailedError} If a one-time prekey id was referenced but no
  *   matching key was supplied.
+ * @returns The session keys (root + header keys). Feed into
+ *   `DoubleRatchet.initReceiver`.
  * @example
- * const sk = await x3dhRespond(myIdentity, mySpk, myOtp, msg)
- * const ratchet = await DoubleRatchet.initReceiver(sk, mySpkKeyPair)
+ * const keys = await x3dhRespond(myIdentity, mySpk, myOtp, msg)
+ * const ratchet = await DoubleRatchet.initReceiver(keys, mySpkKeyPair)
  */
 export async function x3dhRespond(
   myIdentity: IdentityKeyPair,
   mySignedPreKey: KeyPair,
   myOneTimePreKey: KeyPair | null,
   message: PreKeyMessage
-): Promise<Uint8Array> {
+): Promise<SessionKeys> {
   await _sodium.ready
 
   if (message.oneTimePreKeyId !== null && !myOneTimePreKey) {
@@ -355,10 +389,10 @@ export async function x3dhRespond(
     parts.push(dh4)
   }
 
-  const sharedSecret = x3dhKDF(concatBytes(parts))
+  const sessionKeys = deriveSessionKeys(concatBytes(parts))
 
   for (const p of parts) _sodium.memzero(p)
   _sodium.memzero(myIdentityX25519Priv)
 
-  return sharedSecret
+  return sessionKeys
 }
