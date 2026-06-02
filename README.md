@@ -331,14 +331,24 @@ You could. But you'd need to implement X25519 key exchange, Double Ratchet from 
 
 ### How secure is it?
 
-Encra uses the same cryptographic primitives as Signal:
+Encra uses the same cryptographic constructions as Signal:
 
 | Purpose | Algorithm |
 |---|---|
-| Key exchange | X25519 (ECDH) via `crypto_box_beforenm` |
+| Identity keys | Ed25519 (sign/verify), converted to X25519 for DH |
+| Session setup | X3DH (Extended Triple Diffie-Hellman) with signed + one-time prekeys |
+| Messaging | Double Ratchet **with header encryption** |
+| Key agreement | X25519 (ECDH) |
 | Encryption | XSalsa20-Poly1305 (authenticated) |
 | KDF / ratchet | Keyed BLAKE2b-256 |
 | Randomness | OS CSPRNG via libsodium `randombytes_buf` |
+
+Chat sessions are established with **X3DH**: each device publishes an identity
+key, a signed prekey, and a pool of one-time prekeys, so a sender can open an
+authenticated session with an offline recipient. The signed-prekey signature is
+verified before any session is created, which defeats a key-substituting server.
+Messages then flow through a Double Ratchet whose **headers are encrypted**, so
+the relay never sees the ratchet public key or message counters.
 
 ### What platforms are supported?
 
@@ -360,15 +370,37 @@ Under 5 minutes: install the package, set your API key, drop in one hook or clas
 | Network interception | XSalsa20-Poly1305 authenticated encryption — tampering is detected and rejected. |
 | Key compromise exposing past messages | Double Ratchet with per-message key deletion (forward secrecy). |
 | Key compromise exposing future messages | DH ratchet step on every direction change (break-in recovery). |
+| Key-substituting (MITM) server | X3DH verifies the signed-prekey signature against the peer's identity key before opening a session. |
+| Ratchet metadata leakage to the relay | Message headers (ratchet public key + counters) are encrypted under a header key. |
 | Weak randomness | All nonces and key pairs via libsodium `randombytes_buf` (OS CSPRNG). |
 
 ### What we do not protect against
 
 - **Compromised endpoint** — if the device is fully compromised (malware, physical access), Encra cannot help.
-- **Metadata** — Encra encrypts content, not metadata. The server knows *who* communicated and *when*, not *what*.
-- **Key server impersonation** — use `generateFingerprint()` for out-of-band verification of peer identity.
+- **Routing metadata** — message *contents* and ratchet headers are encrypted, but the relay still routes by sender/recipient id, so it knows *who* communicated and *when*, not *what*. (Sealed-sender support is on the roadmap.)
+- **Identity-key trust on first use** — X3DH stops a server from swapping a *prekey*, but you should still confirm a peer's identity key out of band with `generateFingerprint()`.
 
-### Double Ratchet — how forward secrecy works
+### Session setup — X3DH
+
+```
+Recipient publishes:  Identity Key (Ed25519)
+                      Signed Prekey (X25519, signed by identity key)
+                      One-Time Prekeys (X25519, consumed once each)
+
+Sender fetches the bundle, verifies the signed-prekey signature, then runs
+four Diffie-Hellman operations:
+
+  DH1 = DH(IK_sender, SPK_recipient)
+  DH2 = DH(EK_sender, IK_recipient)
+  DH3 = DH(EK_sender, SPK_recipient)
+  DH4 = DH(EK_sender, OPK_recipient)   ← omitted if no one-time prekey is left
+
+  session keys = KDF(DH1 ‖ DH2 ‖ DH3 ‖ DH4)
+```
+
+This yields an authenticated shared secret even when the recipient is offline.
+
+### Double Ratchet (with header encryption) — how forward secrecy works
 
 ```
 Root Key
@@ -377,7 +409,10 @@ Root Key
    │       │
    │       └─► Chain Key 2 ──► Message Key 2  (used once, then deleted from memory)
    │
-   └─► (DH ratchet step on direction flip — new root key, new chains)
+   └─► (DH ratchet step on direction flip — new root key, new chains, new header keys)
+
+Every message header (ratchet public key + counters) is encrypted under a
+per-direction header key, so the relay sees only opaque ciphertext.
 ```
 
 If an attacker compromises today's key: past messages are safe (keys already deleted), future messages are safe after the next DH ratchet step.
@@ -471,6 +506,11 @@ import {
   encrypt, decrypt,
   generateFieldKey, encryptField, decryptField,
   generateFingerprint,
+  // Identity keys (Ed25519) + X3DH
+  generateIdentityKeyPair, sign, verify,
+  generateSignedPreKey, generateOneTimePreKeys, buildPreKeyBundle,
+  x3dhInitiate, x3dhRespond,
+  // Double Ratchet with header encryption
   DoubleRatchet,
   InvalidKeyError, DecryptionFailedError, KeyNotFoundError,
 } from '@encra/core'
@@ -489,11 +529,16 @@ npx encra ping      # Verify server reachability and API key validity
 | Method | Path | Description |
 |---|---|---|
 | `GET`  | `/health` | Liveness check |
-| `POST` | `/v1/keys` | Register / update a public key |
+| `POST` | `/v1/keys` | Register / update a device's public key |
 | `GET`  | `/v1/keys/:userId` | Fetch all device public keys for a user → `{ userId, devices: [{ deviceId, publicKey }] }` |
-| `WS`   | `/v1/relay?token=` | WebSocket relay — routes encrypted messages |
+| `POST` | `/v1/prekeys` | Publish / replenish a device's X3DH bundle (identity key, signed prekey, one-time prekeys) |
+| `GET`  | `/v1/prekeys/:userId/:deviceId` | Fetch a prekey bundle (atomically consumes one one-time prekey) |
+| `GET`  | `/v1/prekeys/:userId/:deviceId/count` | Remaining one-time prekey count (for replenishment) |
+| `WS`   | `/v1/relay` | WebSocket relay — authenticate with a `{ type: "auth", token }` message, then `register`; routes encrypted messages |
 
-All endpoints require `Authorization: Bearer <api_key>`.
+All HTTP endpoints require `Authorization: Bearer <api_key>`. The WebSocket
+relay authenticates via its first message (the token is **not** placed in the
+URL, keeping it out of logs).
 
 ---
 
