@@ -1,5 +1,11 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import type { RatchetStateExport, PreKeyMessage } from '@encra/core'
+import {
+  generateIdentityKeyPair,
+  generateSignedPreKey,
+  generateOneTimePreKeys,
+  exportKey,
+} from '@encra/core'
 
 /** Shape of a single persisted chat message. */
 export interface StoredMessage {
@@ -126,6 +132,71 @@ export async function savePreKeys(userId: string, prekeys: StoredPreKeys): Promi
   try {
     await (await getDB()).put('prekeys', prekeys, userId)
   } catch { /* non-fatal: prekeys still held in-memory for this session */ }
+}
+
+/** One-time prekey pool size for a freshly generated device. */
+const OTP_POOL_SIZE = 100
+
+/**
+ * In-flight prekey generation locks, keyed by userId. Guarantees exactly one
+ * identity-key + signed-prekey generation per userId per tab, even if multiple
+ * `EncraClient` instances (or other callers) initialise prekeys for the same
+ * user concurrently. Without this, each caller would generate a *different*
+ * identity + signed prekey and race to persist and publish them — leaving this
+ * device's stored prekeys out of sync with what peers fetch, which makes the
+ * signed-prekey signature fail to verify (a false MITM alarm) and breaks
+ * inbound session setup.
+ */
+const prekeyInits = new Map<string, Promise<{ prekeys: StoredPreKeys; created: boolean }>>()
+
+/**
+ * Load this device's prekey material, generating and persisting it on first use.
+ * Concurrent callers for the same `userId` share a single generation, so the
+ * identity key and signed prekey are always consistent across every consumer.
+ *
+ * @param userId - The local user whose device prekeys to load or create.
+ * @returns The stored prekeys and whether they were freshly created this call
+ *   (so the caller can decide whether to publish the full one-time prekey pool).
+ * @example
+ * const { prekeys, created } = await loadOrCreatePreKeys('alice')
+ */
+export function loadOrCreatePreKeys(
+  userId: string,
+): Promise<{ prekeys: StoredPreKeys; created: boolean }> {
+  // get → create-promise → set runs with no `await` between, so concurrent
+  // callers in the same tab always observe and reuse the first in-flight promise.
+  const inFlight = prekeyInits.get(userId)
+  if (inFlight) return inFlight
+
+  const promise = (async () => {
+    const existing = await loadPreKeys(userId)
+    if (existing) return { prekeys: existing, created: false }
+
+    const identity = await generateIdentityKeyPair()
+    const spk      = await generateSignedPreKey(identity, 1)
+    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
+    const prekeys: StoredPreKeys = {
+      identityPub:  exportKey(identity.publicKey),
+      identityPriv: exportKey(identity.privateKey),
+      signedPreKey: {
+        keyId:     spk.keyId,
+        pub:       exportKey(spk.keyPair.publicKey),
+        priv:      exportKey(spk.keyPair.privateKey),
+        signature: exportKey(spk.signature),
+      },
+      oneTimePreKeys: otps.map((o) => ({
+        keyId: o.keyId,
+        pub:   exportKey(o.keyPair.publicKey),
+        priv:  exportKey(o.keyPair.privateKey),
+      })),
+      nextOtpId: OTP_POOL_SIZE + 1,
+    }
+    await savePreKeys(userId, prekeys)
+    return { prekeys, created: true }
+  })().finally(() => { prekeyInits.delete(userId) })
+
+  prekeyInits.set(userId, promise)
+  return promise
 }
 
 export async function loadMessages(userId: string): Promise<StoredMessage[]> {

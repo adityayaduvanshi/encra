@@ -4,9 +4,6 @@ import {
   exportKey,
   importKey,
   sodiumReady,
-  generateIdentityKeyPair,
-  generateSignedPreKey,
-  generateOneTimePreKeys,
   x3dhInitiate,
   x3dhRespond,
   derivePresenceKey,
@@ -24,7 +21,7 @@ import type {
 } from '@encra/core'
 import {
   loadKeyPair,          saveKeyPair,
-  loadPreKeys,          savePreKeys,
+  loadOrCreatePreKeys,
   loadGhostMode,        saveGhostMode,
   loadPresenceSession,  savePresenceSession,
   getOrCreateDeviceId,
@@ -83,7 +80,6 @@ const ENCRA_SERVER_URL = 'https://api.encra.dev'
 const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
 const BACKOFF_BASE_MS  = 1_000
 const BACKOFF_MAX_MS   = 60_000
-const OTP_POOL_SIZE    = 100
 
 /**
  * React hook for encrypted presence: online/offline status, typing indicators,
@@ -208,48 +204,29 @@ export function useE2EPresence({
 
   /** Restore or generate this device's identity + signed prekey + OTP pool. */
   const ensurePreKeys = useCallback(async (): Promise<void> => {
-    const stored = await loadPreKeys(userId)
-    if (stored) {
-      prekeysRef.current  = stored
-      identityRef.current = {
-        publicKey:  importKey(stored.identityPub),
-        privateKey: importKey(stored.identityPriv),
-      }
-      return
+    // Shared with useE2EChat via ratchetStore so both hooks converge on one
+    // generation per userId (avoids racing identity/signed-prekey publishes).
+    const { prekeys } = await loadOrCreatePreKeys(userId)
+    prekeysRef.current  = prekeys
+    identityRef.current = {
+      publicKey:  importKey(prekeys.identityPub),
+      privateKey: importKey(prekeys.identityPriv),
     }
-
-    const identity = await generateIdentityKeyPair()
-    const spk      = await generateSignedPreKey(identity, 1)
-    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
-
-    identityRef.current = identity
-    prekeysRef.current  = {
-      identityPub:  exportKey(identity.publicKey),
-      identityPriv: exportKey(identity.privateKey),
-      signedPreKey: {
-        keyId:     spk.keyId,
-        pub:       exportKey(spk.keyPair.publicKey),
-        priv:      exportKey(spk.keyPair.privateKey),
-        signature: exportKey(spk.signature),
-      },
-      oneTimePreKeys: otps.map((o) => ({
-        keyId: o.keyId,
-        pub:   exportKey(o.keyPair.publicKey),
-        priv:  exportKey(o.keyPair.privateKey),
-      })),
-      nextOtpId: OTP_POOL_SIZE + 1,
-    }
-    await savePreKeys(userId, prekeysRef.current)
     await publishPreKeys()
   }, [userId, publishPreKeys])
 
-  /** Fetch a peer device's prekey bundle WITHOUT consuming a one-time prekey. */
+  /** Fetch a peer device's prekey bundle WITHOUT consuming a one-time prekey.
+   *  Returns null (instead of throwing) on 404/429 so callers degrade gracefully
+   *  when the peer hasn't published prekeys yet or when rate-limited.
+   */
   const fetchPresenceBundle = useCallback(
-    async (peerId: string, deviceId: string): Promise<PreKeyBundle> => {
+    async (peerId: string, deviceId: string): Promise<PreKeyBundle | null> => {
       const res = await fetch(
         `${httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(deviceId)}?consumeOneTime=false`,
         { headers: { Authorization: `Bearer ${apiKey}` } },
       )
+      if (res.status === 404) return null  // peer hasn't published prekeys yet
+      if (res.status === 429) return null  // rate limited — skip, retry on next send
       if (!res.ok) {
         throw new Error(
           `Could not fetch presence bundle for '${peerId}' device '${deviceId}': ${res.status}.`,
@@ -262,9 +239,11 @@ export function useE2EPresence({
 
   // ── Presence session establishment ──────────────────────────────────────────
 
-  /** Outbound presence key for a peer device (we are the X3DH initiator). */
+  /** Outbound presence key for a peer device (we are the X3DH initiator).
+   *  Returns null if the peer device has no prekeys published yet.
+   */
   const getSendPresenceKey = useCallback(
-    async (peerId: string, deviceId: string): Promise<Uint8Array> => {
+    async (peerId: string, deviceId: string): Promise<Uint8Array | null> => {
       const cacheKey = `${peerId}:${deviceId}`
       const cached   = sendKeysRef.current.get(cacheKey)
       if (cached) return cached
@@ -282,6 +261,8 @@ export function useE2EPresence({
 
       // 3-DH X3DH (no one-time prekey): signature verified inside x3dhInitiate.
       const bundle = await fetchPresenceBundle(peerId, deviceId)
+      if (!bundle) return null  // peer not ready — silently skip
+
       const init   = await x3dhInitiate(myIdentity, bundle)
       const key    = await derivePresenceKey(init.sessionKeys.rootKey)
 
@@ -352,6 +333,7 @@ export function useE2EPresence({
       const devices = await fetchPeerDeviceKeys(to)
       for (const device of devices) {
         const presenceKey = await getSendPresenceKey(to, device.deviceId)
+        if (!presenceKey) continue  // peer device has no prekeys published yet — skip
         const encrypted   = await encryptPresence(payload, presenceKey)
         const prekey      = sendPrekeyRef.current.get(`${to}:${device.deviceId}`)
         socket.send(JSON.stringify({
@@ -591,7 +573,9 @@ export function useE2EPresence({
 
   const sendTyping = useCallback(
     async (to: string, isTyping: boolean): Promise<void> => {
+      // Best-effort only — never surface errors to callers (e.g. peer not ready)
       await sendPresenceTo(to, { status: 'online', lastSeenAt: Date.now(), isTyping })
+        .catch(() => {})
     },
     [sendPresenceTo],
   )

@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from 'react'
 import ChatDemo from './components/ChatDemo'
 import FileDemo from './components/FileDemo'
 import FormDemo from './components/FormDemo'
+import PresenceDemo from './components/PresenceDemo'
 import { LogsDialog } from './components/LogsDialog'
 import { onLog } from './lib/logger'
 
@@ -10,12 +11,13 @@ export interface Config {
   serverUrl: string
 }
 
-type Tab = 'chat' | 'file' | 'form'
+type Tab = 'chat' | 'file' | 'form' | 'presence'
 
 const TABS: { id: Tab; icon: string; label: string; hook: string; desc: string }[] = [
-  { id: 'chat', icon: '↔', label: 'Chat',  hook: 'useE2EChat', desc: 'Real-time messaging' },
-  { id: 'file', icon: '⊞', label: 'File',  hook: 'useE2EFile', desc: 'File encryption'    },
-  { id: 'form', icon: '≡', label: 'Form',  hook: 'useE2EForm', desc: 'Field encryption'   },
+  { id: 'chat',     icon: '↔', label: 'Chat',     hook: 'useE2EChat',     desc: 'Real-time messaging'   },
+  { id: 'file',     icon: '⊞', label: 'File',     hook: 'useE2EFile',     desc: 'File encryption'       },
+  { id: 'form',     icon: '≡', label: 'Form',     hook: 'useE2EForm',     desc: 'Field encryption'      },
+  { id: 'presence', icon: '◎', label: 'Presence', hook: 'useE2EPresence', desc: 'Encrypted status'      },
 ]
 
 // ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -264,9 +266,10 @@ export default function App() {
           key={tab}
           style={{ overflow: 'hidden', padding: 20, display: 'flex', flexDirection: 'column', minHeight: 0 }}
         >
-          {tab === 'chat' && <ChatDemo config={config} sessionId={sessionId} />}
-          {tab === 'file' && <FileDemo config={config} sessionId={sessionId} />}
-          {tab === 'form' && <FormDemo config={config} sessionId={sessionId} />}
+          {tab === 'chat'     && <ChatDemo     config={config} sessionId={sessionId} />}
+          {tab === 'file'     && <FileDemo     config={config} sessionId={sessionId} />}
+          {tab === 'form'     && <FormDemo     config={config} sessionId={sessionId} />}
+          {tab === 'presence' && <PresenceDemo config={config} sessionId={sessionId} />}
         </div>
       </div>
     </div>
@@ -284,6 +287,7 @@ function ConfigScreen({ onSubmit }: { onSubmit: (c: Config) => void }) {
     'X25519 key exchange',
     'XSalsa20-Poly1305',
     'Double Ratchet',
+    'X3DH Presence',
     'Multi-device',
   ]
 
@@ -318,7 +322,7 @@ function ConfigScreen({ onSubmit }: { onSubmit: (c: Config) => void }) {
           <p style={{ fontSize: 13, color: 'var(--text-2)', marginTop: 8, lineHeight: 1.6 }}>
             Signal-level E2E encryption.
             <br />
-            Try all three hooks live in your browser.
+            Try all four hooks live in your browser.
           </p>
         </div>
 

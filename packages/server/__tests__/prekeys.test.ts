@@ -27,9 +27,13 @@ function makeMockPool() {
 
   const key = (u: string, d: string) => `${u}::${d}`
 
-  const pool = {
-    query: vi.fn(async (sql: string, params: unknown[] = []) => {
+  const query = vi.fn(async (sql: string, params: unknown[] = []) => {
       const s = sql.trim().toUpperCase().replace(/\s+/g, ' ')
+
+      // Transaction control statements are no-ops against the in-memory store.
+      if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') {
+        return { rows: [], rowCount: 0 } as unknown as QueryResult
+      }
 
       if (s === 'SELECT 1') return { rows: [{ '?column?': 1 }], rowCount: 1 } as unknown as QueryResult
 
@@ -82,7 +86,13 @@ function makeMockPool() {
       }
 
       return { rows: [], rowCount: 0 } as unknown as QueryResult
-    }),
+    })
+
+  const pool = {
+    query,
+    // POST /v1/prekeys runs its writes in a transaction via a dedicated client;
+    // the client shares the same in-memory query handler and a no-op release.
+    connect: vi.fn(async () => ({ query, release: vi.fn() })),
   } as unknown as Pool
 
   return { pool, identity, signed, otps }

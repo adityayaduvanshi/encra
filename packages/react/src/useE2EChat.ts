@@ -6,8 +6,6 @@ import {
   sodiumReady,
   DecryptionFailedError,
   DoubleRatchet,
-  generateIdentityKeyPair,
-  generateSignedPreKey,
   generateOneTimePreKeys,
   x3dhInitiate,
   x3dhRespond,
@@ -17,7 +15,7 @@ import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
-  loadPreKeys,   savePreKeys,
+  savePreKeys,   loadOrCreatePreKeys,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
@@ -234,42 +232,20 @@ export function useE2EChat({
    * prekey pool, then publish the public material to the key server.
    */
   const initPreKeys = useCallback(async (): Promise<void> => {
-    const stored = await loadPreKeys(userId)
-    if (stored) {
-      prekeysRef.current  = stored
-      identityRef.current = {
-        publicKey:  importKey(stored.identityPub),
-        privateKey: importKey(stored.identityPriv),
-      }
-      // Re-assert identity + signed prekey (idempotent). Don't re-publish
-      // existing one-time prekeys — some may already be reserved by senders.
-      await publishPreKeys([])
-      return
+    // Shared with useE2EPresence via ratchetStore so both hooks converge on one
+    // generation per userId (avoids racing identity/signed-prekey publishes).
+    const { prekeys, created } = await loadOrCreatePreKeys(userId)
+    prekeysRef.current  = prekeys
+    identityRef.current = {
+      publicKey:  importKey(prekeys.identityPub),
+      privateKey: importKey(prekeys.identityPriv),
     }
-
-    const identity = await generateIdentityKeyPair()
-    const spk      = await generateSignedPreKey(identity, 1)
-    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
-
-    identityRef.current = identity
-    prekeysRef.current  = {
-      identityPub:  exportKey(identity.publicKey),
-      identityPriv: exportKey(identity.privateKey),
-      signedPreKey: {
-        keyId:     spk.keyId,
-        pub:       exportKey(spk.keyPair.publicKey),
-        priv:      exportKey(spk.keyPair.privateKey),
-        signature: exportKey(spk.signature),
-      },
-      oneTimePreKeys: otps.map((o) => ({
-        keyId: o.keyId,
-        pub:   exportKey(o.keyPair.publicKey),
-        priv:  exportKey(o.keyPair.privateKey),
-      })),
-      nextOtpId: OTP_POOL_SIZE + 1,
-    }
-    await savePreKeys(userId, prekeysRef.current)
-    await publishPreKeys(prekeysRef.current.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })))
+    // Publish the full one-time prekey pool only when we just created it.
+    // On restore, re-assert identity + signed prekey but don't re-publish
+    // existing one-time prekeys — some may already be reserved by senders.
+    await publishPreKeys(
+      created ? prekeys.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })) : [],
+    )
   }, [userId, publishPreKeys])
 
   /** Fetch a peer device's prekey bundle (consumes one of their one-time prekeys). */

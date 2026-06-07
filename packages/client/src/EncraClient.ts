@@ -5,8 +5,6 @@ import {
   sodiumReady,
   DecryptionFailedError,
   DoubleRatchet,
-  generateIdentityKeyPair,
-  generateSignedPreKey,
   generateOneTimePreKeys,
   buildPreKeyBundle,
   x3dhInitiate,
@@ -23,7 +21,7 @@ import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
-  loadPreKeys,   savePreKeys,
+  savePreKeys,   loadOrCreatePreKeys,
   loadGhostMode, saveGhostMode,
   loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
@@ -519,6 +517,7 @@ export class EncraClient {
     const devices = await this._fetchPeerDeviceKeys(to)
     for (const device of devices) {
       const presenceKey = await this._getSendPresenceKey(to, device.deviceId)
+      if (!presenceKey) continue  // peer device has no prekeys published yet — skip
       const encrypted   = await encryptPresence(payload, presenceKey)
       const prekey      = this._sendPresencePrekey.get(`${to}:${device.deviceId}`)
       this._socket.send(JSON.stringify({
@@ -559,20 +558,27 @@ export class EncraClient {
 
   // ── Private helpers ───────────────────────────────────────────────────────
 
-  /** Fetch a peer device's prekey bundle WITHOUT consuming a one-time prekey. */
-  private async _fetchPresenceBundle(peerId: string, deviceId: string): Promise<PreKeyBundle> {
+  /** Fetch a peer device's prekey bundle WITHOUT consuming a one-time prekey.
+   *  Returns null (instead of throwing) on 404/429 so callers degrade gracefully
+   *  when the peer hasn't published prekeys yet or when rate-limited.
+   */
+  private async _fetchPresenceBundle(peerId: string, deviceId: string): Promise<PreKeyBundle | null> {
     const res = await fetch(
       `${this._httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(deviceId)}?consumeOneTime=false`,
       { headers: { Authorization: `Bearer ${this._apiKey}` } },
     )
+    if (res.status === 404) return null  // peer hasn't published prekeys yet
+    if (res.status === 429) return null  // rate limited — skip, retry on next send
     if (!res.ok) {
       throw new Error(`Could not fetch presence bundle for '${peerId}' device '${deviceId}': ${res.status}.`)
     }
     return (await res.json()) as PreKeyBundle
   }
 
-  /** Outbound presence key for a peer device (we are the X3DH initiator). */
-  private async _getSendPresenceKey(peerId: string, deviceId: string): Promise<Uint8Array> {
+  /** Outbound presence key for a peer device (we are the X3DH initiator).
+   *  Returns null if the peer device has no prekeys published yet.
+   */
+  private async _getSendPresenceKey(peerId: string, deviceId: string): Promise<Uint8Array | null> {
     const cacheKey = `${peerId}:${deviceId}`
     const cached   = this._sendPresenceKeys.get(cacheKey)
     if (cached) return cached
@@ -587,6 +593,8 @@ export class EncraClient {
 
     if (!this._identity) throw new Error('Identity key not initialised.')
     const bundle = await this._fetchPresenceBundle(peerId, deviceId)
+    if (!bundle) return null  // peer not ready — silently skip
+
     const init   = await x3dhInitiate(this._identity, bundle)
     const key    = await derivePresenceKey(init.sessionKeys.rootKey)
 
@@ -782,42 +790,21 @@ export class EncraClient {
    * one-time prekey pool, then publish the public material to the key server.
    */
   private async _initPreKeys(): Promise<void> {
-    const stored = await loadPreKeys(this._userId)
-    if (stored) {
-      this._prekeys  = stored
-      this._identity = {
-        publicKey:  importKey(stored.identityPub),
-        privateKey: importKey(stored.identityPriv),
-      }
-      // Re-assert identity + signed prekey (idempotent upserts). Don't re-publish
-      // existing one-time prekeys — some may already be reserved by senders.
-      await this._publishPreKeys([])
-      return
+    // Shared generation guard (in ratchetStore) so concurrent initialisations
+    // for the same userId converge on one identity + signed prekey instead of
+    // racing to generate and publish divergent material.
+    const { prekeys, created } = await loadOrCreatePreKeys(this._userId)
+    this._prekeys  = prekeys
+    this._identity = {
+      publicKey:  importKey(prekeys.identityPub),
+      privateKey: importKey(prekeys.identityPriv),
     }
-
-    const identity = await generateIdentityKeyPair()
-    const spk      = await generateSignedPreKey(identity, 1)
-    const otps     = await generateOneTimePreKeys(1, OTP_POOL_SIZE)
-
-    this._identity = identity
-    this._prekeys  = {
-      identityPub:  exportKey(identity.publicKey),
-      identityPriv: exportKey(identity.privateKey),
-      signedPreKey: {
-        keyId:     spk.keyId,
-        pub:       exportKey(spk.keyPair.publicKey),
-        priv:      exportKey(spk.keyPair.privateKey),
-        signature: exportKey(spk.signature),
-      },
-      oneTimePreKeys: otps.map((o) => ({
-        keyId: o.keyId,
-        pub:   exportKey(o.keyPair.publicKey),
-        priv:  exportKey(o.keyPair.privateKey),
-      })),
-      nextOtpId: OTP_POOL_SIZE + 1,
-    }
-    await savePreKeys(this._userId, this._prekeys)
-    await this._publishPreKeys(this._prekeys.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })))
+    // Publish the full one-time prekey pool only when we just created it. On
+    // restore, re-assert identity + signed prekey (idempotent upserts) but don't
+    // re-publish existing one-time prekeys — some may already be reserved.
+    await this._publishPreKeys(
+      created ? prekeys.oneTimePreKeys.map((o) => ({ keyId: o.keyId, publicKey: o.pub })) : [],
+    )
   }
 
   /**

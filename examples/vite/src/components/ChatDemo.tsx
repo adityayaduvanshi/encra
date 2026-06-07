@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect } from 'react'
-import { useE2EChat } from '@encra/react'
+import { useE2EChat, useE2EPresence } from '@encra/react'
 import type { WireEvent } from '@encra/react'
 import type { Config } from '../App'
 import { StatusDot } from './StatusBadge'
@@ -8,6 +8,15 @@ import { emitLog } from '../lib/logger'
 interface Props { config: Config; sessionId: string }
 
 interface TaggedEvent extends WireEvent { from: string; id: number }
+
+// ── Status dot for peer presence ───────────────────────────────────────────────
+
+const STATUS_COLOR: Record<string, string> = {
+  online:  'var(--accent)',
+  offline: 'var(--text-3)',
+  away:    'var(--amber)',
+  busy:    'var(--red)',
+}
 
 // ── Chat panel ─────────────────────────────────────────────────────────────────
 
@@ -18,8 +27,12 @@ function ChatPanel({
   config: Config; onWire: (e: TaggedEvent) => void
 }) {
   const counter    = useRef(0)
-  const sendNumRef = useRef(0)       // approx ratchet message index
+  const sendNumRef = useRef(0)
   const recvNumRef = useRef(0)
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout>>()
+  const didLogRef  = useRef(false)
+
+  // ── Chat hook ──────────────────────────────────────────────────────────────
 
   const { messages, isReady, isConnecting, sendMessage, error } = useE2EChat({
     apiKey: config.apiKey, userId, serverUrl: config.serverUrl,
@@ -39,29 +52,33 @@ function ChatPanel({
       } else {
         recvNumRef.current++
         emitLog({
-          category: 'TRANSPORT', actor: name,
-          title: 'Ciphertext received from relay',
-          fields: [
-            { label: 'ciphertext', value: e.ciphertext.slice(0, 44) + '…' },
-            { label: 'nonce',      value: e.nonce.slice(0, 28) + '…'      },
-          ],
-        })
-        emitLog({
           category: 'RATCHET', actor: name,
           title: `Double Ratchet: decrypt message #${recvNumRef.current}`,
           fields: [
-            { label: 'from',           value: recipientId                                    },
-            { label: 'msg key',        value: 'derived from recv chain key → used → deleted' },
-            { label: 'chain advance',  value: 'BLAKE2b-256 KDF on chain key'                 },
-            { label: 'forward secrecy',value: '✓ decryption key erased after use'            },
+            { label: 'from',            value: recipientId                                    },
+            { label: 'msg key',         value: 'derived from recv chain key → used → deleted' },
+            { label: 'forward secrecy', value: '✓ decryption key erased after use'            },
           ],
         })
       }
     },
   })
 
+  // ── Presence hook (runs alongside chat) ───────────────────────────────────
+
+  const {
+    presence, isReady: presenceReady, sendTyping,
+  } = useE2EPresence({
+    apiKey:    config.apiKey,
+    userId,
+    contacts:  [recipientId],
+    serverUrl: config.serverUrl,
+  })
+
+  const peerInfo = presence[recipientId]
+  // The hook broadcasts online automatically when ready and offline on unmount.
+
   // Log key registration + connection
-  const didLogRef = useRef(false)
   useEffect(() => {
     if (isReady && !didLogRef.current) {
       didLogRef.current = true
@@ -69,28 +86,25 @@ function ChatPanel({
         category: 'KEY', actor: name,
         title: 'X25519 key pair generated & registered',
         fields: [
-          { label: 'userId',      value: userId                             },
-          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'         },
-          { label: 'public key',  value: 'uploaded → POST /v1/keys'         },
-          { label: 'private key', value: 'stays on device — never sent'     },
+          { label: 'userId',      value: userId                         },
+          { label: 'algorithm',   value: 'X25519 (Curve25519 ECDH)'     },
+          { label: 'public key',  value: 'uploaded → POST /v1/keys'     },
+          { label: 'private key', value: 'stays on device — never sent' },
         ],
       })
       emitLog({
         category: 'SYSTEM', actor: name,
         title: 'WebSocket relay connected',
         fields: [
-          { label: 'endpoint', value: '/v1/relay' },
-          { label: 'auth',     value: 'JWT Bearer (apiKey)'  },
+          { label: 'endpoint', value: '/v1/relay'          },
+          { label: 'auth',     value: 'JWT Bearer (apiKey)' },
         ],
       })
     }
   }, [isReady, name, userId])
 
-  // Log errors
   useEffect(() => {
-    if (error) {
-      emitLog({ category: 'ERROR', actor: name, title: error.message })
-    }
+    if (error) emitLog({ category: 'ERROR', actor: name, title: error.message })
   }, [error, name])
 
   const [input, setInput] = useState('')
@@ -100,51 +114,103 @@ function ChatPanel({
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  // ── Input change: send typing indicator ─────────────────────────────────────
+
+  function handleInputChange(val: string) {
+    setInput(val)
+    if (!presenceReady) return
+    sendTyping(recipientId, val.length > 0)
+    clearTimeout(typingTimerRef.current)
+    if (val.length > 0) {
+      typingTimerRef.current = setTimeout(() => sendTyping(recipientId, false), 2000)
+    }
+  }
+
+  // ── Send ────────────────────────────────────────────────────────────────────
+
   async function send() {
     if (!input.trim() || !isReady) return
     const n = ++sendNumRef.current
-    const isDH = n === 1  // first msg to this peer always does a DH ratchet step
+    const isDH = n === 1
     emitLog({
       category: 'RATCHET', actor: name,
       title: `Double Ratchet: encrypt message #${n}`,
       fields: [
-        { label: 'to',             value: recipientId                                           },
+        { label: 'to',             value: recipientId                                             },
         { label: 'step',           value: isDH ? 'DH ratchet + symmetric ratchet' : 'symmetric ratchet step' },
-        { label: 'msg key',        value: 'derived from send chain key → used → deleted'        },
-        { label: 'chain advance',  value: 'BLAKE2b-256 KDF on chain key'                        },
-        { label: 'forward secrecy',value: '✓ encryption key erased after use'                   },
+        { label: 'msg key',        value: 'derived from send chain key → used → deleted'          },
+        { label: 'forward secrecy',value: '✓ encryption key erased after use'                     },
         ...(isDH ? [{ label: 'DH ratchet', value: 'new ephemeral key pair → new root key' }] : []),
       ],
     })
     const text = input.trim()
-    setInput('')                           // clear optimistically
+    setInput('')
+    // Clear typing indicator immediately on send
+    if (presenceReady) {
+      sendTyping(recipientId, false)
+      clearTimeout(typingTimerRef.current)
+    }
     try { await sendMessage(recipientId, text) }
-    catch (e) { setInput(text); console.error(e) }  // restore on failure
+    catch (e) { setInput(text); console.error(e) }
   }
+
+  // Cleanup typing timer on unmount
+  useEffect(() => () => clearTimeout(typingTimerRef.current), [])
+
+  // ── Peer presence header info ───────────────────────────────────────────────
+
+  const peerStatusText = peerInfo?.isTyping
+    ? 'typing…'
+    : peerInfo
+    ? peerInfo.status
+    : null
+
+  const peerStatusColor = peerInfo?.isTyping
+    ? 'var(--text-3)'
+    : peerInfo
+    ? STATUS_COLOR[peerInfo.status] ?? 'var(--text-3)'
+    : 'var(--text-3)'
 
   return (
     <div className="panel flex flex-col" style={{ height: '100%' }}>
       {/* Header */}
       <div className="panel-header">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div
-            className="flex items-center justify-center shrink-0 mono font-medium"
-            style={{
-              width: 26, height: 26, borderRadius: 6,
-              background: accent + '20',
-              border: `1px solid ${accent}40`,
-              fontSize: 11, color: accent,
-            }}
-          >
-            {name[0]}
+          {/* Avatar with presence ring */}
+          <div style={{ position: 'relative', flexShrink: 0 }}>
+            <div
+              className="flex items-center justify-center mono font-medium"
+              style={{
+                width: 26, height: 26, borderRadius: 6,
+                background: accent + '20',
+                border: `1px solid ${accent}40`,
+                fontSize: 11, color: accent,
+              }}
+            >
+              {name[0]}
+            </div>
           </div>
+
           <div className="min-w-0">
             <p style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-1)', lineHeight: 1 }}>
               {name}
             </p>
-            <p className="mono truncate" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
-              {userId}
-            </p>
+            {/* Peer presence status */}
+            {peerStatusText ? (
+              <div className="flex items-center gap-1" style={{ marginTop: 2 }}>
+                <span style={{
+                  width: 5, height: 5, borderRadius: '50%',
+                  background: peerStatusColor, display: 'inline-block', flexShrink: 0,
+                }} />
+                <span className="mono" style={{ fontSize: 10, color: peerStatusColor }}>
+                  {peerInfo?.isTyping ? `${recipientId.split('-')[0]} is typing…` : peerStatusText}
+                </span>
+              </div>
+            ) : (
+              <p className="mono truncate" style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                {userId}
+              </p>
+            )}
           </div>
         </div>
         <StatusDot isReady={isReady} isConnecting={isConnecting} error={error} />
@@ -171,8 +237,7 @@ function ChatPanel({
                     borderRadius: 10,
                     borderBottomRightRadius: mine ? 3 : 10,
                     borderBottomLeftRadius: mine ? 10 : 3,
-                    fontSize: 13,
-                    lineHeight: 1.4,
+                    fontSize: 13, lineHeight: 1.4,
                     background: mine ? accent : 'var(--bg-elevated)',
                     color: mine ? '#000' : 'var(--text-1)',
                     fontWeight: mine ? 500 : 400,
@@ -183,6 +248,22 @@ function ChatPanel({
               </div>
             )
           })}
+
+          {/* Typing indicator bubble */}
+          {peerInfo?.isTyping && (
+            <div className="flex justify-start" style={{ marginTop: 4 }}>
+              <div style={{
+                padding: '7px 14px',
+                borderRadius: 10, borderBottomLeftRadius: 3,
+                background: 'var(--bg-elevated)',
+                fontSize: 16, letterSpacing: 3,
+                color: 'var(--text-3)',
+              }}>
+                •••
+              </div>
+            </div>
+          )}
+
           <div ref={bottomRef} />
         </div>
       </div>
@@ -190,12 +271,9 @@ function ChatPanel({
       {/* Error */}
       {error && (
         <div style={{
-          padding: '6px 14px',
-          borderTop: '1px solid var(--border)',
-          background: 'var(--red-dim)',
-          fontSize: 11,
-          color: 'var(--red)',
-          fontFamily: 'JetBrains Mono',
+          padding: '6px 14px', borderTop: '1px solid var(--border)',
+          background: 'var(--red-dim)', fontSize: 11,
+          color: 'var(--red)', fontFamily: 'JetBrains Mono',
         }}>
           {error.message}
         </div>
@@ -209,7 +287,7 @@ function ChatPanel({
         <input
           className="chat-input flex-1"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(e) => handleInputChange(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && send()}
           placeholder={isReady ? `Message ${recipientId.split('-')[0]}…` : 'Connecting…'}
           disabled={!isReady}
@@ -235,7 +313,6 @@ function WirePanel({ events, onClear }: { events: TaggedEvent[]; onClear: () => 
 
   return (
     <div className="terminal">
-      {/* Terminal chrome */}
       <div className="terminal-header">
         <div className="terminal-dot" style={{ background: '#ff5f57' }} />
         <div className="terminal-dot" style={{ background: '#febc2e' }} />
@@ -247,11 +324,7 @@ function WirePanel({ events, onClear }: { events: TaggedEvent[]; onClear: () => 
           <button
             onClick={onClear}
             className="mono"
-            style={{
-              fontSize: 9, color: 'var(--text-3)',
-              background: 'none', border: 'none', cursor: 'pointer',
-              padding: 0,
-            }}
+            style={{ fontSize: 9, color: 'var(--text-3)', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}
             onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-2)')}
             onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-3)')}
           >
@@ -324,10 +397,10 @@ export default function ChatDemo({ config, sessionId }: Props) {
       <div className="info-banner">
         <span style={{ color: 'var(--accent)', flexShrink: 0 }}>ℹ</span>
         <span>
-          Two independent <span className="mono" style={{ color: 'var(--text-1)' }}>useE2EChat</span> instances
-          in the same tab. All encryption is client-side — the{' '}
-          <span style={{ color: 'var(--text-1)', fontWeight: 500 }}>server.log</span> panel shows only
-          the ciphertext the relay forwards, never plaintext.
+          Two independent{' '}
+          <span className="mono" style={{ color: 'var(--text-1)' }}>useE2EChat</span> +{' '}
+          <span className="mono" style={{ color: 'var(--text-1)' }}>useE2EPresence</span> instances.
+          Typing indicators and online status are encrypted — the relay sees only ciphertext.
         </span>
       </div>
 

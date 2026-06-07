@@ -82,40 +82,63 @@ router.post('/v1/prekeys', requireAuth, async (req: Request, res: Response, next
     const did = deviceId.trim()
     const pool = getPool()
 
-    await pool.query(
-      `INSERT INTO identity_keys (user_id, device_id, identity_key)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, device_id) DO UPDATE SET identity_key = EXCLUDED.identity_key`,
-      [uid, did, identityKey.trim()],
-    )
+    // Identity key and signed prekey MUST be written atomically. They are stored
+    // in separate tables but are cryptographically linked — the signed prekey's
+    // signature only verifies against the identity key from the same publish.
+    // Without a transaction, two concurrent publishes (e.g. a client mounting the
+    // chat and presence hooks at once) can interleave across pooled connections
+    // and leave an identity row from one generation paired with a signed-prekey
+    // row from another, producing a bundle whose signature fails to verify on the
+    // initiator side (a false MITM alarm). Wrapping all writes in one transaction
+    // on a single connection guarantees the rows always come from one generation.
+    const client = await pool.connect()
+    let oneTimePreKeyCount = 0
+    try {
+      await client.query('BEGIN')
 
-    await pool.query(
-      `INSERT INTO signed_prekeys (user_id, device_id, key_id, public_key, signature)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (user_id, device_id)
-       DO UPDATE SET key_id = EXCLUDED.key_id, public_key = EXCLUDED.public_key,
-                     signature = EXCLUDED.signature, created_at = NOW()`,
-      [uid, did, signedPreKey.keyId, (signedPreKey.publicKey as string).trim(), (signedPreKey.signature as string).trim()],
-    )
-
-    for (const otp of oneTimePreKeys) {
-      await pool.query(
-        `INSERT INTO one_time_prekeys (user_id, device_id, key_id, public_key)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (user_id, device_id, key_id) DO NOTHING`,
-        [uid, did, otp.keyId, (otp.publicKey as string).trim()],
+      await client.query(
+        `INSERT INTO identity_keys (user_id, device_id, identity_key)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, device_id) DO UPDATE SET identity_key = EXCLUDED.identity_key`,
+        [uid, did, identityKey.trim()],
       )
-    }
 
-    const countRes = await pool.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM one_time_prekeys WHERE user_id = $1 AND device_id = $2`,
-      [uid, did],
-    )
+      await client.query(
+        `INSERT INTO signed_prekeys (user_id, device_id, key_id, public_key, signature)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, device_id)
+         DO UPDATE SET key_id = EXCLUDED.key_id, public_key = EXCLUDED.public_key,
+                       signature = EXCLUDED.signature, created_at = NOW()`,
+        [uid, did, signedPreKey.keyId, (signedPreKey.publicKey as string).trim(), (signedPreKey.signature as string).trim()],
+      )
+
+      for (const otp of oneTimePreKeys) {
+        await client.query(
+          `INSERT INTO one_time_prekeys (user_id, device_id, key_id, public_key)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (user_id, device_id, key_id) DO NOTHING`,
+          [uid, did, otp.keyId, (otp.publicKey as string).trim()],
+        )
+      }
+
+      const countRes = await client.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM one_time_prekeys WHERE user_id = $1 AND device_id = $2`,
+        [uid, did],
+      )
+      oneTimePreKeyCount = parseInt(countRes.rows[0]?.count ?? '0', 10)
+
+      await client.query('COMMIT')
+    } catch (txErr) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw txErr
+    } finally {
+      client.release()
+    }
 
     res.status(201).json({
       userId: uid,
       deviceId: did,
-      oneTimePreKeyCount: parseInt(countRes.rows[0]?.count ?? '0', 10),
+      oneTimePreKeyCount,
     })
   } catch (err) {
     next(err)

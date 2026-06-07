@@ -183,6 +183,8 @@ describe('useE2EChat', () => {
       class extends MockWebSocket {
         constructor(url: string) {
           super(url)
+          // eslint-disable-next-line no-console
+          console.log('[DIAG] WebSocket constructed; reassigning mockWs')
           mockWs = this
         }
       }
