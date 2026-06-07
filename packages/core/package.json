@@ -15,14 +15,17 @@
   },
   "keywords": [
     "encryption",
-    "e2e",
-    "end-to-end",
+    "end-to-end-encryption",
+    "e2ee",
+    "cryptography",
     "double-ratchet",
-    "signal",
-    "x25519",
+    "signal-protocol",
     "libsodium",
-    "crypto",
-    "chat"
+    "secure-chat",
+    "privacy",
+    "typescript",
+    "hipaa",
+    "gdpr"
   ],
   "engines": {
     "node": ">=18.0.0"

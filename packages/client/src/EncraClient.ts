@@ -11,16 +11,26 @@ import {
   buildPreKeyBundle,
   x3dhInitiate,
   x3dhRespond,
+  derivePresenceKey,
+  encryptPresence,
+  decryptPresence,
 } from '@encra/core'
-import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type {
+  KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage,
+  PresencePayload, PresenceStatus,
+} from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
   loadPreKeys,   savePreKeys,
+  loadGhostMode, saveGhostMode,
+  loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
+
+export type { PresencePayload, PresenceStatus }
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -102,6 +112,7 @@ interface EventMap {
   message:      [msg: Message]
   error:        [err: Error]
   wire:         [event: WireEvent]
+  presence:     [event: { from: string; fromDeviceId: string; payload: PresencePayload }]
 }
 
 type Listener<K extends keyof EventMap> = (...args: EventMap[K]) => void
@@ -174,6 +185,11 @@ export class EncraClient {
   private _pendingPrekey:    Map<string, PreKeyMessage>            = new Map()
   private _peerKeyCache:     Map<string, DeviceKey[]>              = new Map()
   private _peerKeyCacheTime: Map<string, number>                   = new Map()
+  // Presence: directional X3DH session keys + the prekey to attach outbound.
+  private _sendPresenceKeys: Map<string, Uint8Array>               = new Map()
+  private _recvPresenceKeys: Map<string, Uint8Array>               = new Map()
+  private _sendPresencePrekey: Map<string, PreKeyMessage>          = new Map()
+  private _ghostMode:        boolean                               = false
   private _socket:       WebSocket | null              = null
   private _retryCount:   number                        = 0
   private _retryTimer:   ReturnType<typeof setTimeout>|null = null
@@ -204,6 +220,8 @@ export class EncraClient {
   get messages():     Message[]  { return this._messages }
   /** This device's stable ID (available after `connect()` resolves). */
   get deviceId():     string | null { return this._deviceId }
+  /** True if ghost mode is active — presence broadcasts are suppressed. */
+  get ghostMode():    boolean    { return this._ghostMode }
 
   // ── Typed event emitter ───────────────────────────────────────────────────
 
@@ -248,6 +266,9 @@ export class EncraClient {
     this._pendingPrekey.clear()
     this._peerKeyCache.clear()
     this._peerKeyCacheTime.clear()
+    this._sendPresenceKeys.clear()
+    this._recvPresenceKeys.clear()
+    this._sendPresencePrekey.clear()
     this._setReady(false)
     this._setConnecting(false)
   }
@@ -475,7 +496,172 @@ export class EncraClient {
     throw new DecryptionFailedError('decryptFields: decryption failed — wrong key or tampered data.')
   }
 
+  // ── Presence ──────────────────────────────────────────────────────────────
+
+  /**
+   * Send an encrypted presence update to every registered device of `to`.
+   *
+   * Each direction gets its own authenticated X3DH session (3-DH variant — the
+   * signed-prekey signature is verified). The presence key is derived from the
+   * session root key, so it is isolated from chat message keys and rotates when
+   * the session is re-established (forward secrecy at session granularity).
+   * No-op while ghost mode is active or the socket is closed.
+   *
+   * @param to      - Recipient user ID.
+   * @param payload - Presence data (status, lastSeenAt, isTyping).
+   * @example
+   * await client.sendPresence('bob', { status: 'online', lastSeenAt: Date.now(), isTyping: false })
+   */
+  async sendPresence(to: string, payload: PresencePayload): Promise<void> {
+    if (this._ghostMode) return
+    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) return
+
+    const devices = await this._fetchPeerDeviceKeys(to)
+    for (const device of devices) {
+      const presenceKey = await this._getSendPresenceKey(to, device.deviceId)
+      const encrypted   = await encryptPresence(payload, presenceKey)
+      const prekey      = this._sendPresencePrekey.get(`${to}:${device.deviceId}`)
+      this._socket.send(JSON.stringify({
+        type:       'presence',
+        to,
+        toDeviceId: device.deviceId,
+        ciphertext: encrypted.ciphertext,
+        nonce:      encrypted.nonce,
+        ...(prekey && { prekey }),
+      }))
+    }
+  }
+
+  /**
+   * Enable or disable ghost mode.
+   * Enabling broadcasts `offline` to peers with an established session, then
+   * suppresses all future presence sends. Disabling clears the flag.
+   *
+   * @param enabled - Whether ghost mode should be on.
+   */
+  async setGhostMode(enabled: boolean): Promise<void> {
+    if (enabled === this._ghostMode) return
+
+    if (enabled) {
+      // Broadcast offline to peers we already have a session with, before the flag.
+      const now = Date.now()
+      for (const cacheKey of this._sendPresenceKeys.keys()) {
+        const sep = cacheKey.lastIndexOf(':')
+        await this.sendPresence(cacheKey.slice(0, sep), { status: 'offline', lastSeenAt: now, isTyping: false })
+          .catch(() => {})
+      }
+      this._ghostMode = true
+    } else {
+      this._ghostMode = false
+    }
+    await saveGhostMode(this._userId, this._ghostMode)
+  }
+
   // ── Private helpers ───────────────────────────────────────────────────────
+
+  /** Fetch a peer device's prekey bundle WITHOUT consuming a one-time prekey. */
+  private async _fetchPresenceBundle(peerId: string, deviceId: string): Promise<PreKeyBundle> {
+    const res = await fetch(
+      `${this._httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(deviceId)}?consumeOneTime=false`,
+      { headers: { Authorization: `Bearer ${this._apiKey}` } },
+    )
+    if (!res.ok) {
+      throw new Error(`Could not fetch presence bundle for '${peerId}' device '${deviceId}': ${res.status}.`)
+    }
+    return (await res.json()) as PreKeyBundle
+  }
+
+  /** Outbound presence key for a peer device (we are the X3DH initiator). */
+  private async _getSendPresenceKey(peerId: string, deviceId: string): Promise<Uint8Array> {
+    const cacheKey = `${peerId}:${deviceId}`
+    const cached   = this._sendPresenceKeys.get(cacheKey)
+    if (cached) return cached
+
+    const stored = await loadPresenceSession(this._userId, `ps:${cacheKey}`)
+    if (stored) {
+      const key = importKey(stored.key)
+      this._sendPresenceKeys.set(cacheKey, key)
+      if (stored.prekey) this._sendPresencePrekey.set(cacheKey, stored.prekey)
+      return key
+    }
+
+    if (!this._identity) throw new Error('Identity key not initialised.')
+    const bundle = await this._fetchPresenceBundle(peerId, deviceId)
+    const init   = await x3dhInitiate(this._identity, bundle)
+    const key    = await derivePresenceKey(init.sessionKeys.rootKey)
+
+    this._sendPresenceKeys.set(cacheKey, key)
+    this._sendPresencePrekey.set(cacheKey, init.message)
+    await savePresenceSession(this._userId, `ps:${cacheKey}`, { key: exportKey(key), prekey: init.message })
+    return key
+  }
+
+  /** Inbound presence key for a peer device (responder side, from their prekey). */
+  private async _establishRecvPresenceKey(
+    peerId: string, fromDeviceId: string, prekey: PreKeyMessage,
+  ): Promise<Uint8Array> {
+    if (!this._identity || !this._prekeys) throw new Error('Prekeys not initialised.')
+    if (prekey.signedPreKeyId !== this._prekeys.signedPreKey.keyId) {
+      throw new DecryptionFailedError(
+        `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${this._prekeys.signedPreKey.keyId}).`,
+      )
+    }
+    const signedPair: KeyPair = {
+      publicKey:  importKey(this._prekeys.signedPreKey.pub),
+      privateKey: importKey(this._prekeys.signedPreKey.priv),
+    }
+    // Presence X3DH never uses a one-time prekey (3-DH variant).
+    const keys = await x3dhRespond(this._identity, signedPair, null, prekey)
+    const key  = await derivePresenceKey(keys.rootKey)
+
+    const cacheKey = `${peerId}:${fromDeviceId}`
+    this._recvPresenceKeys.set(cacheKey, key)
+    await savePresenceSession(this._userId, `pr:${cacheKey}`, { key: exportKey(key) })
+    return key
+  }
+
+  /** Cached/persisted inbound presence key, or null if no session exists yet. */
+  private async _loadRecvPresenceKey(peerId: string, fromDeviceId: string): Promise<Uint8Array | null> {
+    const cacheKey = `${peerId}:${fromDeviceId}`
+    const cached   = this._recvPresenceKeys.get(cacheKey)
+    if (cached) return cached
+    const stored = await loadPresenceSession(this._userId, `pr:${cacheKey}`)
+    if (stored) {
+      const key = importKey(stored.key)
+      this._recvPresenceKeys.set(cacheKey, key)
+      return key
+    }
+    return null
+  }
+
+  /** Decrypt an inbound presence frame and emit a `presence` event. */
+  private async _handlePresenceFrame(msg: {
+    from: string; fromDeviceId: string; ciphertext: string; nonce: string; prekey?: PreKeyMessage
+  }): Promise<void> {
+    const enc = { ciphertext: msg.ciphertext, nonce: msg.nonce }
+    let key = await this._loadRecvPresenceKey(msg.from, msg.fromDeviceId)
+    let payload: PresencePayload | null = null
+
+    if (key) {
+      try {
+        payload = await decryptPresence(enc, key)
+      } catch (err) {
+        if (!(err instanceof DecryptionFailedError) || !msg.prekey) throw err
+        key = null // stale session; re-establish from the prekey below
+      }
+    }
+    if (!payload) {
+      if (!msg.prekey) {
+        throw new DecryptionFailedError(`No presence session with '${msg.from}' and no prekey to establish one.`)
+      }
+      const fresh = await this._establishRecvPresenceKey(msg.from, msg.fromDeviceId, msg.prekey)
+      payload = await decryptPresence(enc, fresh)
+    }
+
+    if (!this._cancelled && payload) {
+      this._emit('presence', { from: msg.from, fromDeviceId: msg.fromDeviceId, payload })
+    }
+  }
 
   private static _readFileBytes(file: File | Blob): Promise<Uint8Array> {
     if (typeof file.arrayBuffer === 'function') {
@@ -769,6 +955,19 @@ export class EncraClient {
         msg = JSON.parse(event.data as string) as WireMessage
       } catch { return }
 
+      // Presence frames are a separate, ephemeral channel (no ratchet header).
+      if (msg.type === 'presence') {
+        if (!msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce) return
+        this._handlePresenceFrame({
+          from: msg.from, fromDeviceId: msg.fromDeviceId,
+          ciphertext: msg.ciphertext, nonce: msg.nonce,
+          ...(msg.prekey && { prekey: msg.prekey }),
+        }).catch((err) => {
+          this._emit('error', err instanceof Error ? err : new Error(String(err)))
+        })
+        return
+      }
+
       if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.encHeader) return
 
       this._emit('wire', {
@@ -839,6 +1038,9 @@ export class EncraClient {
     // Restore message history
     const history = await loadMessages(this._userId)
     if (history.length > 0) this._messages = history
+
+    // Restore ghost-mode preference
+    this._ghostMode = await loadGhostMode(this._userId)
 
     // Register this device's public key
     const regRes = await fetch(`${this._httpBase}/v1/keys`, {

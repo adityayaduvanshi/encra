@@ -41,7 +41,7 @@ const RELAY_CHANNEL = 'encra:relay'
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface RelayMessage {
-  type:          'auth' | 'register' | 'message'
+  type:          'auth' | 'register' | 'message' | 'presence'
   // Authentication (first message after connect)
   token?:        string
   // Registration
@@ -385,6 +385,38 @@ export function attachWebSocketRelay(server: Server): WebSocketServer {
         return
       }
 
+      // ── presence ────────────────────────────────────────────────────────────
+      if (msg.type === 'presence') {
+        if (!registeredKey || !registeredUserId || !registeredDeviceId) {
+          socket.send(JSON.stringify({ type: 'error', message: 'Must register before sending presence.' }))
+          return
+        }
+        if (!msg.to || !msg.toDeviceId || !msg.ciphertext || !msg.nonce) {
+          socket.send(JSON.stringify({
+            type:    'error',
+            message: 'presence requires to, toDeviceId, ciphertext, and nonce.',
+          }))
+          return
+        }
+
+        const presenceRecipientKey = `${msg.to}:${msg.toDeviceId}`
+        const presencePayload      = JSON.stringify({
+          type:         'presence',
+          from:         registeredUserId,
+          fromDeviceId: registeredDeviceId,
+          ciphertext:   msg.ciphertext,
+          nonce:        msg.nonce,
+          // The first presence frame of a session carries the X3DH prekey message
+          // so the recipient can establish the same session and derive the key.
+          ...(msg.prekey !== undefined && { prekey: msg.prekey }),
+        })
+
+        deliverPresence(presenceRecipientKey, presencePayload).catch((err: Error) => {
+          logger.warn({ err: err.message, recipientKey: presenceRecipientKey }, 'Presence delivery failed')
+        })
+        return
+      }
+
       socket.send(JSON.stringify({ type: 'error', message: `Unknown message type: ${msg.type}` }))
     })
 
@@ -480,4 +512,26 @@ async function deliverMessage(
   )
 
   void senderSocket  // suppress unused-var warning — caller uses it for error reporting
+}
+
+/**
+ * Deliver a presence update — ephemeral, never queued offline.
+ *  1. Try local clients Map (same process)
+ *  2. If Redis is configured, publish to the relay channel so another instance
+ *     can deliver it
+ * Drops silently if the recipient is offline on all instances. Presence is
+ * never persisted: a stale "online" must never outlive the sender's session.
+ */
+async function deliverPresence(recipientKey: string, payload: string): Promise<void> {
+  const recipientSocket = clients.get(recipientKey)
+  if (recipientSocket?.readyState === WebSocket.OPEN) {
+    recipientSocket.send(payload)
+    return
+  }
+
+  const pub = getPublisher()
+  if (pub) {
+    await pub.publish(RELAY_CHANNEL, JSON.stringify({ recipientKey, payload }))
+  }
+  // Silently drop if offline — presence is ephemeral and never stored.
 }

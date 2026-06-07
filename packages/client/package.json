@@ -1,7 +1,7 @@
 {
   "name": "@encra/client",
   "version": "0.4.0",
-  "description": "Framework-agnostic vanilla JS client for Encra end-to-end encrypted chat",
+  "description": "Framework-agnostic Signal-grade end-to-end encryption client — chat, files, forms, and presence for Vue, Svelte, vanilla JS, and Node.js",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",
   "homepage": "https://github.com/adityayaduvanshi/encra#readme",
@@ -15,12 +15,17 @@
   },
   "keywords": [
     "encryption",
-    "e2e",
-    "chat",
-    "double-ratchet",
-    "signal",
-    "vanilla",
-    "javascript"
+    "end-to-end-encryption",
+    "e2ee",
+    "encrypted-chat",
+    "secure-chat",
+    "signal-protocol",
+    "file-encryption",
+    "vue",
+    "svelte",
+    "privacy",
+    "hipaa",
+    "gdpr"
   ],
   "engines": {
     "node": ">=18.0.0"

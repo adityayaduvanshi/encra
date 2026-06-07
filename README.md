@@ -116,6 +116,7 @@ Every message uses a **unique one-time key** derived from a ratchet chain. Keys 
 | Real-time chat | `useE2EChat()` | `EncraClient.sendMessage()` |
 | Files & media (≤50 MB) | `useE2EFile()` | `EncraClient.encryptFile()` |
 | Form submissions | `useE2EForm()` | `EncraClient.encryptFields()` |
+| Presence (online / typing / last-seen) | `useE2EPresence()` | `EncraClient.sendPresence()` |
 | Database columns | `encryptField()` from `@encra/core` | same |
 
 ---
@@ -449,6 +450,19 @@ const { encryptFields, decryptFields, isReady, error } = useE2EForm({
   onError?:   (err: Error) => void,
 })
 
+// Encrypted presence — online/offline, typing, last-seen, ghost mode
+const { presence, isReady, ghostMode, setGhostMode, sendTyping, setStatus, error } = useE2EPresence({
+  apiKey:     string,
+  userId:     string,
+  contacts:   string[],   // user IDs to track and broadcast presence to
+  serverUrl?: string,
+  onError?:   (err: Error) => void,
+})
+// presence is a map keyed by userId:
+//   { [userId]: { status: 'online'|'offline'|'away'|'busy', lastSeenAt: number|null, isTyping: boolean } }
+// Presence updates are ephemeral (never queued) and encrypted under a key derived
+// from an authenticated X3DH session — never under static device keys.
+
 // Shared types (also exported from @encra/client)
 interface DeviceKey { deviceId: string; publicKey: Uint8Array }
 
@@ -486,6 +500,11 @@ await client.decryptFile(encrypted: EncryptedFile, from: string)  // → File
 await client.encryptFields(fields: Record<string, string>, to: string)   // → EncryptedFields
 await client.decryptFields(encrypted: EncryptedFields, from: string)     // → Record<string, string>
 
+// Presence (ephemeral, session-derived key — never queued)
+await client.sendPresence(to: string, payload: PresencePayload)  // { status, lastSeenAt, isTyping }
+await client.setGhostMode(enabled: boolean)                      // broadcasts offline, then suppresses sends
+client.ghostMode      // boolean
+
 // State
 client.isReady        // boolean
 client.isConnecting   // boolean
@@ -494,6 +513,7 @@ client.error          // Error | null
 
 // Events
 client.on('ready' | 'connecting' | 'disconnected' | 'message' | 'error' | 'wire', listener)
+client.on('presence', (event) => console.log(event.from, event.payload.status))
 client.off(event, listener)
 ```
 
@@ -505,6 +525,8 @@ import {
   deriveSharedSecret,
   encrypt, decrypt,
   generateFieldKey, encryptField, decryptField,
+  // Presence (symmetric, domain-separated from message keys)
+  derivePresenceKey, encryptPresence, decryptPresence,
   generateFingerprint,
   // Identity keys (Ed25519) + X3DH
   generateIdentityKeyPair, sign, verify,
@@ -566,10 +588,12 @@ cd encra && npm install
 cp packages/server/.env.example packages/server/.env
 # Set DATABASE_URL and JWT_SECRET
 
-# Migrate
+# Migrate (run in order)
 psql $DATABASE_URL -f packages/server/migrations/001_init.sql
 psql $DATABASE_URL -f packages/server/migrations/002_message_queue_header.sql
 psql $DATABASE_URL -f packages/server/migrations/003_device_keys.sql
+psql $DATABASE_URL -f packages/server/migrations/004_prekeys.sql
+psql $DATABASE_URL -f packages/server/migrations/005_header_encryption.sql
 
 # Build & start
 npm run build --workspace=packages/server
@@ -582,7 +606,7 @@ npm start     --workspace=packages/server
 
 ```bash
 npm install          # Install all workspace deps
-npm test             # Run all tests (65 core + 35 react + 25 client + more)
+npm test             # Run all tests (100+ core · 35 react · 26 client · 46 server)
 npm run build        # Build all packages
 node e2e-test.mjs    # Alice → Bob end-to-end integration test
 ```

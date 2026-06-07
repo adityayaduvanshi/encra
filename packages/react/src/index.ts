@@ -7,5 +7,14 @@ export type { EncryptedFile, UseE2EFileOptions, UseE2EFileResult } from './useE2
 export { useE2EForm } from './useE2EForm.js'
 export type { EncryptedFields, UseE2EFormOptions, UseE2EFormResult } from './useE2EForm.js'
 
+export { useE2EPresence } from './useE2EPresence.js'
+export type {
+  PeerPresence,
+  PresenceStatus,
+  PresencePayload,
+  UseE2EPresenceOptions,
+  UseE2EPresenceResult,
+} from './useE2EPresence.js'
+
 export { E2EChatProvider, useE2EChatConfig } from './E2EChatProvider.js'
 export type { E2EChatConfig } from './E2EChatProvider.js'

@@ -128,11 +128,17 @@ router.post('/v1/prekeys', requireAuth, async (req: Request, res: Response, next
  * prekey if any remain. If the pool is exhausted, the bundle omits the
  * one-time prekey (X3DH falls back to the 3-DH variant).
  *
+ * Query param `consumeOneTime=false` returns the identity key + signed prekey
+ * WITHOUT consuming a one-time prekey. Used for ephemeral presence sessions,
+ * which run the 3-DH X3DH variant and must not drain the chat one-time-prekey
+ * pool. Forward secrecy for these sessions comes from signed-prekey rotation.
+ *
  * Returns a PreKeyBundle: { identityKey, signedPreKey, oneTimePreKey? }
  */
 router.get('/v1/prekeys/:userId/:deviceId', requireAuth, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId, deviceId } = req.params as { userId: string; deviceId: string }
+    const consumeOneTime = req.query['consumeOneTime'] !== 'false'
     const pool = getPool()
 
     const identityRes = await pool.query<{ identity_key: string }>(
@@ -152,18 +158,21 @@ router.get('/v1/prekeys/:userId/:deviceId', requireAuth, async (req: Request, re
 
     // Atomically consume the oldest unused one-time prekey, if any.
     // FOR UPDATE SKIP LOCKED makes concurrent fetches hand out distinct keys.
-    const otpRes = await pool.query<{ key_id: number; public_key: string }>(
-      `DELETE FROM one_time_prekeys
-       WHERE id = (
-         SELECT id FROM one_time_prekeys
-         WHERE user_id = $1 AND device_id = $2
-         ORDER BY id
-         LIMIT 1
-         FOR UPDATE SKIP LOCKED
-       )
-       RETURNING key_id, public_key`,
-      [userId, deviceId],
-    )
+    // Skipped entirely for non-consuming (presence) fetches.
+    const otpRes = consumeOneTime
+      ? await pool.query<{ key_id: number; public_key: string }>(
+          `DELETE FROM one_time_prekeys
+           WHERE id = (
+             SELECT id FROM one_time_prekeys
+             WHERE user_id = $1 AND device_id = $2
+             ORDER BY id
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED
+           )
+           RETURNING key_id, public_key`,
+          [userId, deviceId],
+        )
+      : { rows: [] as Array<{ key_id: number; public_key: string }> }
 
     const identity = identityRes.rows[0]!
     const signed   = signedRes.rows[0]!

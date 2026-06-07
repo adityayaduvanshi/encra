@@ -39,4 +39,11 @@ export type {
   SessionKeys,
 } from './crypto/x3dh.js'
 
+export {
+  derivePresenceKey,
+  encryptPresence,
+  decryptPresence,
+} from './crypto/presence.js'
+export type { PresenceStatus, PresencePayload, EncryptedPresence } from './crypto/presence.js'
+
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

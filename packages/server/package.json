@@ -1,8 +1,40 @@
 {
   "name": "@encra/server",
   "version": "0.2.0",
-  "description": "Self-hostable key server and WebSocket relay for Encra",
+  "description": "Self-hostable zero-knowledge key server and WebSocket relay for Encra end-to-end encryption",
   "license": "BUSL-1.1",
+  "author": "Encra (https://encra.dev)",
+  "homepage": "https://github.com/adityayaduvanshi/encra#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/adityayaduvanshi/encra.git",
+    "directory": "packages/server"
+  },
+  "bugs": {
+    "url": "https://github.com/adityayaduvanshi/encra/issues"
+  },
+  "keywords": [
+    "encryption",
+    "end-to-end-encryption",
+    "e2ee",
+    "secure-chat",
+    "signal-protocol",
+    "websocket",
+    "self-hosted",
+    "express",
+    "postgresql",
+    "privacy",
+    "hipaa"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "LICENSE",
+    "README.md"
+  ],
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

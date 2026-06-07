@@ -14,12 +14,16 @@
     "url": "https://github.com/adityayaduvanshi/encra/issues"
   },
   "keywords": [
+    "encra",
     "encryption",
-    "e2e",
+    "end-to-end-encryption",
+    "e2ee",
     "cli",
-    "chat",
-    "signal",
-    "encra"
+    "secure-chat",
+    "signal-protocol",
+    "double-ratchet",
+    "privacy",
+    "keygen"
   ],
   "engines": {
     "node": ">=18.0.0"

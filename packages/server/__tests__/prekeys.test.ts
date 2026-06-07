@@ -216,6 +216,23 @@ describe('GET /v1/prekeys/:userId/:deviceId', () => {
     expect(res.status).toBe(404)
   })
 
+  it('does not consume a one-time prekey when consumeOneTime=false (presence sessions)', async () => {
+    const mock = makeMockPool()
+    setPool(mock.pool)
+    const app = await seed(mock.pool)
+
+    const res = await request(app)
+      .get('/v1/prekeys/alice/laptop?consumeOneTime=false')
+      .set('Authorization', `Bearer ${makeToken()}`)
+
+    expect(res.status).toBe(200)
+    expect(res.body.identityKey).toBe(VALID_BODY.identityKey)
+    expect(res.body.signedPreKey).toMatchObject({ keyId: 1 })
+    // No OTP returned and the pool is untouched (still 2).
+    expect(res.body.oneTimePreKey).toBeUndefined()
+    expect(mock.otps).toHaveLength(2)
+  })
+
   it('hands out distinct one-time prekeys to concurrent fetchers', async () => {
     const mock = makeMockPool()
     setPool(mock.pool)

@@ -243,6 +243,90 @@ const fields = await decryptFields(payload, patientId)
 
 ---
 
+## useE2EPresence
+
+Encrypted presence: online/offline status, typing indicators, last-seen
+timestamps, and ghost mode. Presence updates are **ephemeral** — the relay
+routes them synchronously and never queues them for offline recipients.
+
+### Signature
+
+```typescript
+function useE2EPresence(options: UseE2EPresenceOptions): UseE2EPresenceResult
+```
+
+### Options
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `apiKey` | `string` | ✅ | Developer API key (JWT). |
+| `userId` | `string` | ✅ | Current user's identifier. |
+| `contacts` | `string[]` | ✅ | User IDs to track and broadcast your status to. |
+| `serverUrl` | `string` | — | Defaults to `https://api.encra.dev`. |
+| `onError` | `(err: Error) => void` | — | Recoverable per-update errors. |
+
+### Result
+
+| Field | Type | Description |
+|---|---|---|
+| `presence` | `Record<string, PeerPresence>` | Map keyed by `userId`; populated as updates arrive. |
+| `isReady` | `boolean` | True when connected and registered. |
+| `ghostMode` | `boolean` | True while your presence is hidden. |
+| `setGhostMode` | `(enabled: boolean) => Promise<void>` | Enable: broadcast `offline` then suppress sends. Disable: broadcast `online`. Persisted to IndexedDB. |
+| `sendTyping` | `(to: string, isTyping: boolean) => Promise<void>` | Send a typing indicator (debounce in your UI). |
+| `setStatus` | `(status: PresenceStatus) => Promise<void>` | Broadcast a status to all `contacts`. |
+| `error` | `Error \| null` | Last fatal error. |
+
+```typescript
+type PresenceStatus = 'online' | 'offline' | 'away' | 'busy'
+
+interface PeerPresence {
+  status:     PresenceStatus
+  lastSeenAt: number | null   // sender's device clock (epoch ms)
+  isTyping:   boolean
+}
+```
+
+### Encryption (session-derived, Signal-grade)
+
+Each direction of a contact relationship gets its own **authenticated X3DH
+session** (the 3-DH variant — the signed-prekey signature is verified, so a
+key-substituting server is defeated). The presence key is
+`derivePresenceKey(sessionRootKey)` — keyed BLAKE2b-256 with domain separator
+`encra:presence:v1`, cryptographically isolated from chat message keys. Because
+a fresh root key is produced whenever a session is (re-)established, the presence
+key **rotates with the session** (forward secrecy at session granularity).
+Presence sessions use the `consumeOneTime=false` bundle fetch, so they never
+drain the chat one-time-prekey pool.
+
+### Behaviour
+- On connect, broadcasts `online` once to all `contacts`.
+- On unmount, best-effort broadcasts `offline` to contacts with an established session.
+- Ghost mode is persisted to IndexedDB and survives reloads.
+- Stale inbound sessions are transparently re-established from the prekey carried
+  on the sender's frames.
+
+### Example
+
+```tsx
+const { presence, sendTyping, ghostMode, setGhostMode, setStatus } = useE2EPresence({
+  apiKey:   'e2e_live_xxx',
+  userId:   'alice',
+  contacts: ['bob', 'carol'],
+})
+
+// Show "is typing…" to Bob
+await sendTyping('bob', true)
+
+// Render a contact's status
+const bob = presence['bob']           // { status: 'online', lastSeenAt, isTyping }
+
+// Go invisible
+await setGhostMode(true)
+```
+
+---
+
 ## E2EChatProvider (optional)
 
 Context provider for sharing `apiKey` and `serverUrl` across multiple `useE2EChat`

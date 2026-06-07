@@ -1,11 +1,23 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
-import type { RatchetStateExport } from '@encra/core'
+import type { RatchetStateExport, PreKeyMessage } from '@encra/core'
 
 /** Shape of a single persisted chat message. */
 export interface StoredMessage {
   from:      string
   text:      string
   timestamp: number
+}
+
+/**
+ * A persisted presence session: the symmetric presence key (base64) derived
+ * from an X3DH session root key, plus — for outbound (initiator) sessions — the
+ * X3DH prekey message that lets the peer establish the same session. Receiver
+ * sessions omit `prekey`. Persisting this keeps the presence key stable across
+ * reloads so the peer doesn't have to re-establish on every page load.
+ */
+export interface StoredPresenceSession {
+  key:     string
+  prekey?: PreKeyMessage
 }
 
 /**
@@ -45,10 +57,18 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: StoredPreKeys
   }
+  presence: {
+    key:   string        // `${userId}:${dir}:${peerId}:${deviceId}`
+    value: StoredPresenceSession
+  }
+  settings: {
+    key:   string        // userId
+    value: { ghostMode: boolean }
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 4
+const DB_VERSION = 5
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -64,6 +84,8 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('messages')) db.createObjectStore('messages')
         if (!db.objectStoreNames.contains('devices'))  db.createObjectStore('devices')
         if (!db.objectStoreNames.contains('prekeys'))  db.createObjectStore('prekeys')
+        if (!db.objectStoreNames.contains('presence')) db.createObjectStore('presence')
+        if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
       },
     })
   }
@@ -116,6 +138,44 @@ export async function saveMessages(userId: string, messages: StoredMessage[]): P
   try {
     await (await getDB()).put('messages', messages, userId)
   } catch { /* non-fatal: messages still visible in-memory */ }
+}
+
+/**
+ * Load a persisted presence session by its composite key
+ * (`${userId}:${dir}:${peerId}:${deviceId}`), or undefined if none exists.
+ */
+export async function loadPresenceSession(
+  userId: string,
+  sessionKey: string,
+): Promise<StoredPresenceSession | undefined> {
+  try {
+    return (await getDB()).get('presence', `${userId}:${sessionKey}`)
+  } catch { return undefined }
+}
+
+/** Persist a presence session. Best-effort — the in-memory key still works. */
+export async function savePresenceSession(
+  userId: string,
+  sessionKey: string,
+  session: StoredPresenceSession,
+): Promise<void> {
+  try {
+    await (await getDB()).put('presence', session, `${userId}:${sessionKey}`)
+  } catch { /* non-fatal: presence key still cached in-memory */ }
+}
+
+/** Load the persisted ghost-mode flag for a user (defaults to false). */
+export async function loadGhostMode(userId: string): Promise<boolean> {
+  try {
+    return (await (await getDB()).get('settings', userId))?.ghostMode ?? false
+  } catch { return false }
+}
+
+/** Persist the ghost-mode flag for a user. */
+export async function saveGhostMode(userId: string, ghostMode: boolean): Promise<void> {
+  try {
+    await (await getDB()).put('settings', { ghostMode }, userId)
+  } catch { /* non-fatal */ }
 }
 
 /**
