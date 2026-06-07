@@ -290,4 +290,46 @@ describe('error handling', () => {
     // Trying to decrypt the last one should fail (too many skipped)
     await expect(bob.decrypt(msgs[msgs.length - 1]!)).rejects.toThrow(DecryptionFailedError)
   })
+
+  it('trySkippedMessageKeys returns null for in-order message after a skip (same chain)', async () => {
+    // This covers the branch: header decrypts with a stored HK but no mk for that counter.
+    const { alice, bob } = await makeSession()
+
+    const m0 = await alice.encrypt('zero')
+    const m1 = await alice.encrypt('one')
+    const m2 = await alice.encrypt('two')
+    const m3 = await alice.encrypt('three')
+
+    // Deliver m2 first — m0 and m1 are skipped and stored
+    expect(await bob.decrypt(m2)).toBe('two')
+
+    // m3 is in-order (counter=3). trySkippedMessageKeys will find the stored
+    // header key for this chain, decrypt m3's header successfully (n=3), but
+    // find no message key for counter 3 → returns null → main path handles it.
+    expect(await bob.decrypt(m3)).toBe('three')
+
+    // m0 and m1 are still recoverable from MKSKIPPED
+    expect(await bob.decrypt(m0)).toBe('zero')
+    expect(await bob.decrypt(m1)).toBe('one')
+  })
+})
+
+// ── fromExport with nullable fields ──────────────────────────────────────────
+
+describe('fromExport with initial receiver state (nullable fields)', () => {
+  it('round-trips a fresh receiver state before any messages', async () => {
+    // Bob's initReceiver state has DHr=null, CKs/CKr=null, HKs/HKr=null.
+    // This exercises the null branches in fromExport.
+    const bobKP = await generateKeyPair()
+    const keys = makeKeys()
+    const alice = await DoubleRatchet.initSender(keys, bobKP.publicKey)
+    const bob = await DoubleRatchet.initReceiver(keys, bobKP)
+
+    // Export Bob's fresh state (most optional fields are null)
+    const bobRestored = await DoubleRatchet.fromExport(bob.export())
+
+    // Alice sends — bobRestored should decrypt correctly
+    const msg = await alice.encrypt('hello after restore')
+    expect(await bobRestored.decrypt(msg)).toBe('hello after restore')
+  })
 })

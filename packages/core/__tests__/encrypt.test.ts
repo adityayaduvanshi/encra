@@ -64,6 +64,14 @@ describe('encrypt / decrypt', () => {
     await expect(encrypt('Hello', new Uint8Array(16))).rejects.toThrow(InvalidKeyError)
   })
 
+  it('encrypt throws InvalidKeyError when plaintext is not a string', async () => {
+    const alice = await generateKeyPair()
+    const bob = await generateKeyPair()
+    const secret = await deriveSharedSecret(alice.privateKey, bob.publicKey)
+    // @ts-expect-error — intentional runtime type check
+    await expect(encrypt(42, secret)).rejects.toThrow(InvalidKeyError)
+  })
+
   it('decrypt throws InvalidKeyError for wrong-length key', async () => {
     await expect(decrypt(new Uint8Array(48), new Uint8Array(24), new Uint8Array(16))).rejects.toThrow(
       InvalidKeyError
