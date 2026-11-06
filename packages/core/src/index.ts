@@ -9,7 +9,7 @@ export type { EncryptedMessage } from './crypto/encrypt.js'
 export { encryptField, decryptField, generateFieldKey } from './crypto/field.js'
 export type { EncryptedField } from './crypto/field.js'
 
-export { generateFingerprint } from './crypto/fingerprint.js'
+export { generateFingerprint, generateSafetyNumber } from './crypto/fingerprint.js'
 
 export { DoubleRatchet, MAX_SKIP_KEYS, RATCHET_VERSION } from './crypto/ratchet.js'
 export type { MessageHeader, RatchetMessage, RatchetStateExport } from './crypto/ratchet.js'

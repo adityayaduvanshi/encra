@@ -1,10 +1,11 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
-import type { RatchetStateExport, PreKeyMessage } from '@encra/core'
+import type { RatchetStateExport, PreKeyMessage, KeyPair, IdentityKeyPair } from '@encra/core'
 import {
   generateIdentityKeyPair,
   generateSignedPreKey,
   generateOneTimePreKeys,
   exportKey,
+  importKey,
 } from '@encra/core'
 
 /** Shape of a single persisted chat message. */
@@ -26,6 +27,11 @@ export interface StoredPresenceSession {
   prekey?: PreKeyMessage
 }
 
+/** A stored signed prekey: X25519 pair + the identity signature over its public key. */
+export interface StoredSignedPreKey {
+  keyId: number; pub: string; priv: string; signature: string
+}
+
 /**
  * This device's X3DH prekey material (private halves included). Persisted so
  * sessions survive reloads and incoming prekey messages can be answered.
@@ -35,7 +41,21 @@ export interface StoredPreKeys {
   identityPub:  string
   identityPriv: string
   /** Current signed prekey: X25519 pair + identity signature over its public key. */
-  signedPreKey: { keyId: number; pub: string; priv: string; signature: string }
+  signedPreKey: StoredSignedPreKey
+  /**
+   * When the current signed prekey was generated (ms epoch). Drives rotation —
+   * a signed prekey older than {@link SIGNED_PREKEY_MAX_AGE_MS} is rotated.
+   */
+  signedPreKeyCreatedAt: number
+  /**
+   * Previously-current signed prekeys, retained (capped) so this device can
+   * still answer prekey messages that referenced an older signed prekey — e.g.
+   * a message that was in flight or queued offline across a rotation. Without
+   * this, rotating the signed prekey would make those sessions undecryptable.
+   */
+  previousSignedPreKeys: StoredSignedPreKey[]
+  /** Next signed-prekey id to allocate on rotation. */
+  nextSpkId: number
   /** Unused one-time prekey pool (X25519 pairs). Consumed on inbound sessions. */
   oneTimePreKeys: Array<{ keyId: number; pub: string; priv: string }>
   /** Next one-time prekey id to allocate when replenishing the pool. */
@@ -137,6 +157,69 @@ export async function savePreKeys(userId: string, prekeys: StoredPreKeys): Promi
 /** One-time prekey pool size for a freshly generated device. */
 const OTP_POOL_SIZE = 100
 
+/** How many superseded signed prekeys to retain for rotation safety. */
+const MAX_RETAINED_SIGNED_PREKEYS = 3
+
+/**
+ * Rotate the signed prekey once it is older than this. Rotation gives sessions
+ * forward secrecy at signed-prekey granularity; retention (see
+ * {@link StoredPreKeys.previousSignedPreKeys}) keeps the rotation lossless.
+ */
+export const SIGNED_PREKEY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000  // 7 days
+
+/**
+ * Resolve the signed-prekey key pair a prekey message refers to, searching the
+ * current signed prekey and the retained previous ones. Returns null if the id
+ * matches none (the key is truly gone — the session cannot be established).
+ *
+ * @param prekeys - This device's stored prekey material.
+ * @param keyId   - `signedPreKeyId` from the inbound prekey message.
+ */
+export function resolveSignedPreKeyPair(prekeys: StoredPreKeys, keyId: number): KeyPair | null {
+  const candidates = [prekeys.signedPreKey, ...(prekeys.previousSignedPreKeys ?? [])]
+  const found = candidates.find((s) => s.keyId === keyId)
+  if (!found) return null
+  return { publicKey: importKey(found.pub), privateKey: importKey(found.priv) }
+}
+
+/**
+ * Rotate the signed prekey if the current one is older than `maxAgeMs`. A fresh
+ * signed prekey is generated and signed by the identity key; the outgoing one is
+ * moved into the retained list (capped at {@link MAX_RETAINED_SIGNED_PREKEYS}) so
+ * in-flight messages against it still open. Persists the updated material.
+ *
+ * @returns The new public signed-prekey material to publish, or null if no
+ *   rotation was due (nothing to publish).
+ */
+export async function rotateSignedPreKeyIfStale(
+  userId: string,
+  prekeys: StoredPreKeys,
+  maxAgeMs: number = SIGNED_PREKEY_MAX_AGE_MS,
+): Promise<{ keyId: number; publicKey: string; signature: string } | null> {
+  if (Date.now() - prekeys.signedPreKeyCreatedAt < maxAgeMs) return null
+
+  const identity: IdentityKeyPair = {
+    publicKey:  importKey(prekeys.identityPub),
+    privateKey: importKey(prekeys.identityPriv),
+  }
+  const spk = await generateSignedPreKey(identity, prekeys.nextSpkId)
+
+  // Retain the outgoing current signed prekey (newest-first, capped).
+  prekeys.previousSignedPreKeys = [prekeys.signedPreKey, ...(prekeys.previousSignedPreKeys ?? [])]
+    .slice(0, MAX_RETAINED_SIGNED_PREKEYS)
+  prekeys.signedPreKey = {
+    keyId:     spk.keyId,
+    pub:       exportKey(spk.keyPair.publicKey),
+    priv:      exportKey(spk.keyPair.privateKey),
+    signature: exportKey(spk.signature),
+  }
+  prekeys.signedPreKeyCreatedAt = Date.now()
+  prekeys.nextSpkId += 1
+  await savePreKeys(userId, prekeys)
+
+  return { keyId: spk.keyId, publicKey: prekeys.signedPreKey.pub, signature: prekeys.signedPreKey.signature }
+}
+
 /**
  * In-flight prekey generation locks, keyed by userId. Guarantees exactly one
  * identity-key + signed-prekey generation per userId per tab, even if multiple
@@ -170,7 +253,16 @@ export function loadOrCreatePreKeys(
 
   const promise = (async () => {
     const existing = await loadPreKeys(userId)
-    if (existing) return { prekeys: existing, created: false }
+    if (existing) {
+      // Backfill rotation fields for prekeys saved before retention existed, so
+      // older installs upgrade in place without regenerating their identity.
+      let changed = false
+      if (existing.signedPreKeyCreatedAt === undefined) { existing.signedPreKeyCreatedAt = Date.now(); changed = true }
+      if (existing.previousSignedPreKeys  === undefined) { existing.previousSignedPreKeys  = [];         changed = true }
+      if (existing.nextSpkId              === undefined) { existing.nextSpkId              = existing.signedPreKey.keyId + 1; changed = true }
+      if (changed) await savePreKeys(userId, existing)
+      return { prekeys: existing, created: false }
+    }
 
     const identity = await generateIdentityKeyPair()
     const spk      = await generateSignedPreKey(identity, 1)
@@ -184,6 +276,9 @@ export function loadOrCreatePreKeys(
         priv:      exportKey(spk.keyPair.privateKey),
         signature: exportKey(spk.signature),
       },
+      signedPreKeyCreatedAt: Date.now(),
+      previousSignedPreKeys: [],
+      nextSpkId:             spk.keyId + 1,
       oneTimePreKeys: otps.map((o) => ({
         keyId: o.keyId,
         pub:   exportKey(o.keyPair.publicKey),

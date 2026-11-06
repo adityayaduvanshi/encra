@@ -123,6 +123,11 @@ async function flushQueuedMessages(
   deviceId: string,
   socket:   WebSocket,
 ): Promise<void> {
+  // Read the queue WITHOUT deleting. Previously this used `DELETE ... RETURNING`
+  // and then sent in a loop — if the socket dropped partway, every row that had
+  // already been deleted but not yet sent was lost forever. Now we delete each
+  // message only AFTER it has been handed to the socket, so a mid-flush
+  // disconnect leaves the undelivered remainder safely queued for next time.
   const result = await getPool().query<{
     id:                number
     sender_id:         string
@@ -133,12 +138,14 @@ async function flushQueuedMessages(
     prekey:            unknown
     sender_name:       string | null
   }>(
-    `DELETE FROM message_queue
-     WHERE recipient_id = $1 AND recipient_device_id = $2
-     RETURNING id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name`,
+    `SELECT id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name
+     FROM   message_queue
+     WHERE  recipient_id = $1 AND recipient_device_id = $2
+     ORDER  BY id`,
     [userId, deviceId],
   )
 
+  const deliveredIds: number[] = []
   for (const row of result.rows) {
     if (socket.readyState !== WebSocket.OPEN) break
     socket.send(JSON.stringify({
@@ -151,6 +158,15 @@ async function flushQueuedMessages(
       ...(row.prekey      !== null && { prekey:     row.prekey }),
       ...(row.sender_name !== null && { senderName: row.sender_name }),
     }))
+    deliveredIds.push(row.id)
+  }
+
+  // Delete only what we actually handed to the socket.
+  if (deliveredIds.length > 0) {
+    await getPool().query(
+      `DELETE FROM message_queue WHERE id = ANY($1::int[])`,
+      [deliveredIds],
+    )
   }
 }
 

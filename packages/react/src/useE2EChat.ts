@@ -7,6 +7,8 @@ import {
   DecryptionFailedError,
   DoubleRatchet,
   generateOneTimePreKeys,
+  generateSafetyNumber,
+  identityPublicToX25519,
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
@@ -16,6 +18,7 @@ import {
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
+  resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
@@ -66,6 +69,13 @@ export interface UseE2EChatResult {
   /** True during the initial connection or a reconnect attempt. */
   isConnecting: boolean
   sendMessage: (to: string, text: string) => Promise<void>
+  /**
+   * Compute the conversation safety number with `peerId` — a 60-digit code that
+   * is identical on both sides when no man-in-the-middle is present. Show it to
+   * both users to verify out-of-band. Resolves to `null` if the peer has not
+   * published prekeys yet.
+   */
+  getSafetyNumber: (peerId: string) => Promise<string | null>
   error: Error | null
 }
 
@@ -145,6 +155,15 @@ export function useE2EChat({
   const peerKeyCacheRef     = useRef<Map<string, DeviceKey[]>>(new Map())
   const peerKeyCacheTimeRef = useRef<Map<string, number>>(new Map())
   const socketRef           = useRef<WebSocket | null>(null)
+  /**
+   * Per-sender-device inbound processing chains. Incoming frames for the same
+   * `${from}:${fromDeviceId}` are processed strictly one at a time: decrypting a
+   * Double Ratchet advances shared chain-key state, so two `decrypt()` calls
+   * interleaving on one ratchet instance (which happens when async message
+   * handlers overlap during a burst) would corrupt the chain and lose messages.
+   * Different senders still run in parallel.
+   */
+  const inboundChainsRef    = useRef<Map<string, Promise<void>>>(new Map())
 
   // Stable refs so callbacks can change without restarting the effect
   const onErrorRef       = useRef(onError)
@@ -240,6 +259,10 @@ export function useE2EChat({
       publicKey:  importKey(prekeys.identityPub),
       privateKey: importKey(prekeys.identityPriv),
     }
+    // Rotate the signed prekey if it has aged out (forward secrecy). The old one
+    // is retained so sessions opened against it still work; `publishPreKeys`
+    // below then advertises whichever signed prekey is now current.
+    if (!created) await rotateSignedPreKeyIfStale(userId, prekeys)
     // Publish the full one-time prekey pool only when we just created it.
     // On restore, re-assert identity + signed prekey but don't re-publish
     // existing one-time prekeys — some may already be reserved by senders.
@@ -264,6 +287,34 @@ export function useE2EChat({
       return (await res.json()) as PreKeyBundle
     },
     [apiKey, httpBase]
+  )
+
+  /**
+   * Compute the conversation safety number with `peerId`. Fetches the peer's
+   * identity key WITHOUT consuming a one-time prekey, then combines it with our
+   * own identity key via `generateSafetyNumber` (symmetric — both sides get the
+   * same code). Returns null if the peer hasn't published prekeys yet.
+   */
+  const getSafetyNumber = useCallback(
+    async (peerId: string): Promise<string | null> => {
+      const myIdentity = identityRef.current
+      if (!myIdentity) return null
+
+      const devices = await fetchPeerDeviceKeys(peerId).catch(() => [] as DeviceKey[])
+      if (devices.length === 0) return null
+
+      const res = await fetch(
+        `${httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(devices[0]!.deviceId)}?consumeOneTime=false`,
+        { headers: { Authorization: `Bearer ${apiKey}` } },
+      )
+      if (!res.ok) return null
+      const bundle = (await res.json()) as { identityKey: string }
+
+      const myIdX    = identityPublicToX25519(myIdentity.publicKey)
+      const theirIdX = identityPublicToX25519(importKey(bundle.identityKey))
+      return generateSafetyNumber(myIdX, theirIdX)
+    },
+    [apiKey, httpBase, fetchPeerDeviceKeys]
   )
 
   /** Top the one-time prekey pool back up to OTP_POOL_SIZE and publish the new keys. */
@@ -367,14 +418,14 @@ export function useE2EChat({
         )
       }
 
-      if (prekey.signedPreKeyId !== pk.signedPreKey.keyId) {
+      // Resolve the signed prekey the sender used — this may be the current one
+      // or a retained previous one (if we rotated after the sender fetched our
+      // bundle but before this message arrived). Only truly-gone keys fail.
+      const signedPair = resolveSignedPreKeyPair(pk, prekey.signedPreKeyId)
+      if (!signedPair) {
         throw new DecryptionFailedError(
-          `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${pk.signedPreKey.keyId}).`,
+          `Signed prekey ${prekey.signedPreKeyId} is not available (current is ${pk.signedPreKey.keyId}, no retained match).`,
         )
-      }
-      const signedPair: KeyPair = {
-        publicKey:  importKey(pk.signedPreKey.pub),
-        privateKey: importKey(pk.signedPreKey.priv),
       }
       let oneTimePair: KeyPair | null = null
       if (prekey.oneTimePreKeyId !== null) {
@@ -410,6 +461,42 @@ export function useE2EChat({
       }, delay)
     }
 
+    /**
+     * Decrypt and store one inbound frame. Runs inside a per-sender-device
+     * serialization chain (see `inboundChainsRef`) so ratchet state is never
+     * advanced by two overlapping decrypts.
+     */
+    async function handleInboundMessage(msg: WireMessage): Promise<void> {
+      try {
+        const ratchet = await getOrInitReceiverRatchet(msg.from!, msg.fromDeviceId!, msg.prekey)
+        const text    = await ratchet.decrypt({
+          encHeader:  importKey(msg.encHeader!),
+          ciphertext: importKey(msg.ciphertext!),
+          nonce:      importKey(msg.nonce!),
+        })
+        await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
+        // We've heard from this peer device — stop attaching our prekey message.
+        pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
+        if (!cancelled) {
+          setMessages((prev) => {
+            const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
+            const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+            void saveMessages(userId, capped)
+            return capped
+          })
+        }
+      } catch (err) {
+        // Surface EVERY receive error. Previously only DecryptionFailedError was
+        // reported and all other failures (e.g. "Prekeys not initialised", a
+        // rotated signed prekey, a missing one-time prekey) were swallowed
+        // silently, hiding real breakage from the app.
+        const e = err instanceof DecryptionFailedError
+          ? new DecryptionFailedError(`Decryption failed for message from '${msg.from}'.`)
+          : err instanceof Error ? err : new Error(String(err))
+        onErrorRef.current?.(e)
+      }
+    }
+
     function connectWS() {
       ws = new WebSocket(`${wsBase}/v1/relay`)
       socketRef.current = ws
@@ -421,11 +508,18 @@ export function useE2EChat({
         if (!cancelled) { setIsReady(true); setIsConnecting(false) }
       })
 
-      ws.addEventListener('message', async (event) => {
+      ws.addEventListener('message', (event) => {
         let msg: WireMessage
         try {
           msg = JSON.parse(event.data as string) as WireMessage
         } catch { return }
+
+        // Server-originated error frames are recoverable — report, don't crash.
+        if (msg.type === 'error') {
+          const m = (msg as { message?: string }).message
+          onErrorRef.current?.(new Error(m ? `Server: ${m}` : 'Server error.'))
+          return
+        }
 
         if (
           msg.type !== 'message' ||
@@ -443,41 +537,35 @@ export function useE2EChat({
           timestamp:  Date.now(),
         })
 
-        try {
-          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
-          const text = await ratchet.decrypt({
-            encHeader:  importKey(msg.encHeader),
-            ciphertext: importKey(msg.ciphertext),
-            nonce:      importKey(msg.nonce),
-          })
-          await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
-          // We've heard from this peer device — stop attaching our prekey message.
-          pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
-          if (!cancelled) {
-            setMessages((prev) => {
-              const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
-              const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
-              void saveMessages(userId, capped)
-              return capped
-            })
-          }
-        } catch (err) {
-          if (err instanceof DecryptionFailedError) {
-            const e = new DecryptionFailedError(`Decryption failed for message from '${msg.from}'.`)
-            onErrorRef.current?.(e)
-          }
-        }
+        // Chain this frame behind any in-flight decrypt for the same sender
+        // device so decryptions never interleave on one ratchet instance.
+        const chainKey = `${msg.from}:${msg.fromDeviceId}`
+        const prev     = inboundChainsRef.current.get(chainKey) ?? Promise.resolve()
+        const next     = prev.then(() => handleInboundMessage(msg)).catch(() => {})
+        inboundChainsRef.current.set(chainKey, next)
       })
 
       ws.addEventListener('error', () => {
         if (!cancelled) onErrorRef.current?.(new Error('WebSocket connection error.'))
       })
 
-      ws.addEventListener('close', () => {
-        if (!cancelled) {
-          setIsReady(false)
-          scheduleReconnect()
+      ws.addEventListener('close', (event) => {
+        if (cancelled) return
+        setIsReady(false)
+        const code = (event as CloseEvent | undefined)?.code
+        // 4001 = auth rejected (bad/expired API key); 4003 = registration timeout.
+        // Reconnecting can't fix a rejected key, so stop the loop and surface a
+        // fatal error instead of retrying forever.
+        if (code === 4001 || code === 4003) {
+          setIsConnecting(false)
+          setError(new Error(
+            code === 4001
+              ? 'Authentication failed: the API key was rejected. Check your apiKey.'
+              : 'Registration timed out.',
+          ))
+          return
         }
+        scheduleReconnect()
       })
     }
 
@@ -551,8 +639,39 @@ export function useE2EChat({
       pendingPrekeyRef.current.clear()
       peerKeyCacheRef.current.clear()
       peerKeyCacheTimeRef.current.clear()
+      inboundChainsRef.current.clear()
     }
   }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys])
+
+  /**
+   * Encrypt `text` for one recipient device and push it over the socket.
+   * Shared by the recipient-fanout and the sender's own-device fanout.
+   */
+  const sendToDevice = useCallback(
+    async (socket: WebSocket, peerId: string, deviceId: string, text: string): Promise<void> => {
+      const ratchet = await getOrInitSenderRatchet(peerId, deviceId)
+      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
+      await saveRatchet(userId, `s:${peerId}:${deviceId}`, ratchet.export())
+
+      const pending = pendingPrekeyRef.current.get(`${peerId}:${deviceId}`)
+      const ctB64 = exportKey(ciphertext)
+      const nB64  = exportKey(nonce)
+      const ehB64 = exportKey(encHeader)
+
+      socket.send(JSON.stringify({
+        type:       'message',
+        to:         peerId,
+        toDeviceId: deviceId,
+        ciphertext: ctB64,
+        nonce:      nB64,
+        encHeader:  ehB64,
+        ...(pending && { prekey: pending }),
+      }))
+
+      onWireMessageRef.current?.({ direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
+    },
+    [userId, getOrInitSenderRatchet]
+  )
 
   /**
    * Encrypts `text` and delivers it to every registered device of `to`.
@@ -576,36 +695,23 @@ export function useE2EChat({
         throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
       }
 
-      // Send one encrypted message per recipient device
+      // Send one encrypted message per recipient device.
       for (const device of peerDevices) {
-        const ratchet = await getOrInitSenderRatchet(to, device.deviceId)
-        const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
-        await saveRatchet(userId, `s:${to}:${device.deviceId}`, ratchet.export())
+        await sendToDevice(socket, to, device.deviceId, text)
+      }
 
-        // Attach the X3DH prekey message until we hear back from this device, so
-        // the recipient can establish the session even if earlier frames were lost.
-        const pending = pendingPrekeyRef.current.get(`${to}:${device.deviceId}`)
-
-        const ctB64 = exportKey(ciphertext)
-        const nB64  = exportKey(nonce)
-        const ehB64 = exportKey(encHeader)
-
-        socket.send(JSON.stringify({
-          type:       'message',
-          to,
-          toDeviceId: device.deviceId,
-          ciphertext: ctB64,
-          nonce:      nB64,
-          encHeader:  ehB64,
-          ...(pending && { prekey: pending }),
-        }))
-
-        onWireMessageRef.current?.({
-          direction:  'sent',
-          ciphertext: ctB64,
-          nonce:      nB64,
-          timestamp:  Date.now(),
-        })
+      // Self-device sync: also deliver to the sender's OWN other devices so the
+      // message appears everywhere the user is logged in (not just the device it
+      // was typed on). Best-effort — a failure here must not fail the send to
+      // the recipient. The current device is excluded so we never echo to self.
+      try {
+        const myDevices = await fetchPeerDeviceKeys(userId)
+        for (const device of myDevices) {
+          if (device.deviceId === deviceIdRef.current) continue
+          await sendToDevice(socket, userId, device.deviceId, text)
+        }
+      } catch (err) {
+        onErrorRef.current?.(err instanceof Error ? err : new Error('Self-device sync failed.'))
       }
 
       // Add sent message to local state once (not once per device)
@@ -616,8 +722,8 @@ export function useE2EChat({
         return capped
       })
     },
-    [userId, fetchPeerDeviceKeys, getOrInitSenderRatchet]
+    [userId, fetchPeerDeviceKeys, sendToDevice]
   )
 
-  return { messages, isReady, isConnecting, sendMessage, error }
+  return { messages, isReady, isConnecting, sendMessage, getSafetyNumber, error }
 }

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Encra — E2E Chat Demo</title>
+    <style>
+      :root {
+        --bg: #0b1020; --panel: #141b31; --panel-2: #1b2440; --line: #2a3557;
+        --text: #e8ecf7; --muted: #8a97b8; --accent: #6c8cff; --accent-2: #3ad29f;
+        --bubble-me: #2f4bd6; --bubble-them: #26304f;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+        background: var(--bg); color: var(--text); min-height: 100vh;
+      }
+      header { padding: 20px 24px 4px; }
+      header h1 { margin: 0; font-size: 20px; letter-spacing: .3px; }
+      header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+      .stage {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+        padding: 16px 24px 24px; max-width: 1100px; margin: 0 auto;
+      }
+      @media (max-width: 760px) { .stage { grid-template-columns: 1fr; } }
+      .panel {
+        background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+        display: flex; flex-direction: column; height: 70vh; min-height: 420px; overflow: hidden;
+      }
+      .phead { padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel-2); }
+      .phead .who { font-weight: 650; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; display: inline-block; }
+      .dot.on { background: var(--accent-2); box-shadow: 0 0 0 3px rgba(58,210,159,.18); }
+      .phead .meta { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: ui-monospace, monospace; }
+      .log { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+      .msg { max-width: 78%; padding: 8px 12px; border-radius: 14px; font-size: 14px; word-break: break-word; }
+      .msg.me   { align-self: flex-end; background: var(--bubble-me); border-bottom-right-radius: 4px; }
+      .msg.them { align-self: flex-start; background: var(--bubble-them); border-bottom-left-radius: 4px; }
+      .msg .t { font-size: 10px; color: var(--muted); margin-top: 3px; }
+      .compose { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); background: var(--panel-2); }
+      .compose input {
+        flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--text);
+        border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none;
+      }
+      .compose input:focus { border-color: var(--accent); }
+      button {
+        background: var(--accent); color: white; border: 0; border-radius: 10px;
+        padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+      }
+      button:disabled { opacity: .5; cursor: not-allowed; }
+      .bar { display: flex; gap: 10px; align-items: center; padding: 10px 24px; max-width: 1100px; margin: 0 auto; flex-wrap: wrap; }
+      .bar .sn { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; }
+      .bar .match { color: var(--accent-2); font-weight: 600; }
+      .bar button { background: var(--panel-2); border: 1px solid var(--line); }
+      .hint { color: var(--muted); font-size: 12px; padding: 0 24px 8px; max-width: 1100px; margin: 0 auto; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>🔐 Encra — End-to-End Encrypted Chat Demo</h1>
+      <p>Two users, two independent <code>EncraClient</code>s, real X3DH + Double Ratchet. The server (in-memory, this page) only ever sees ciphertext.</p>
+    </header>
+
+    <div class="bar">
+      <button id="safety">Compute safety number</button>
+      <span class="sn" id="sn-out">—</span>
+      <button id="reset">Reset demo data</button>
+    </div>
+    <p class="hint">Type in either pane and hit Send. Open DevTools → Network → WS to watch only ciphertext cross the wire. The safety numbers on both sides must match (that's the MITM check).</p>
+
+    <div class="stage">
+      <section class="panel" data-user="alice" data-peer="bob">
+        <div class="phead">
+          <div class="who"><span class="dot"></span> Alice</div>
+          <div class="meta">device: <span class="device">…</span></div>
+        </div>
+        <div class="log"></div>
+        <form class="compose"><input placeholder="Message to Bob…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
+      </section>
+
+      <section class="panel" data-user="bob" data-peer="alice">
+        <div class="phead">
+          <div class="who"><span class="dot"></span> Bob</div>
+          <div class="meta">device: <span class="device">…</span></div>
+        </div>
+        <div class="log"></div>
+        <form class="compose"><input placeholder="Message to Alice…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
+      </section>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
