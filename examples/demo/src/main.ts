@@ -37,7 +37,10 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const log       = section.querySelector<HTMLDivElement>('.log')!
   const form      = section.querySelector<HTMLFormElement>('.compose')!
   const input     = section.querySelector<HTMLInputElement>('input')!
-  const button    = section.querySelector<HTMLButtonElement>('button')!
+  // The Send button lives in the compose form; `section.querySelector('button')`
+  // would wrongly match the storebar's "Reload from DB" button (it comes first in
+  // the DOM), leaving the real Send button disabled.
+  const button    = form.querySelector<HTMLButtonElement>('button')!
   const storedEl  = section.querySelector<HTMLSpanElement>('.stored')!
   const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
   const olderBtn  = section.querySelector<HTMLButtonElement>('.older')!
