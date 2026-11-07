@@ -24,11 +24,21 @@ import {
   savePreKeys,   loadOrCreatePreKeys,
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
   loadOrCreateStorageRootKey,
+  enqueueOutbox, loadOutbox, removeOutbox,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
 
 export type { StoredMessageRecord }
+
+/**
+ * Delivery status of a SENT message (undefined for received messages):
+ * - `queued`  — accepted while offline; will send on reconnect
+ * - `sending` — being delivered to the relay
+ * - `sent`    — handed to the relay (not a recipient read receipt)
+ * - `failed`  — delivery failed; stays queued and retries on reconnect
+ */
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
 
 export interface Message {
   /** Stable, sender-generated id — identical across every device the message reaches. */
@@ -45,6 +55,8 @@ export interface Message {
   to: string
   text: string
   timestamp: number
+  /** Delivery status for messages YOU sent; undefined for received messages. */
+  status?: MessageStatus
 }
 
 export interface WireEvent {
@@ -222,6 +234,9 @@ export function useE2EChat({
   const inboundChainsRef    = useRef<Map<string, Promise<void>>>(new Map())
   /** Ids of messages already in state — for deduping re-delivered/self-synced copies. */
   const seenIdsRef          = useRef<Set<string>>(new Set())
+  /** Serializes outbox flushes; `flushOutboxRef` lets the WS 'open' handler call the latest flush. */
+  const flushingRef         = useRef(false)
+  const flushOutboxRef      = useRef<() => void>(() => {})
 
   /** Append a message if its id hasn't been seen, capping and persisting history. */
   const addMessage = useCallback((m: Message): void => {
@@ -582,7 +597,7 @@ export function useE2EChat({
         ws!.send(JSON.stringify({ type: 'auth', token: apiKey }))
         ws!.send(JSON.stringify({ type: 'register', userId, deviceId: deviceIdRef.current }))
         retryCount = 0
-        if (!cancelled) { setIsReady(true); setIsConnecting(false) }
+        if (!cancelled) { setIsReady(true); setIsConnecting(false); flushOutboxRef.current() }
       })
 
       ws.addEventListener('message', (event) => {
@@ -756,43 +771,31 @@ export function useE2EChat({
     [userId, getOrInitSenderRatchet]
   )
 
-  /**
-   * Encrypts `text` and delivers it to every registered device of `to`.
-   * Each device gets its own Double Ratchet envelope so messages decrypt
-   * independently regardless of which device the recipient opens them on.
-   *
-   * @param to   - Recipient user ID.
-   * @param text - Plaintext message to send.
-   * @throws {Error} If the WebSocket is not connected or the recipient has no keys.
-   */
-  const sendMessage = useCallback(
-    async (to: string, text: string): Promise<string> => {
+  /** Update a sent message's delivery status in place, persisting the change. */
+  const setMessageStatus = useCallback((id: string, status: MessageStatus): void => {
+    setMessages((prev) => {
+      let changed = false
+      const next = prev.map((m) => {
+        if (m.id === id && m.status !== status) { changed = true; return { ...m, status } }
+        return m
+      })
+      if (changed) void saveMessages(userId, next)
+      return changed ? next : prev
+    })
+  }, [userId])
+
+  /** Deliver one queued message: fan out to the recipient's devices + our own. */
+  const deliverMessage = useCallback(
+    async (item: { id: string; to: string; text: string; ts: number }): Promise<void> => {
       const socket = socketRef.current
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        throw new Error('WebSocket is not connected. Wait for isReady to be true.')
-      }
-
-      // Fetch all of the recipient's registered devices
-      const peerDevices = await fetchPeerDeviceKeys(to)
-      if (peerDevices.length === 0) {
-        throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
-      }
-
-      // One id + timestamp for this message, encoded into the ciphertext so every
-      // delivered copy shares them (dedup + stable ordering across devices).
-      const id   = newMessageId()
-      const ts   = Date.now()
-      const body = packMessagePayload({ id, to, text, ts })
-
-      // Send one encrypted copy per recipient device.
+      if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error('Not connected.')
+      const peerDevices = await fetchPeerDeviceKeys(item.to)
+      if (peerDevices.length === 0) throw new Error(`No devices found for '${item.to}'.`)
+      const body = packMessagePayload({ id: item.id, to: item.to, text: item.text, ts: item.ts })
       for (const device of peerDevices) {
-        await sendToDevice(socket, to, device.deviceId, body)
+        await sendToDevice(socket, item.to, device.deviceId, body)
       }
-
-      // Self-device sync: also deliver to the sender's OWN other devices so the
-      // message appears everywhere the user is logged in. Best-effort — a failure
-      // here must not fail the send to the recipient. The current device is
-      // excluded so we never echo to self.
+      // Self-device sync (best-effort) — deliver to the sender's own other devices.
       try {
         const myDevices = await fetchPeerDeviceKeys(userId)
         for (const device of myDevices) {
@@ -802,12 +805,60 @@ export function useE2EChat({
       } catch (err) {
         onErrorRef.current?.(err instanceof Error ? err : new Error('Self-device sync failed.'))
       }
+    },
+    [userId, fetchPeerDeviceKeys, sendToDevice]
+  )
 
-      // Add the sent message to local state once (deduped by id).
-      addMessage({ id, conversationId: to, from: userId, to, text, timestamp: ts })
+  /**
+   * Flush the persisted outbox oldest-first (serialized). Re-loads after each
+   * message so items queued mid-flush are still delivered; stops at the first
+   * failure, which stays queued and retries on the next reconnect.
+   */
+  const flushOutbox = useCallback(async (): Promise<void> => {
+    if (flushingRef.current) return
+    flushingRef.current = true
+    try {
+      for (;;) {
+        const socket = socketRef.current
+        if (!socket || socket.readyState !== WebSocket.OPEN) break
+        const item = (await loadOutbox(userId))[0]   // oldest queued
+        if (!item) break
+        setMessageStatus(item.id, 'sending')
+        try {
+          await deliverMessage(item)
+          await removeOutbox(userId, item.id)
+          setMessageStatus(item.id, 'sent')
+        } catch (err) {
+          setMessageStatus(item.id, 'failed')   // left queued; retried on reconnect
+          onErrorRef.current?.(err instanceof Error ? err : new Error('Send failed.'))
+          break
+        }
+      }
+    } finally {
+      flushingRef.current = false
+    }
+  }, [userId, deliverMessage, setMessageStatus])
+  // Keep the ref current so the WS 'open' handler flushes with the latest closure.
+  flushOutboxRef.current = flushOutbox
+
+  /**
+   * Queue `text` for delivery to `to`. Resolves to the message id immediately and
+   * NEVER throws for being offline: the message is shown optimistically with a
+   * `status`, persisted to the outbox, and delivered now (if connected) or on the
+   * next reconnect. Track delivery via `message.status`.
+   */
+  const sendMessage = useCallback(
+    async (to: string, text: string): Promise<string> => {
+      const id     = newMessageId()
+      const ts     = Date.now()
+      const socket = socketRef.current
+      const online = !!socket && socket.readyState === WebSocket.OPEN
+      addMessage({ id, conversationId: to, from: userId, to, text, timestamp: ts, status: online ? 'sending' : 'queued' })
+      await enqueueOutbox({ userId, id, to, text, ts })
+      await flushOutbox()   // delivers now when connected; no-op (stays queued) when offline
       return id
     },
-    [userId, fetchPeerDeviceKeys, sendToDevice, addMessage]
+    [userId, addMessage, flushOutbox]
   )
 
   // ── At-rest storage (persist history in the developer's own database) ───────

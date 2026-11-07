@@ -30,6 +30,7 @@ import {
   savePreKeys,   loadOrCreatePreKeys,
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
   loadOrCreateStorageRootKey,
+  enqueueOutbox, loadOutbox, removeOutbox,
   loadGhostMode, saveGhostMode,
   loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
@@ -39,6 +40,13 @@ import {
 export type { PresencePayload, PresenceStatus, StoredMessageRecord }
 
 // ── Public types ──────────────────────────────────────────────────────────────
+
+/**
+ * Delivery status of a SENT message (undefined for received messages):
+ * `queued` (offline, will send on reconnect) → `sending` → `sent` (handed to the
+ * relay, not a read receipt) / `failed` (stays queued, retries on reconnect).
+ */
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
 
 export interface Message {
   /** Stable, sender-generated id — identical across every device the message reaches. */
@@ -51,6 +59,8 @@ export interface Message {
   to:             string
   text:           string
   timestamp:      number
+  /** Delivery status for messages YOU sent; undefined for received messages. */
+  status?:        MessageStatus
 }
 
 /**
@@ -123,6 +133,7 @@ interface EventMap {
   connecting:   []
   disconnected: []
   message:      [msg: Message]
+  status:       [event: { id: string; status: MessageStatus }]
   error:        [err: Error]
   wire:         [event: WireEvent]
   presence:     [event: { from: string; fromDeviceId: string; payload: PresencePayload }]
@@ -245,6 +256,10 @@ export class EncraClient {
   private _retryTimer:   ReturnType<typeof setTimeout>|null = null
   private _cancelled:    boolean                       = false
   private _connected:    boolean                       = false
+  /** True while the outbox is being flushed (serializes flushes). */
+  private _flushing:     boolean                       = false
+  /** True when the app called goOffline() — suppresses sending + auto-reconnect. */
+  private _manualOffline: boolean                      = false
 
   private readonly _listeners = new Map<string, Listener<keyof EventMap>[]>()
 
@@ -335,30 +350,33 @@ export class EncraClient {
   }
 
   /**
-   * Encrypt `text` and send it to all registered devices of `to` (and the
-   * sender's own other devices). Resolves to the message id. Throws if the
-   * WebSocket is not open.
+   * Queue `text` for delivery to `to`. Resolves to the message id immediately and
+   * NEVER throws for being offline: the message is shown optimistically with a
+   * `status`, persisted to the outbox, and delivered now (if connected) or on the
+   * next reconnect. Track delivery via `message.status` and the `status` event.
    */
   async sendMessage(to: string, text: string): Promise<string> {
-    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
-      throw new Error('Not connected. Wait for the "ready" event before sending.')
-    }
+    const id     = newMessageId()
+    const ts     = Date.now()
+    const online = !!this._socket && this._socket.readyState === WebSocket.OPEN && !this._manualOffline
 
-    const peerDevices = await this._fetchPeerDeviceKeys(to)
+    // Optimistic echo + durable outbox entry (survives reloads / offline).
+    this._addMessage({ id, conversationId: to, from: this._userId, to, text, timestamp: ts, status: online ? 'sending' : 'queued' })
+    await enqueueOutbox({ userId: this._userId, id, to, text, ts })
 
-    // One id + timestamp for this message, encoded into the ciphertext so every
-    // delivered copy shares them (dedup + stable ordering across devices).
-    const id   = newMessageId()
-    const ts   = Date.now()
-    const body = packMessagePayload({ id, to, text, ts })
+    await this._flushOutbox()   // delivers now when connected; stays queued when offline
+    return id
+  }
 
+  /** Deliver one queued message: fan out to the recipient's devices + our own. */
+  private async _deliverMessage(item: { id: string; to: string; text: string; ts: number }): Promise<void> {
+    const peerDevices = await this._fetchPeerDeviceKeys(item.to)
+    if (peerDevices.length === 0) throw new Error(`No devices found for '${item.to}'.`)
+    const body = packMessagePayload({ id: item.id, to: item.to, text: item.text, ts: item.ts })
     for (const device of peerDevices) {
-      await this._sendToDevice(to, device.deviceId, body)
+      await this._sendToDevice(item.to, device.deviceId, body)
     }
-
-    // Self-device sync: deliver to the sender's OWN other devices so the message
-    // shows up everywhere the user is logged in. Best-effort — failing here must
-    // not fail the send to the recipient. The current device is excluded.
+    // Self-device sync (best-effort): deliver to the sender's own other devices.
     try {
       const myDevices = await this._fetchPeerDeviceKeys(this._userId)
       for (const device of myDevices) {
@@ -368,9 +386,61 @@ export class EncraClient {
     } catch (err) {
       this._emit('error', err instanceof Error ? err : new Error('Self-device sync failed.'))
     }
+  }
 
-    this._addMessage({ id, conversationId: to, from: this._userId, to, text, timestamp: ts })
-    return id
+  /**
+   * Flush the persisted outbox in order. Serialized; stops at the first failure,
+   * which stays queued and retries on the next reconnect.
+   */
+  private async _flushOutbox(): Promise<void> {
+    if (this._flushing) return
+    this._flushing = true
+    try {
+      for (;;) {
+        if (!this._socket || this._socket.readyState !== WebSocket.OPEN || this._manualOffline) break
+        const item = (await loadOutbox(this._userId))[0]   // oldest queued
+        if (!item) break
+        this._setMessageStatus(item.id, 'sending')
+        try {
+          await this._deliverMessage(item)
+          await removeOutbox(this._userId, item.id)
+          this._setMessageStatus(item.id, 'sent')
+        } catch (err) {
+          this._setMessageStatus(item.id, 'failed')   // left queued; retried on reconnect
+          this._emit('error', err instanceof Error ? err : new Error('Send failed.'))
+          break
+        }
+      }
+    } finally {
+      this._flushing = false
+    }
+  }
+
+  /** Update a sent message's delivery status in place and notify listeners. */
+  private _setMessageStatus(id: string, status: MessageStatus): void {
+    const msg = this._messages.find((m) => m.id === id)
+    if (!msg || msg.status === status) return
+    msg.status = status
+    void saveMessages(this._userId, this._messages)
+    this._emit('status', { id, status })
+  }
+
+  /**
+   * Stop sending and auto-reconnecting (the socket is closed). Messages sent
+   * while offline are queued and flushed by {@link goOnline}. Useful to let users
+   * compose offline, or to demo the outbox.
+   */
+  goOffline(): void {
+    this._manualOffline = true
+    this._socket?.close()
+    this._setReady(false)
+  }
+
+  /** Resume: reconnect the relay and flush anything queued while offline. */
+  goOnline(): void {
+    if (!this._manualOffline) return
+    this._manualOffline = false
+    if (!this._cancelled) this._connectWS()
   }
 
   /**
@@ -1059,6 +1129,7 @@ export class EncraClient {
       if (!this._cancelled) {
         this._setReady(true)
         this._setConnecting(false)
+        void this._flushOutbox()   // send anything queued while offline
       }
     })
 
@@ -1113,6 +1184,7 @@ export class EncraClient {
       if (this._cancelled) return
       this._setReady(false)
       this._emit('disconnected')
+      if (this._manualOffline) return   // goOffline() closed it on purpose; don't reconnect
       const code = (event as CloseEvent | undefined)?.code
       // 4001 = auth rejected (bad/expired API key); 4003 = registration timeout.
       // Reconnecting can't fix a rejected key, so stop looping and surface it.

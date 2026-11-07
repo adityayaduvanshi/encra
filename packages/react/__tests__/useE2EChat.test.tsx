@@ -309,7 +309,7 @@ describe('useE2EChat', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('sendMessage throws when WebSocket is not connected', async () => {
+  it('queues (does not throw) when the socket is closed', async () => {
     setupMocks()
 
     const { result } = renderHook(() =>
@@ -321,7 +321,12 @@ describe('useE2EChat', () => {
     // Close the socket to simulate disconnection
     await act(async () => { mockWs.close() })
 
-    await expect(result.current.sendMessage('bob', 'hi')).rejects.toThrow('WebSocket is not connected')
+    // Previously this threw 'WebSocket is not connected'; now the message is
+    // accepted, shown optimistically, and queued for the next reconnect.
+    let id: string | undefined
+    await act(async () => { id = await result.current.sendMessage('bob', 'hi') })
+    expect(typeof id).toBe('string')
+    expect(result.current.messages.some((m) => m.id === id)).toBe(true)
   })
 
   it('marks not ready when WebSocket closes', async () => {

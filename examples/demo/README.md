@@ -62,6 +62,8 @@ a pagination problem, not a crypto one.
 - Offline queue + flush on (re)connect
 - Per-sender inbound serialization, safety numbers, auth/reconnect handling
 - Message ids + conversations, and at-rest history (`encryptForStorage` / `decryptFromStorage`)
+- Outbound queue + send status: hit **Go offline**, type (messages show ⏳ queued),
+  then **Go online** — they flush and turn ✓ sent. Nothing is lost offline.
 
 > ⚠️ The mock relay (`mock-relay.ts`) is for local demos only. It has **no auth**
 > and stores everything in process memory. Use `@encra/server` for anything real.

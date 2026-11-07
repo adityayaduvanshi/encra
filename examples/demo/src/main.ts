@@ -43,8 +43,11 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const button    = form.querySelector<HTMLButtonElement>('button')!
   const storedEl  = section.querySelector<HTMLSpanElement>('.stored')!
   const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
+  const offlineBtn = section.querySelector<HTMLButtonElement>('.offline')!
 
   let loadedOnce = false
+  let offline = false
+  const bubbles = new Map<string, HTMLDivElement>()   // id → sent bubble, for status updates
 
   const client = new EncraClient({
     apiKey:    'demo-key',
@@ -53,11 +56,17 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     serverUrl: window.location.origin,
   })
 
+  const STATUS_GLYPH: Record<string, string> = { queued: '⏳', sending: '…', sent: '✓', failed: '✗' }
+  function statusHtml(msg: Message): string {
+    if (msg.from !== userId || !msg.status) return ''
+    return ` <span class="st ${msg.status}">${STATUS_GLYPH[msg.status] ?? ''}</span>`
+  }
   function makeBubble(msg: Message): HTMLDivElement {
     const el = document.createElement('div')
     el.className = `msg ${msg.from === userId ? 'me' : 'them'}`
     el.innerHTML = `<div>${escapeHtml(msg.text)}</div>` +
-      `<div class="t">${msg.from === userId ? 'you' : msg.from} · ${new Date(msg.timestamp).toLocaleTimeString()}</div>`
+      `<div class="t">${msg.from === userId ? 'you' : msg.from} · ${new Date(msg.timestamp).toLocaleTimeString()}${statusHtml(msg)}</div>`
+    if (msg.from === userId) bubbles.set(msg.id, el)   // track sent bubbles for status updates
     return el
   }
   function addBubble(msg: Message): void {
@@ -82,8 +91,11 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     for (const rec of records) {
       // Skip any record we can't decrypt (e.g. one written under a storage key
       // that was since reset) rather than aborting the whole render.
-      try { addBubble(await client.decryptFromStorage(rec)) }
-      catch (e) { console.warn('[decrypt-skip]', userId, rec.id.slice(0, 6), (e as Error)?.message) }
+      try {
+        const msg = await client.decryptFromStorage(rec)
+        if (msg.from === userId) msg.status = 'sent'   // persisted history was delivered
+        addBubble(msg)
+      } catch (e) { console.warn('[decrypt-skip]', userId, rec.id.slice(0, 6), (e as Error)?.message) }
     }
     await refreshStored()
   }
@@ -100,6 +112,20 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   })
   client.on('disconnected', () => dot.classList.remove('on'))
   client.on('error', (err) => console.warn(`[${userId}]`, err.message))
+
+  // Update a sent bubble's status glyph (⏳ queued · … sending · ✓ sent · ✗ failed).
+  client.on('status', ({ id, status }) => {
+    const st = bubbles.get(id)?.querySelector('.st')
+    if (st) { st.className = `st ${status}`; st.textContent = STATUS_GLYPH[status] ?? '' }
+  })
+
+  // Offline toggle — demonstrates the outbox: go offline, type (messages queue
+  // with ⏳), go online, watch them flush (✓).
+  offlineBtn.addEventListener('click', () => {
+    offline = !offline
+    if (offline) { client.goOffline(); offlineBtn.textContent = 'Go online' }
+    else { client.goOnline(); offlineBtn.textContent = 'Go offline' }
+  })
 
   // Every message (sent echo + received) is shown AND persisted to the app DB as
   // an at-rest record — ciphertext in the developer's database, decryptable later.

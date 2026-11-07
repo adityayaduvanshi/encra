@@ -32,6 +32,19 @@ export interface StoredPresenceSession {
   prekey?: PreKeyMessage
 }
 
+/** A queued outbound message awaiting delivery (persisted so it survives reloads). */
+export interface StoredOutboxItem {
+  /** The userId that owns this queued send (so one store can hold many users). */
+  userId: string
+  /** Stable message id (shared with the rendered Message). */
+  id:     string
+  /** Recipient userId. */
+  to:     string
+  text:   string
+  /** Sender's send time (ms epoch). */
+  ts:     number
+}
+
 /** A stored signed prekey: X25519 pair + the identity signature over its public key. */
 export interface StoredSignedPreKey {
   keyId: number; pub: string; priv: string; signature: string
@@ -100,10 +113,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: string        // base64 at-rest storage root key
   }
+  outbox: {
+    key:   string        // `${userId}:${messageId}`
+    value: StoredOutboxItem
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 6
+const DB_VERSION = 7
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -122,6 +139,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('presence')) db.createObjectStore('presence')
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
         if (!db.objectStoreNames.contains('storagekeys')) db.createObjectStore('storagekeys')
+        if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox')
       },
     })
   }
@@ -424,4 +442,33 @@ export function loadOrCreateStorageRootKey(userId: string): Promise<Uint8Array> 
 
   storageKeyInits.set(userId, promise)
   return promise
+}
+
+// ── Outbound queue (persisted; flushed on reconnect) ──────────────────────────
+
+/** In-memory fallback when IndexedDB is unavailable, so the outbox still works
+ *  for the session (it just won't survive a reload). Key: `${userId}:${id}`. */
+const memOutbox = new Map<string, StoredOutboxItem>()
+
+/** Queue an outbound message for (re)delivery. Keyed by id, so enqueue is atomic
+ *  and race-free (no read-modify-write of a shared array). */
+export async function enqueueOutbox(item: StoredOutboxItem): Promise<void> {
+  try { await (await getDB()).put('outbox', item, `${item.userId}:${item.id}`) }
+  catch { memOutbox.set(`${item.userId}:${item.id}`, item) }
+}
+
+/** All queued sends for a user, oldest-first. */
+export async function loadOutbox(userId: string): Promise<StoredOutboxItem[]> {
+  try {
+    const all = await (await getDB()).getAll('outbox')
+    return all.filter((o) => o.userId === userId).sort((a, b) => a.ts - b.ts)
+  } catch {
+    return [...memOutbox.values()].filter((o) => o.userId === userId).sort((a, b) => a.ts - b.ts)
+  }
+}
+
+/** Remove a delivered message from the queue. */
+export async function removeOutbox(userId: string, id: string): Promise<void> {
+  try { await (await getDB()).delete('outbox', `${userId}:${id}`) }
+  catch { memOutbox.delete(`${userId}:${id}`) }
 }

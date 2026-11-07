@@ -37,6 +37,9 @@
       .msg.me   { align-self: flex-end; background: var(--bubble-me); border-bottom-right-radius: 4px; }
       .msg.them { align-self: flex-start; background: var(--bubble-them); border-bottom-left-radius: 4px; }
       .msg .t { font-size: 10px; color: var(--muted); margin-top: 3px; }
+      .msg .st { margin-left: 6px; }
+      .msg .st.failed { color: #ff8a8a; }
+      .msg .st.queued, .msg .st.sending { opacity: .75; }
       .compose { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); background: var(--panel-2); }
       .compose input {
         flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--text);
@@ -85,7 +88,7 @@
           <div class="meta">device: <span class="device">…</span></div>
         </div>
         <div class="log"></div>
-        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button></div>
         <form class="compose"><input placeholder="Message to Bob…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
 
@@ -95,7 +98,7 @@
           <div class="meta">device: <span class="device">…</span></div>
         </div>
         <div class="log"></div>
-        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button></div>
         <form class="compose"><input placeholder="Message to Alice…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
     </div>
