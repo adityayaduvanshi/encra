@@ -380,6 +380,14 @@ export async function getOrCreateDeviceId(userId: string): Promise<string> {
 
 /** In-session cache so repeated calls return the same key even without IndexedDB. */
 const storageKeyCache = new Map<string, Uint8Array>()
+/**
+ * In-flight generation locks, keyed by userId. Without this, a burst of messages
+ * persisted on first use would each find no stored key, each generate a DIFFERENT
+ * one, and race to persist (last wins) — leaving some records encrypted under a
+ * key that is no longer the stored one, so they fail to decrypt after a reload.
+ * The lock makes concurrent callers share exactly one generation.
+ */
+const storageKeyInits = new Map<string, Promise<Uint8Array>>()
 
 /**
  * Load (or create and persist) this user's at-rest storage root key — the
@@ -388,23 +396,32 @@ const storageKeyCache = new Map<string, Uint8Array>()
  * back to an in-session key (history won't survive a reload, but the primitives
  * still work).
  */
-export async function loadOrCreateStorageRootKey(userId: string): Promise<Uint8Array> {
+export function loadOrCreateStorageRootKey(userId: string): Promise<Uint8Array> {
   const cached = storageKeyCache.get(userId)
-  if (cached) return cached
+  if (cached) return Promise.resolve(cached)
+  // get → create-promise → set with no `await` between, so concurrent callers
+  // always observe and reuse the first in-flight generation.
+  const inFlight = storageKeyInits.get(userId)
+  if (inFlight) return inFlight
 
-  let key: Uint8Array
-  try {
-    const db       = await getDB()
-    const existing = await db.get('storagekeys', userId)
-    if (existing) {
-      key = importKey(existing)
-    } else {
+  const promise = (async () => {
+    let key: Uint8Array
+    try {
+      const db       = await getDB()
+      const existing = await db.get('storagekeys', userId)
+      if (existing) {
+        key = importKey(existing)
+      } else {
+        key = await generateStorageRootKey()
+        await db.put('storagekeys', exportKey(key), userId)
+      }
+    } catch {
       key = await generateStorageRootKey()
-      await db.put('storagekeys', exportKey(key), userId)
     }
-  } catch {
-    key = await generateStorageRootKey()
-  }
-  storageKeyCache.set(userId, key)
-  return key
+    storageKeyCache.set(userId, key)
+    return key
+  })().finally(() => { storageKeyInits.delete(userId) })
+
+  storageKeyInits.set(userId, promise)
+  return promise
 }

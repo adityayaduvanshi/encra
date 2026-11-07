@@ -9,6 +9,7 @@ import {
 import {
   resolveSignedPreKeyPair,
   rotateSignedPreKeyIfStale,
+  loadOrCreateStorageRootKey,
   type StoredPreKeys,
 } from '../src/ratchetStore.js'
 
@@ -70,5 +71,13 @@ describe('signed prekey retention + rotation', () => {
     const pk = await makePrekeys(Date.now())
     for (let i = 0; i < 6; i++) await rotateSignedPreKeyIfStale('u', pk, 0)
     expect(pk.previousSignedPreKeys.length).toBeLessThanOrEqual(3)
+  })
+
+  it('loadOrCreateStorageRootKey returns one stable key under concurrent first use', async () => {
+    const hex = (k: Uint8Array) => Array.from(k).join(',')
+    const keys = await Promise.all(Array.from({ length: 12 }, () => loadOrCreateStorageRootKey('concurrent-user-c')))
+    const first = hex(keys[0]!)
+    for (const k of keys) expect(hex(k)).toBe(first)
+    expect(hex(await loadOrCreateStorageRootKey('concurrent-user-c'))).toBe(first)
   })
 })

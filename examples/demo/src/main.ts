@@ -1,26 +1,26 @@
 import { EncraClient } from '@encra/client'
 import type { Message, StoredMessageRecord } from '@encra/client'
 
-/** Small page size so pagination is visible with only a handful of messages. */
-const PAGE_SIZE = 5
-
 /** POST one at-rest record into the "developer's DB" (the mock server's app DB). */
 async function saveToAppDb(userId: string, record: StoredMessageRecord): Promise<void> {
-  await fetch('/app/messages', {
+  const res = await fetch('/app/messages', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body:    JSON.stringify({ userId, record }),
   })
+  if (!res.ok) throw new Error(`app DB save failed: ${res.status}`)  // surface, don't lose silently
 }
 
-/** Load one page of at-rest records for a conversation, newest-first. */
-async function loadAppDbPage(
-  userId: string, conversationId: string, before: number | null,
-): Promise<{ records: StoredMessageRecord[]; nextBefore: number | null }> {
-  const p = new URLSearchParams({ userId, conversationId, limit: String(PAGE_SIZE) })
-  if (before !== null) p.set('before', String(before))
+/**
+ * Load the whole conversation (oldest-first) from the developer DB. The GET
+ * endpoint also supports `?before=&limit=` for real pagination (see README); the
+ * demo loads everything so nothing ever looks missing.
+ */
+async function loadConversation(userId: string, conversationId: string): Promise<StoredMessageRecord[]> {
+  const p = new URLSearchParams({ userId, conversationId, limit: '200' })
   const res = await fetch(`/app/messages?${p.toString()}`)
-  return res.json() as Promise<{ records: StoredMessageRecord[]; nextBefore: number | null }>
+  const data = (await res.json()) as { records: StoredMessageRecord[] }
+  return [...data.records].reverse()   // server returns newest-first
 }
 
 /**
@@ -43,9 +43,7 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const button    = form.querySelector<HTMLButtonElement>('button')!
   const storedEl  = section.querySelector<HTMLSpanElement>('.stored')!
   const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
-  const olderBtn  = section.querySelector<HTMLButtonElement>('.older')!
 
-  let oldestLoaded: number | null = null  // for "Load older" pagination
   let loadedOnce = false
 
   const client = new EncraClient({
@@ -77,19 +75,16 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     } catch { /* ignore */ }
   }
 
-  /** Load this conversation's history from the developer DB (newest page) and render it. */
+  /** Load the whole conversation from the developer DB and render it. */
   async function loadFromDb(): Promise<void> {
     log.innerHTML = ''
-    oldestLoaded = null
-    const { records, nextBefore } = await loadAppDbPage(userId, peerId, null)
-    // Records come newest-first; render oldest-first. Skip any record we can't
-    // decrypt (e.g. one written under a storage key that was since reset).
-    for (const rec of [...records].reverse()) {
+    const records = await loadConversation(userId, peerId)   // oldest-first
+    for (const rec of records) {
+      // Skip any record we can't decrypt (e.g. one written under a storage key
+      // that was since reset) rather than aborting the whole render.
       try { addBubble(await client.decryptFromStorage(rec)) }
       catch (e) { console.warn('[decrypt-skip]', userId, rec.id.slice(0, 6), (e as Error)?.message) }
     }
-    oldestLoaded = records.length ? records[records.length - 1]!.timestamp : null
-    olderBtn.hidden = nextBefore === null
     await refreshStored()
   }
 
@@ -122,18 +117,6 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   // "Reload from DB" — clear the pane and re-render purely from the encrypted
   // records in the developer's DB (same path used automatically on open).
   rehydrate.addEventListener('click', () => { void loadFromDb() })
-
-  // "Load older" — fetch the previous page and prepend it (decrypt-on-demand).
-  olderBtn.addEventListener('click', async () => {
-    const { records, nextBefore } = await loadAppDbPage(userId, peerId, oldestLoaded)
-    for (const rec of records) {                    // newest-first → prepend keeps order
-      try {
-        log.insertBefore(makeBubble(await client.decryptFromStorage(rec)), log.firstChild)
-      } catch { /* skip undecryptable */ }
-    }
-    if (records.length) oldestLoaded = records[records.length - 1]!.timestamp
-    olderBtn.hidden = nextBefore === null
-  })
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
