@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { EncraClient, MAX_FILE_BYTES } from '../src/EncraClient.js'
-import type { EncryptedFile, EncryptedFields } from '../src/EncraClient.js'
+import type { EncryptedFile, EncryptedFields, Message } from '../src/EncraClient.js'
 import * as ratchetStore from '../src/ratchetStore.js'
 import { sodiumReady, generateKeyPair, exportKey } from '@encra/core'
 
@@ -399,6 +399,49 @@ describe('EncraClient', () => {
     await new Promise((r) => setTimeout(r, 100))
 
     expect(bobReceived).toEqual(['hello bob 🔐'])
+    cleanup()
+  })
+
+  it('assigns a stable id, groups by conversation, and does not duplicate on re-delivery', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('conv-alice', 'conv-bob')
+    const bobMsgs: Message[] = []
+    bob.on('message', (m) => bobMsgs.push(m))
+
+    const aliceSocket = socketFor('conv-alice')!
+    const bobSocket   = socketFor('conv-bob')!
+
+    const id = await alice.sendMessage('conv-bob', 'hi bob')
+    expect(typeof id).toBe('string')
+
+    // Sender side: the message is grouped under the recipient, with from/to/id.
+    const aliceThread = alice.conversation('conv-bob')
+    expect(aliceThread.map((m) => m.text)).toEqual(['hi bob'])
+    expect(aliceThread[0]!.id).toBe(id)
+    expect(aliceThread[0]!.from).toBe('conv-alice')
+    expect(aliceThread[0]!.to).toBe('conv-bob')
+    expect(Object.keys(alice.conversations)).toEqual(['conv-bob'])
+
+    // Relay the frame to Bob — then deliver it a SECOND time.
+    const frame = aliceSocket.sentMessages.find((m) => {
+      const p = JSON.parse(m) as { type: string; to?: string }
+      return p.type === 'message' && p.to === 'conv-bob'
+    })!
+    const sent = JSON.parse(frame) as Record<string, unknown>
+    const wire = JSON.stringify({
+      type: 'message', from: 'conv-alice', fromDeviceId: TEST_DEVICE_ID,
+      ciphertext: sent['ciphertext'], nonce: sent['nonce'], encHeader: sent['encHeader'], prekey: sent['prekey'],
+    })
+    bobSocket.simulateMessage(wire)
+    await new Promise((r) => setTimeout(r, 100))
+    bobSocket.simulateMessage(wire)  // re-delivery must not surface a duplicate
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Receiver side: exactly one message, same id, grouped under the sender.
+    expect(bobMsgs).toHaveLength(1)
+    expect(bobMsgs[0]!.id).toBe(id)
+    expect(bobMsgs[0]!.text).toBe('hi bob')
+    expect(bobMsgs[0]!.conversationId).toBe('conv-alice')
+    expect(bob.conversation('conv-alice')).toHaveLength(1)
     cleanup()
   })
 

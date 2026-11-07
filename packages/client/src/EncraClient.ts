@@ -8,6 +8,8 @@ import {
   generateOneTimePreKeys,
   generateSafetyNumber,
   identityPublicToX25519,
+  packMessagePayload,
+  unpackMessagePayload,
   buildPreKeyBundle,
   x3dhInitiate,
   x3dhRespond,
@@ -36,9 +38,16 @@ export type { PresencePayload, PresenceStatus }
 // ── Public types ──────────────────────────────────────────────────────────────
 
 export interface Message {
-  from:      string
-  text:      string
-  timestamp: number
+  /** Stable, sender-generated id — identical across every device the message reaches. */
+  id:             string
+  /** The conversation peer, from THIS user's point of view (group by this to render threads). */
+  conversationId: string
+  /** Sender userId. */
+  from:           string
+  /** Recipient userId. */
+  to:             string
+  text:           string
+  timestamp:      number
 }
 
 /**
@@ -148,6 +157,34 @@ const OTP_POOL_SIZE      = 100
 /** Replenish the one-time prekey pool when it drops to this many or fewer. */
 const OTP_LOW_WATER      = 20
 
+/** Generate a stable, unique message id (UUID when available). */
+function newMessageId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** The conversation peer for a message, from `me`'s point of view. */
+function conversationFor(me: string, from: string, to: string): string {
+  return from === me ? to : from
+}
+
+/** Normalise a possibly-legacy stored message into a full `Message` (back-compat). */
+function normalizeStored(
+  m: Partial<Message> & { from: string; text: string; timestamp: number },
+  me: string,
+): Message {
+  const to = m.to ?? (m.from === me ? '' : me)
+  return {
+    id:             m.id ?? newMessageId(),
+    conversationId: m.conversationId ?? conversationFor(me, m.from, to),
+    from:           m.from,
+    to,
+    text:           m.text,
+    timestamp:      m.timestamp,
+  }
+}
+
 /** Maximum file size accepted by `encryptFile` (50 MB). */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024
 
@@ -191,6 +228,8 @@ export class EncraClient {
    * state concurrently (which corrupts the session under bursty traffic).
    */
   private _inboundChains:    Map<string, Promise<void>>            = new Map()
+  /** Ids of messages already in state — dedupes re-delivered/self-synced copies. */
+  private _seenIds:          Set<string>                           = new Set()
   private _peerKeyCache:     Map<string, DeviceKey[]>              = new Map()
   private _peerKeyCacheTime: Map<string, number>                   = new Map()
   // Presence: directional X3DH session keys + the prekey to attach outbound.
@@ -226,6 +265,16 @@ export class EncraClient {
   get isConnecting(): boolean    { return this._isConnecting }
   get error():        Error|null { return this._error }
   get messages():     Message[]  { return this._messages }
+  /** Messages grouped by conversation peer (`conversationId`). */
+  get conversations(): Record<string, Message[]> {
+    const grouped: Record<string, Message[]> = {}
+    for (const m of this._messages) (grouped[m.conversationId] ??= []).push(m)
+    return grouped
+  }
+  /** Messages in the conversation with `peerId`, in arrival order. */
+  conversation(peerId: string): Message[] {
+    return this._messages.filter((m) => m.conversationId === peerId)
+  }
   /** This device's stable ID (available after `connect()` resolves). */
   get deviceId():     string | null { return this._deviceId }
   /** True if ghost mode is active — presence broadcasts are suppressed. */
@@ -283,18 +332,25 @@ export class EncraClient {
   }
 
   /**
-   * Encrypt `text` and send it to all registered devices of `to`.
-   * Throws if the WebSocket is not open.
+   * Encrypt `text` and send it to all registered devices of `to` (and the
+   * sender's own other devices). Resolves to the message id. Throws if the
+   * WebSocket is not open.
    */
-  async sendMessage(to: string, text: string): Promise<void> {
+  async sendMessage(to: string, text: string): Promise<string> {
     if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
       throw new Error('Not connected. Wait for the "ready" event before sending.')
     }
 
     const peerDevices = await this._fetchPeerDeviceKeys(to)
 
+    // One id + timestamp for this message, encoded into the ciphertext so every
+    // delivered copy shares them (dedup + stable ordering across devices).
+    const id   = newMessageId()
+    const ts   = Date.now()
+    const body = packMessagePayload({ id, to, text, ts })
+
     for (const device of peerDevices) {
-      await this._sendToDevice(to, device.deviceId, text)
+      await this._sendToDevice(to, device.deviceId, body)
     }
 
     // Self-device sync: deliver to the sender's OWN other devices so the message
@@ -304,28 +360,33 @@ export class EncraClient {
       const myDevices = await this._fetchPeerDeviceKeys(this._userId)
       for (const device of myDevices) {
         if (device.deviceId === this._deviceId) continue
-        await this._sendToDevice(this._userId, device.deviceId, text)
+        await this._sendToDevice(this._userId, device.deviceId, body)
       }
     } catch (err) {
       this._emit('error', err instanceof Error ? err : new Error('Self-device sync failed.'))
     }
 
-    this._addMessage({ from: this._userId, text, timestamp: Date.now() })
+    this._addMessage({ id, conversationId: to, from: this._userId, to, text, timestamp: ts })
+    return id
   }
 
-  /** Encrypt `text` for one recipient device and push it over the socket. */
-  private async _sendToDevice(peerId: string, deviceId: string, text: string): Promise<void> {
-    const ratchet = await this._getOrInitSenderRatchet(peerId, deviceId)
-    const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
-    await saveRatchet(this._userId, `s:${peerId}:${deviceId}`, ratchet.export())
+  /**
+   * Encrypt an already-packed `body` for one route target device and push it over
+   * the socket. `routePeerId` is the delivery target (the recipient, or our own
+   * userId for self-sync); the conversation peer is encoded inside `body`.
+   */
+  private async _sendToDevice(routePeerId: string, deviceId: string, body: string): Promise<void> {
+    const ratchet = await this._getOrInitSenderRatchet(routePeerId, deviceId)
+    const { encHeader, ciphertext, nonce } = await ratchet.encrypt(body)
+    await saveRatchet(this._userId, `s:${routePeerId}:${deviceId}`, ratchet.export())
 
-    const pending = this._pendingPrekey.get(`${peerId}:${deviceId}`)
+    const pending = this._pendingPrekey.get(`${routePeerId}:${deviceId}`)
     const ctB64   = exportKey(ciphertext)
     const nB64    = exportKey(nonce)
     const ehB64   = exportKey(encHeader)
 
     this._socket!.send(JSON.stringify({
-      type: 'message', to: peerId, toDeviceId: deviceId,
+      type: 'message', to: routePeerId, toDeviceId: deviceId,
       ciphertext: ctB64, nonce: nB64, encHeader: ehB64,
       ...(pending && { prekey: pending }),
     }))
@@ -727,6 +788,8 @@ export class EncraClient {
   private _setConnecting(v: boolean) { this._isConnecting = v; if (v) this._emit('connecting') }
 
   private _addMessage(msg: Message): void {
+    if (this._seenIds.has(msg.id)) return   // dedupe re-delivered / self-synced copies
+    this._seenIds.add(msg.id)
     const next = [...this._messages, msg]
     this._messages = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
     void saveMessages(this._userId, this._messages)
@@ -1055,7 +1118,7 @@ export class EncraClient {
   private async _handleInboundMessage(msg: WireMessage): Promise<void> {
     try {
       const ratchet = await this._getOrInitReceiverRatchet(msg.from!, msg.fromDeviceId!, msg.prekey)
-      const text    = await ratchet.decrypt({
+      const body    = await ratchet.decrypt({
         encHeader:  importKey(msg.encHeader!),
         ciphertext: importKey(msg.ciphertext!),
         nonce:      importKey(msg.nonce!),
@@ -1064,7 +1127,18 @@ export class EncraClient {
       // We've heard from this peer device — stop attaching our prekey message.
       this._pendingPrekey.delete(`${msg.from}:${msg.fromDeviceId}`)
       if (!this._cancelled) {
-        this._addMessage({ from: msg.from!, text, timestamp: Date.now() })
+        // id + conversation peer travel inside the ciphertext, so every copy agrees.
+        const { id, to, text, ts } = unpackMessagePayload(body)
+        const from = msg.from!
+        const peer = to ?? (from === this._userId ? '' : this._userId)
+        this._addMessage({
+          id:             id ?? newMessageId(),
+          conversationId: conversationFor(this._userId, from, peer),
+          from,
+          to:             peer,
+          text,
+          timestamp:      ts ?? Date.now(),
+        })
       }
     } catch (err) {
       // Surface EVERY receive error. Previously only DecryptionFailedError was
@@ -1100,8 +1174,12 @@ export class EncraClient {
     this._deviceId = await getOrCreateDeviceId(this._userId)
 
     // Restore message history
-    const history = await loadMessages(this._userId)
-    if (history.length > 0) this._messages = history
+    // Normalise any legacy records that predate ids/conversations, and seed dedup.
+    const history = (await loadMessages(this._userId)).map((m) => normalizeStored(m, this._userId))
+    if (history.length > 0) {
+      this._messages = history
+      this._seenIds  = new Set(history.map((m) => m.id))
+    }
 
     // Restore ghost-mode preference
     this._ghostMode = await loadGhostMode(this._userId)

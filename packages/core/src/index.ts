@@ -46,4 +46,7 @@ export {
 } from './crypto/presence.js'
 export type { PresenceStatus, PresencePayload, EncryptedPresence } from './crypto/presence.js'
 
+export { packMessagePayload, unpackMessagePayload } from './message.js'
+export type { MessageEnvelope, DecodedMessage } from './message.js'
+
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

@@ -8,11 +8,15 @@ import {
   importKey,
 } from '@encra/core'
 
-/** Shape of a single persisted chat message. */
+/** Shape of a single persisted chat message. (id/to/conversationId optional for
+ *  back-compat with records written before conversation support.) */
 export interface StoredMessage {
-  from:      string
-  text:      string
-  timestamp: number
+  id?:             string
+  conversationId?: string
+  from:            string
+  to?:             string
+  text:            string
+  timestamp:       number
 }
 
 /**

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   generateKeyPair,
   exportKey,
@@ -9,6 +9,8 @@ import {
   generateOneTimePreKeys,
   generateSafetyNumber,
   identityPublicToX25519,
+  packMessagePayload,
+  unpackMessagePayload,
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
@@ -24,7 +26,18 @@ import {
 } from './ratchetStore.js'
 
 export interface Message {
+  /** Stable, sender-generated id — identical across every device the message reaches. */
+  id: string
+  /**
+   * The peer this message's conversation is with, from THIS user's point of
+   * view (the other party in a 1:1 thread). Group messages by this to render
+   * separate conversations.
+   */
+  conversationId: string
+  /** Sender userId. */
   from: string
+  /** Recipient userId. */
+  to: string
   text: string
   timestamp: number
 }
@@ -63,12 +76,16 @@ export interface UseE2EChatOptions {
 }
 
 export interface UseE2EChatResult {
+  /** All messages across every conversation, in arrival order. */
   messages: Message[]
+  /** Messages grouped by `conversationId` (the peer), for rendering one thread at a time. */
+  conversations: Record<string, Message[]>
   /** True when the WebSocket is open and the user is registered. */
   isReady: boolean
   /** True during the initial connection or a reconnect attempt. */
   isConnecting: boolean
-  sendMessage: (to: string, text: string) => Promise<void>
+  /** Encrypt and deliver `text` to `to` (and the sender's own devices). Resolves to the message id. */
+  sendMessage: (to: string, text: string) => Promise<string>
   /**
    * Compute the conversation safety number with `peerId` — a 60-digit code that
    * is identical on both sides when no man-in-the-middle is present. Show it to
@@ -106,6 +123,31 @@ const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
 const OTP_POOL_SIZE    = 100
 /** Replenish the one-time prekey pool when it drops to this many or fewer. */
 const OTP_LOW_WATER    = 20
+
+/** Generate a stable, unique message id (UUID when available). */
+function newMessageId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** The conversation peer for a message, from `me`'s point of view. */
+function conversationFor(me: string, from: string, to: string): string {
+  return from === me ? to : from
+}
+
+/** Normalise a possibly-legacy stored message into a full `Message` (back-compat). */
+function normalizeStored(m: Partial<Message> & { from: string; text: string; timestamp: number }, me: string): Message {
+  const to = m.to ?? (m.from === me ? '' : me)
+  return {
+    id:             m.id ?? newMessageId(),
+    conversationId: m.conversationId ?? conversationFor(me, m.from, to),
+    from:           m.from,
+    to,
+    text:           m.text,
+    timestamp:      m.timestamp,
+  }
+}
 
 /**
  * React hook for sending and receiving end-to-end encrypted messages.
@@ -164,6 +206,20 @@ export function useE2EChat({
    * Different senders still run in parallel.
    */
   const inboundChainsRef    = useRef<Map<string, Promise<void>>>(new Map())
+  /** Ids of messages already in state — for deduping re-delivered/self-synced copies. */
+  const seenIdsRef          = useRef<Set<string>>(new Set())
+
+  /** Append a message if its id hasn't been seen, capping and persisting history. */
+  const addMessage = useCallback((m: Message): void => {
+    if (seenIdsRef.current.has(m.id)) return
+    seenIdsRef.current.add(m.id)
+    setMessages((prev) => {
+      const next   = [...prev, m]
+      const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+      void saveMessages(userId, capped)
+      return capped
+    })
+  }, [userId])
 
   // Stable refs so callbacks can change without restarting the effect
   const onErrorRef       = useRef(onError)
@@ -469,7 +525,7 @@ export function useE2EChat({
     async function handleInboundMessage(msg: WireMessage): Promise<void> {
       try {
         const ratchet = await getOrInitReceiverRatchet(msg.from!, msg.fromDeviceId!, msg.prekey)
-        const text    = await ratchet.decrypt({
+        const body    = await ratchet.decrypt({
           encHeader:  importKey(msg.encHeader!),
           ciphertext: importKey(msg.ciphertext!),
           nonce:      importKey(msg.nonce!),
@@ -478,11 +534,18 @@ export function useE2EChat({
         // We've heard from this peer device — stop attaching our prekey message.
         pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
         if (!cancelled) {
-          setMessages((prev) => {
-            const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
-            const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
-            void saveMessages(userId, capped)
-            return capped
+          // The id and conversation peer travel INSIDE the ciphertext, so every
+          // copy (recipient + the sender's own synced devices) agrees on them.
+          const { id, to, text, ts } = unpackMessagePayload(body)
+          const from = msg.from!
+          const peer = to ?? (from === userId ? '' : userId)
+          addMessage({
+            id:             id ?? newMessageId(),
+            conversationId: conversationFor(userId, from, peer),
+            from,
+            to:             peer,
+            text,
+            timestamp:      ts ?? Date.now(),
           })
         }
       } catch (err) {
@@ -591,9 +654,13 @@ export function useE2EChat({
           await saveKeyPair(userId, { pub: exportKey(kp.publicKey), priv: exportKey(kp.privateKey) })
         }
 
-        // Restore message history before opening the WebSocket
-        const storedMsgs = await loadMessages(userId)
-        if (!cancelled && storedMsgs.length > 0) setMessages(storedMsgs)
+        // Restore message history before opening the WebSocket (normalising any
+        // legacy records that predate ids/conversations, and seeding the dedup set).
+        const storedMsgs = (await loadMessages(userId)).map((m) => normalizeStored(m, userId))
+        if (!cancelled && storedMsgs.length > 0) {
+          seenIdsRef.current = new Set(storedMsgs.map((m) => m.id))
+          setMessages(storedMsgs)
+        }
 
         if (cancelled) return
 
@@ -641,26 +708,28 @@ export function useE2EChat({
       peerKeyCacheTimeRef.current.clear()
       inboundChainsRef.current.clear()
     }
-  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys])
+  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys, addMessage])
 
   /**
-   * Encrypt `text` for one recipient device and push it over the socket.
-   * Shared by the recipient-fanout and the sender's own-device fanout.
+   * Encrypt an already-packed message `body` for one route target device and
+   * push it over the socket. `routePeerId` is the delivery target (the recipient,
+   * or our own userId for self-sync); the conversation peer is encoded inside
+   * `body`, so self-synced copies still land in the right thread.
    */
   const sendToDevice = useCallback(
-    async (socket: WebSocket, peerId: string, deviceId: string, text: string): Promise<void> => {
-      const ratchet = await getOrInitSenderRatchet(peerId, deviceId)
-      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
-      await saveRatchet(userId, `s:${peerId}:${deviceId}`, ratchet.export())
+    async (socket: WebSocket, routePeerId: string, deviceId: string, body: string): Promise<void> => {
+      const ratchet = await getOrInitSenderRatchet(routePeerId, deviceId)
+      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(body)
+      await saveRatchet(userId, `s:${routePeerId}:${deviceId}`, ratchet.export())
 
-      const pending = pendingPrekeyRef.current.get(`${peerId}:${deviceId}`)
+      const pending = pendingPrekeyRef.current.get(`${routePeerId}:${deviceId}`)
       const ctB64 = exportKey(ciphertext)
       const nB64  = exportKey(nonce)
       const ehB64 = exportKey(encHeader)
 
       socket.send(JSON.stringify({
         type:       'message',
-        to:         peerId,
+        to:         routePeerId,
         toDeviceId: deviceId,
         ciphertext: ctB64,
         nonce:      nB64,
@@ -683,7 +752,7 @@ export function useE2EChat({
    * @throws {Error} If the WebSocket is not connected or the recipient has no keys.
    */
   const sendMessage = useCallback(
-    async (to: string, text: string): Promise<void> => {
+    async (to: string, text: string): Promise<string> => {
       const socket = socketRef.current
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         throw new Error('WebSocket is not connected. Wait for isReady to be true.')
@@ -695,35 +764,44 @@ export function useE2EChat({
         throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
       }
 
-      // Send one encrypted message per recipient device.
+      // One id + timestamp for this message, encoded into the ciphertext so every
+      // delivered copy shares them (dedup + stable ordering across devices).
+      const id   = newMessageId()
+      const ts   = Date.now()
+      const body = packMessagePayload({ id, to, text, ts })
+
+      // Send one encrypted copy per recipient device.
       for (const device of peerDevices) {
-        await sendToDevice(socket, to, device.deviceId, text)
+        await sendToDevice(socket, to, device.deviceId, body)
       }
 
       // Self-device sync: also deliver to the sender's OWN other devices so the
-      // message appears everywhere the user is logged in (not just the device it
-      // was typed on). Best-effort — a failure here must not fail the send to
-      // the recipient. The current device is excluded so we never echo to self.
+      // message appears everywhere the user is logged in. Best-effort — a failure
+      // here must not fail the send to the recipient. The current device is
+      // excluded so we never echo to self.
       try {
         const myDevices = await fetchPeerDeviceKeys(userId)
         for (const device of myDevices) {
           if (device.deviceId === deviceIdRef.current) continue
-          await sendToDevice(socket, userId, device.deviceId, text)
+          await sendToDevice(socket, userId, device.deviceId, body)
         }
       } catch (err) {
         onErrorRef.current?.(err instanceof Error ? err : new Error('Self-device sync failed.'))
       }
 
-      // Add sent message to local state once (not once per device)
-      setMessages((prev) => {
-        const next   = [...prev, { from: userId, text, timestamp: Date.now() }]
-        const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
-        void saveMessages(userId, capped)
-        return capped
-      })
+      // Add the sent message to local state once (deduped by id).
+      addMessage({ id, conversationId: to, from: userId, to, text, timestamp: ts })
+      return id
     },
-    [userId, fetchPeerDeviceKeys, sendToDevice]
+    [userId, fetchPeerDeviceKeys, sendToDevice, addMessage]
   )
 
-  return { messages, isReady, isConnecting, sendMessage, getSafetyNumber, error }
+  // Group messages by conversation peer so apps can render one thread at a time.
+  const conversations = useMemo(() => {
+    const grouped: Record<string, Message[]> = {}
+    for (const m of messages) (grouped[m.conversationId] ??= []).push(m)
+    return grouped
+  }, [messages])
+
+  return { messages, conversations, isReady, isConnecting, sendMessage, getSafetyNumber, error }
 }
