@@ -29,6 +29,11 @@ export function mockRelay(): Plugin {
   const clients  = new Map<string, WebSocket>()
   // `${userId}:${deviceId}` -> queued payload strings (offline queue)
   const queue    = new Map<string, string[]>()
+  // The DEVELOPER's own app database (NOT part of Encra's zero-knowledge relay):
+  // userId -> at-rest message records (ciphertext + queryable metadata). This is
+  // what `encryptForStorage` records get persisted into; `decryptFromStorage`
+  // reads them back. It only ever holds ciphertext.
+  const appDb    = new Map<string, Array<{ id: string; conversationId: string; timestamp: number; ciphertext: string; nonce: string }>>()
 
   const log = (...a: unknown[]) => console.log('[mock-relay]', ...a)
 
@@ -53,7 +58,7 @@ export function mockRelay(): Plugin {
 
   function handleHttp(req: IncomingMessage, res: ServerResponse, next: () => void): void {
     const url = req.url ?? ''
-    if (!url.startsWith('/v1/')) return next()
+    if (!url.startsWith('/v1/') && !url.startsWith('/app/')) return next()
     const { pathname, searchParams } = new URL(url, 'http://localhost')
     const parts = pathname.split('/').filter(Boolean) // ['v1','keys',...]
 
@@ -110,6 +115,40 @@ export function mockRelay(): Plugin {
             signedPreKey: rec.signedPreKey,
             ...(otp ? { oneTimePreKey: otp } : {}),
           })
+        }
+
+        // ── POST /app/messages — the developer's DB persists one at-rest record ─
+        if (pathname === '/app/messages' && req.method === 'POST') {
+          const b = (await readBody(req)) as {
+            userId: string
+            record: { id: string; conversationId: string; timestamp: number; ciphertext: string; nonce: string }
+          }
+          const list = appDb.get(b.userId) ?? []
+          if (!list.some((r) => r.id === b.record.id)) list.push(b.record)  // dedupe by id
+          appDb.set(b.userId, list)
+          return sendJson(res, 201, { ok: true, count: list.length })
+        }
+
+        // ── GET /app/messages — paginated load (newest-first) ──────────────────
+        //   ?userId=&conversationId=&limit=&before=<timestamp>
+        if (pathname === '/app/messages' && req.method === 'GET') {
+          const uid    = searchParams.get('userId') ?? ''
+          const convId = searchParams.get('conversationId')
+          const limit  = Math.min(parseInt(searchParams.get('limit') ?? '20', 10) || 20, 200)
+          const before = searchParams.get('before') ? Number(searchParams.get('before')) : null
+          let rows = (appDb.get(uid) ?? []).slice()
+          if (convId) rows = rows.filter((r) => r.conversationId === convId)
+          rows.sort((a, b) => b.timestamp - a.timestamp)               // newest first
+          if (before !== null) rows = rows.filter((r) => r.timestamp < before)
+          const page = rows.slice(0, limit)
+          const nextBefore = rows.length > limit ? page[page.length - 1]!.timestamp : null
+          return sendJson(res, 200, { records: page, nextBefore })
+        }
+
+        // ── POST /app/reset — clear the developer DB (demo "reset" button) ─────
+        if (pathname === '/app/reset' && req.method === 'POST') {
+          appDb.clear()
+          return sendJson(res, 200, { ok: true })
         }
 
         return sendJson(res, 404, { error: 'not found' })

@@ -49,4 +49,12 @@ export type { PresenceStatus, PresencePayload, EncryptedPresence } from './crypt
 export { packMessagePayload, unpackMessagePayload } from './message.js'
 export type { MessageEnvelope, DecodedMessage } from './message.js'
 
+export {
+  generateStorageRootKey,
+  deriveConversationKey,
+  encryptForStorage,
+  decryptFromStorage,
+} from './storage.js'
+export type { ChatMessage, StoredMessageRecord } from './storage.js'
+
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

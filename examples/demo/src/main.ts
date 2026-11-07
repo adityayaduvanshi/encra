@@ -1,5 +1,27 @@
 import { EncraClient } from '@encra/client'
-import type { Message } from '@encra/client'
+import type { Message, StoredMessageRecord } from '@encra/client'
+
+/** Small page size so pagination is visible with only a handful of messages. */
+const PAGE_SIZE = 5
+
+/** POST one at-rest record into the "developer's DB" (the mock server's app DB). */
+async function saveToAppDb(userId: string, record: StoredMessageRecord): Promise<void> {
+  await fetch('/app/messages', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ userId, record }),
+  })
+}
+
+/** Load one page of at-rest records for a conversation, newest-first. */
+async function loadAppDbPage(
+  userId: string, conversationId: string, before: number | null,
+): Promise<{ records: StoredMessageRecord[]; nextBefore: number | null }> {
+  const p = new URLSearchParams({ userId, conversationId, limit: String(PAGE_SIZE) })
+  if (before !== null) p.set('before', String(before))
+  const res = await fetch(`/app/messages?${p.toString()}`)
+  return res.json() as Promise<{ records: StoredMessageRecord[]; nextBefore: number | null }>
+}
 
 /**
  * Wires one chat panel (`<section data-user=... data-peer=...>`) to its own
@@ -10,12 +32,18 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const userId = section.dataset.user!
   const peerId = section.dataset.peer!
 
-  const dot    = section.querySelector<HTMLSpanElement>('.dot')!
-  const device = section.querySelector<HTMLSpanElement>('.device')!
-  const log     = section.querySelector<HTMLDivElement>('.log')!
-  const form    = section.querySelector<HTMLFormElement>('.compose')!
-  const input   = section.querySelector<HTMLInputElement>('input')!
-  const button  = section.querySelector<HTMLButtonElement>('button')!
+  const dot      = section.querySelector<HTMLSpanElement>('.dot')!
+  const device   = section.querySelector<HTMLSpanElement>('.device')!
+  const log       = section.querySelector<HTMLDivElement>('.log')!
+  const form      = section.querySelector<HTMLFormElement>('.compose')!
+  const input     = section.querySelector<HTMLInputElement>('input')!
+  const button    = section.querySelector<HTMLButtonElement>('button')!
+  const storedEl  = section.querySelector<HTMLSpanElement>('.stored')!
+  const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
+  const olderBtn  = section.querySelector<HTMLButtonElement>('.older')!
+
+  let storedCount   = 0
+  let oldestLoaded: number | null = null  // for "Load older" pagination
 
   const client = new EncraClient({
     apiKey:    'demo-key',
@@ -24,12 +52,15 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     serverUrl: window.location.origin,
   })
 
-  function addBubble(msg: Message): void {
+  function makeBubble(msg: Message): HTMLDivElement {
     const el = document.createElement('div')
     el.className = `msg ${msg.from === userId ? 'me' : 'them'}`
     el.innerHTML = `<div>${escapeHtml(msg.text)}</div>` +
       `<div class="t">${msg.from === userId ? 'you' : msg.from} · ${new Date(msg.timestamp).toLocaleTimeString()}</div>`
-    log.appendChild(el)
+    return el
+  }
+  function addBubble(msg: Message): void {
+    log.appendChild(makeBubble(msg))
     log.scrollTop = log.scrollHeight
   }
 
@@ -41,8 +72,42 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     input.focus()
   })
   client.on('disconnected', () => dot.classList.remove('on'))
-  client.on('message', addBubble)
   client.on('error', (err) => console.warn(`[${userId}]`, err.message))
+
+  // Every message (sent echo + received) is shown AND persisted to the app DB as
+  // an at-rest record — ciphertext in the developer's database, decryptable later.
+  client.on('message', async (msg) => {
+    addBubble(msg)
+    try {
+      const record = await client.encryptForStorage(msg)
+      await saveToAppDb(userId, record)
+      storedEl.textContent = String(++storedCount)
+    } catch (err) {
+      console.warn(`[${userId}] store failed:`, err)
+    }
+  })
+
+  // "Reload from DB" — simulate opening the app fresh: clear the pane and
+  // re-render purely from the encrypted records in the developer's DB.
+  rehydrate.addEventListener('click', async () => {
+    log.innerHTML = ''
+    oldestLoaded = null
+    const { records, nextBefore } = await loadAppDbPage(userId, peerId, null)
+    // Records come newest-first; render oldest-first.
+    for (const rec of [...records].reverse()) addBubble(await client.decryptFromStorage(rec))
+    oldestLoaded = records.length ? records[records.length - 1]!.timestamp : null
+    olderBtn.hidden = nextBefore === null
+  })
+
+  // "Load older" — fetch the previous page and prepend it (decrypt-on-demand).
+  olderBtn.addEventListener('click', async () => {
+    const { records, nextBefore } = await loadAppDbPage(userId, peerId, oldestLoaded)
+    for (const rec of records) {                    // newest-first → prepend keeps order
+      log.insertBefore(makeBubble(await client.decryptFromStorage(rec)), log.firstChild)
+    }
+    if (records.length) oldestLoaded = records[records.length - 1]!.timestamp
+    olderBtn.hidden = nextBefore === null
+  })
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
@@ -82,8 +147,9 @@ document.getElementById('safety')!.addEventListener('click', async () => {
 })
 
 // ── Reset: wipe this origin's IndexedDB and reload for a clean session ───────
-document.getElementById('reset')!.addEventListener('click', () => {
+document.getElementById('reset')!.addEventListener('click', async () => {
   panels.forEach((p) => p.client.disconnect())
+  try { await fetch('/app/reset', { method: 'POST' }) } catch { /* ignore */ }
   const req = indexedDB.deleteDatabase('encra-v1')
   req.onsuccess = req.onerror = req.onblocked = () => window.location.reload()
 })

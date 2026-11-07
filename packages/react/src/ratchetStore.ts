@@ -4,6 +4,7 @@ import {
   generateIdentityKeyPair,
   generateSignedPreKey,
   generateOneTimePreKeys,
+  generateStorageRootKey,
   exportKey,
   importKey,
 } from '@encra/core'
@@ -95,10 +96,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // userId
     value: { ghostMode: boolean }
   }
+  storagekeys: {
+    key:   string        // userId
+    value: string        // base64 at-rest storage root key
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 5
+const DB_VERSION = 6
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -116,6 +121,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('prekeys'))  db.createObjectStore('prekeys')
         if (!db.objectStoreNames.contains('presence')) db.createObjectStore('presence')
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
+        if (!db.objectStoreNames.contains('storagekeys')) db.createObjectStore('storagekeys')
       },
     })
   }
@@ -370,4 +376,35 @@ export async function getOrCreateDeviceId(userId: string): Promise<string> {
   } catch {
     return 'default'
   }
+}
+
+/** In-session cache so repeated calls return the same key even without IndexedDB. */
+const storageKeyCache = new Map<string, Uint8Array>()
+
+/**
+ * Load (or create and persist) this user's at-rest storage root key — the
+ * long-lived key behind `encryptForStorage`/`decryptFromStorage`. Held only on
+ * this device; never sent to any server. If IndexedDB is unavailable it falls
+ * back to an in-session key (history won't survive a reload, but the primitives
+ * still work).
+ */
+export async function loadOrCreateStorageRootKey(userId: string): Promise<Uint8Array> {
+  const cached = storageKeyCache.get(userId)
+  if (cached) return cached
+
+  let key: Uint8Array
+  try {
+    const db       = await getDB()
+    const existing = await db.get('storagekeys', userId)
+    if (existing) {
+      key = importKey(existing)
+    } else {
+      key = await generateStorageRootKey()
+      await db.put('storagekeys', exportKey(key), userId)
+    }
+  } catch {
+    key = await generateStorageRootKey()
+  }
+  storageKeyCache.set(userId, key)
+  return key
 }

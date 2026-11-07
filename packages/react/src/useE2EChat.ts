@@ -11,19 +11,24 @@ import {
   identityPublicToX25519,
   packMessagePayload,
   unpackMessagePayload,
+  encryptForStorage as encryptForStorageCore,
+  decryptFromStorage as decryptFromStorageCore,
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage, StoredMessageRecord } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
+  loadOrCreateStorageRootKey,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
+
+export type { StoredMessageRecord }
 
 export interface Message {
   /** Stable, sender-generated id — identical across every device the message reaches. */
@@ -93,6 +98,15 @@ export interface UseE2EChatResult {
    * published prekeys yet.
    */
   getSafetyNumber: (peerId: string) => Promise<string | null>
+  /**
+   * Encrypt a message for at-rest storage in YOUR database. The returned record
+   * keeps `id`/`conversationId`/`timestamp` queryable and everything else
+   * ciphertext, under a per-conversation key that never leaves this device.
+   * Persist the record, then re-hydrate a page at a time with `decryptFromStorage`.
+   */
+  encryptForStorage: (message: Message) => Promise<StoredMessageRecord>
+  /** Decrypt a record produced by `encryptForStorage` back into a `Message`. */
+  decryptFromStorage: (record: StoredMessageRecord) => Promise<Message>
   error: Error | null
 }
 
@@ -796,6 +810,23 @@ export function useE2EChat({
     [userId, fetchPeerDeviceKeys, sendToDevice, addMessage]
   )
 
+  // ── At-rest storage (persist history in the developer's own database) ───────
+  const encryptForStorage = useCallback(
+    async (message: Message): Promise<StoredMessageRecord> => {
+      const key = await loadOrCreateStorageRootKey(userId)
+      return encryptForStorageCore(message, key)
+    },
+    [userId]
+  )
+
+  const decryptFromStorage = useCallback(
+    async (record: StoredMessageRecord): Promise<Message> => {
+      const key = await loadOrCreateStorageRootKey(userId)
+      return decryptFromStorageCore(record, key)
+    },
+    [userId]
+  )
+
   // Group messages by conversation peer so apps can render one thread at a time.
   const conversations = useMemo(() => {
     const grouped: Record<string, Message[]> = {}
@@ -803,5 +834,8 @@ export function useE2EChat({
     return grouped
   }, [messages])
 
-  return { messages, conversations, isReady, isConnecting, sendMessage, getSafetyNumber, error }
+  return {
+    messages, conversations, isReady, isConnecting,
+    sendMessage, getSafetyNumber, encryptForStorage, decryptFromStorage, error,
+  }
 }

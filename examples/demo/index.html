@@ -43,6 +43,16 @@
         border-radius: 10px; padding: 10px 12px; font-size: 14px; outline: none;
       }
       .compose input:focus { border-color: var(--accent); }
+      .storebar {
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+        padding: 8px 12px; border-top: 1px solid var(--line);
+        font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace;
+      }
+      .storebar button {
+        background: var(--bg); border: 1px solid var(--line); color: var(--text);
+        border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: 500;
+      }
+      .storebar .older[hidden] { display: none; }
       button {
         background: var(--accent); color: white; border: 0; border-radius: 10px;
         padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
@@ -75,6 +85,7 @@
           <div class="meta">device: <span class="device">…</span></div>
         </div>
         <div class="log"></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="older" type="button" hidden>↑ Load older</button></div>
         <form class="compose"><input placeholder="Message to Bob…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
 
@@ -84,6 +95,7 @@
           <div class="meta">device: <span class="device">…</span></div>
         </div>
         <div class="log"></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="older" type="button" hidden>↑ Load older</button></div>
         <form class="compose"><input placeholder="Message to Alice…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
     </div>

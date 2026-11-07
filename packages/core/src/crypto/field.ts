@@ -69,8 +69,9 @@ export async function encryptField(value: string, key: Uint8Array): Promise<Encr
   }
 
   const nonce      = na.randombytes_buf(na.crypto_secretbox_NONCEBYTES)
-  const message    = na.from_string(value)
-  const ciphertext = na.crypto_secretbox_easy(message, nonce, key)
+  // Pass the string directly — libsodium UTF-8 encodes it internally. Avoids
+  // `from_string`, whose cross-realm Uint8Array trips crypto_secretbox_easy under jsdom.
+  const ciphertext = na.crypto_secretbox_easy(value, nonce, key)
 
   return { ciphertext: toB64(ciphertext), nonce: toB64(nonce) }
 }

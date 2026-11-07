@@ -50,6 +50,7 @@ export default defineConfig({
       '@encra/core':   fileURLToPath(new URL('../../packages/core/src/index.ts', import.meta.url)),
     },
   },
+  // The mock relay also mounts the developer-DB routes under /app/* (at-rest history).
   optimizeDeps: { exclude: ['libsodium-wrappers', 'libsodium'] },
   build: { target: 'esnext' },
   server: {

@@ -445,6 +445,25 @@ describe('EncraClient', () => {
     cleanup()
   })
 
+  it('encryptForStorage / decryptFromStorage round-trips a message at rest', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('store-a', 'store-b')
+    const message: Message = {
+      id: 'x1', conversationId: 'store-b', from: 'store-a', to: 'store-b',
+      text: 'persist me 🔐', timestamp: 1700000000000,
+    }
+
+    const rec = await alice.encryptForStorage(message)
+    // Queryable metadata stays plaintext; content is hidden.
+    expect(rec.id).toBe('x1')
+    expect(rec.conversationId).toBe('store-b')
+    expect(rec.timestamp).toBe(1700000000000)
+    expect(JSON.stringify(rec)).not.toContain('persist me')
+
+    const back = await alice.decryptFromStorage(rec)
+    expect(back).toEqual(message)
+    cleanup()
+  })
+
   it('restores key pair from IndexedDB without generating a new one', async () => {
     setupMocks()
     const storedKP = await generateKeyPair()

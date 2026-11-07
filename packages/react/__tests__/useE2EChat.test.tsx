@@ -571,6 +571,26 @@ describe('useE2EChat', () => {
     expect(result.current.isConnecting).toBe(false)
   })
 
+  it('encryptForStorage / decryptFromStorage round-trips a message at rest', async () => {
+    setupMocks()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'wendy', serverUrl: 'http://localhost:3000' })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    const message = {
+      id: 's1', conversationId: 'bob', from: 'wendy', to: 'bob',
+      text: 'at rest 🔐', timestamp: 1700000000000,
+    }
+    const rec = await result.current.encryptForStorage(message)
+    expect(rec.id).toBe('s1')
+    expect(rec.conversationId).toBe('bob')
+    expect(JSON.stringify(rec)).not.toContain('at rest')
+
+    const back = await result.current.decryptFromStorage(rec)
+    expect(back).toEqual(message)
+  })
+
   it('reports server-originated error frames via onError without crashing', async () => {
     setupMocks()
     const onError = vi.fn()

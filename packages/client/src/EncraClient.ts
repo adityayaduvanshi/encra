@@ -10,6 +10,8 @@ import {
   identityPublicToX25519,
   packMessagePayload,
   unpackMessagePayload,
+  encryptForStorage as encryptForStorageCore,
+  decryptFromStorage as decryptFromStorageCore,
   buildPreKeyBundle,
   x3dhInitiate,
   x3dhRespond,
@@ -19,7 +21,7 @@ import {
 } from '@encra/core'
 import type {
   KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage,
-  PresencePayload, PresenceStatus,
+  PresencePayload, PresenceStatus, StoredMessageRecord,
 } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
@@ -27,13 +29,14 @@ import {
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
+  loadOrCreateStorageRootKey,
   loadGhostMode, saveGhostMode,
   loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
 
-export type { PresencePayload, PresenceStatus }
+export type { PresencePayload, PresenceStatus, StoredMessageRecord }
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -409,6 +412,23 @@ export class EncraClient {
     const myIdX    = identityPublicToX25519(this._identity.publicKey)
     const theirIdX = identityPublicToX25519(importKey(bundle.identityKey))
     return generateSafetyNumber(myIdX, theirIdX)
+  }
+
+  /**
+   * Encrypt a message for at-rest storage in YOUR database. The record keeps
+   * `id`/`conversationId`/`timestamp` queryable and everything else ciphertext,
+   * under a per-conversation key that never leaves this device. Persist it, then
+   * re-hydrate a page at a time with `decryptFromStorage`.
+   */
+  async encryptForStorage(message: Message): Promise<StoredMessageRecord> {
+    const key = await loadOrCreateStorageRootKey(this._userId)
+    return encryptForStorageCore(message, key)
+  }
+
+  /** Decrypt a record produced by `encryptForStorage` back into a `Message`. */
+  async decryptFromStorage(record: StoredMessageRecord): Promise<Message> {
+    const key = await loadOrCreateStorageRootKey(this._userId)
+    return decryptFromStorageCore(record, key)
   }
 
   /**
