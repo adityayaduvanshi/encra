@@ -45,8 +45,8 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
   const olderBtn  = section.querySelector<HTMLButtonElement>('.older')!
 
-  let storedCount   = 0
   let oldestLoaded: number | null = null  // for "Load older" pagination
+  let loadedOnce = false
 
   const client = new EncraClient({
     apiKey:    'demo-key',
@@ -67,12 +67,41 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     log.scrollTop = log.scrollHeight
   }
 
+  /** Update the 💾 badge from the developer DB (reflects persisted history). */
+  async function refreshStored(): Promise<void> {
+    try {
+      const r = await fetch(
+        `/app/messages?userId=${encodeURIComponent(userId)}&conversationId=${encodeURIComponent(peerId)}&limit=200`,
+      ).then((x) => x.json() as Promise<{ records: unknown[] }>)
+      storedEl.textContent = String(r.records.length)
+    } catch { /* ignore */ }
+  }
+
+  /** Load this conversation's history from the developer DB (newest page) and render it. */
+  async function loadFromDb(): Promise<void> {
+    log.innerHTML = ''
+    oldestLoaded = null
+    const { records, nextBefore } = await loadAppDbPage(userId, peerId, null)
+    // Records come newest-first; render oldest-first. Skip any record we can't
+    // decrypt (e.g. one written under a storage key that was since reset).
+    for (const rec of [...records].reverse()) {
+      try { addBubble(await client.decryptFromStorage(rec)) }
+      catch (e) { console.warn('[decrypt-skip]', userId, rec.id.slice(0, 6), (e as Error)?.message) }
+    }
+    oldestLoaded = records.length ? records[records.length - 1]!.timestamp : null
+    olderBtn.hidden = nextBefore === null
+    await refreshStored()
+  }
+
   client.on('ready', () => {
     dot.classList.add('on')
     input.disabled = false
     button.disabled = false
     device.textContent = client.deviceId ?? '?'
     input.focus()
+    // Restore history from the developer DB on first connect — the realistic
+    // "open the app" flow, so a page reload keeps the conversation on screen.
+    if (!loadedOnce) { loadedOnce = true; void loadFromDb() }
   })
   client.on('disconnected', () => dot.classList.remove('on'))
   client.on('error', (err) => console.warn(`[${userId}]`, err.message))
@@ -84,29 +113,23 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     try {
       const record = await client.encryptForStorage(msg)
       await saveToAppDb(userId, record)
-      storedEl.textContent = String(++storedCount)
+      await refreshStored()
     } catch (err) {
       console.warn(`[${userId}] store failed:`, err)
     }
   })
 
-  // "Reload from DB" — simulate opening the app fresh: clear the pane and
-  // re-render purely from the encrypted records in the developer's DB.
-  rehydrate.addEventListener('click', async () => {
-    log.innerHTML = ''
-    oldestLoaded = null
-    const { records, nextBefore } = await loadAppDbPage(userId, peerId, null)
-    // Records come newest-first; render oldest-first.
-    for (const rec of [...records].reverse()) addBubble(await client.decryptFromStorage(rec))
-    oldestLoaded = records.length ? records[records.length - 1]!.timestamp : null
-    olderBtn.hidden = nextBefore === null
-  })
+  // "Reload from DB" — clear the pane and re-render purely from the encrypted
+  // records in the developer's DB (same path used automatically on open).
+  rehydrate.addEventListener('click', () => { void loadFromDb() })
 
   // "Load older" — fetch the previous page and prepend it (decrypt-on-demand).
   olderBtn.addEventListener('click', async () => {
     const { records, nextBefore } = await loadAppDbPage(userId, peerId, oldestLoaded)
     for (const rec of records) {                    // newest-first → prepend keeps order
-      log.insertBefore(makeBubble(await client.decryptFromStorage(rec)), log.firstChild)
+      try {
+        log.insertBefore(makeBubble(await client.decryptFromStorage(rec)), log.firstChild)
+      } catch { /* skip undecryptable */ }
     }
     if (records.length) oldestLoaded = records[records.length - 1]!.timestamp
     olderBtn.hidden = nextBefore === null
