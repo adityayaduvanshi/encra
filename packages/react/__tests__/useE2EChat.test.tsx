@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
-import { renderHook, act, waitFor } from '@testing-library/react'
+import { renderHook, act, waitFor, cleanup } from '@testing-library/react'
 import { useE2EChat } from '../src/useE2EChat.js'
 import * as ratchetStore from '../src/ratchetStore.js'
 import {
@@ -54,6 +54,12 @@ class MockWebSocket {
   simulateError() {
     this.errorListeners.forEach((fn) => fn())
   }
+
+  /** Close with a specific WebSocket close code (e.g. 4001 auth-rejected). */
+  simulateClose(code?: number) {
+    this.readyState = 3
+    this.closeListeners.forEach((fn) => (fn as (e?: unknown) => void)(code === undefined ? undefined : { code }))
+  }
 }
 
 // ── fetch mock ────────────────────────────────────────────────────────────────
@@ -99,11 +105,14 @@ function makeFetchMock(
       return { ok: true, status: 201, json: async () => ({ userId: body.userId, deviceId: body.deviceId }) } as Response
     }
 
-    const preMatch = url.match(/\/v1\/prekeys\/([^/]+)\/([^/?]+)$/)
+    const preMatch = url.match(/\/v1\/prekeys\/([^/]+)\/([^/?]+)(?:\?([^#]*))?$/)
     if (preMatch) {
       const rec = preKeyStore.get(pkKey(preMatch[1]!, preMatch[2]!))
       if (!rec) return { ok: false, status: 404, json: async () => ({ error: 'not found' }) } as Response
-      const otp = rec.oneTimePreKeys.shift()
+      // Non-consuming fetches (?consumeOneTime=false, used for presence + safety
+      // numbers) must not drain the one-time-prekey pool.
+      const consumeOneTime = !/consumeOneTime=false/.test(preMatch[3] ?? '')
+      const otp = consumeOneTime ? rec.oneTimePreKeys.shift() : undefined
       return {
         ok: true, status: 200,
         json: async () => ({
@@ -170,6 +179,10 @@ describe('useE2EChat', () => {
   })
 
   afterEach(() => {
+    // Unmount any hooks rendered this test so their reconnect timers stop —
+    // otherwise a leaked timer constructs a new WebSocket and reassigns the
+    // shared `mockWs` mid-way through a later test, flaking frame assertions.
+    cleanup()
     keyStore.clear()
     preKeyStore.clear()
     vi.restoreAllMocks()
@@ -296,7 +309,7 @@ describe('useE2EChat', () => {
     expect(result.current.error).toBeNull()
   })
 
-  it('sendMessage throws when WebSocket is not connected', async () => {
+  it('queues (does not throw) when the socket is closed', async () => {
     setupMocks()
 
     const { result } = renderHook(() =>
@@ -308,7 +321,12 @@ describe('useE2EChat', () => {
     // Close the socket to simulate disconnection
     await act(async () => { mockWs.close() })
 
-    await expect(result.current.sendMessage('bob', 'hi')).rejects.toThrow('WebSocket is not connected')
+    // Previously this threw 'WebSocket is not connected'; now the message is
+    // accepted, shown optimistically, and queued for the next reconnect.
+    let id: string | undefined
+    await act(async () => { id = await result.current.sendMessage('bob', 'hi') })
+    expect(typeof id).toBe('string')
+    expect(result.current.messages.some((m) => m.id === id)).toBe(true)
   })
 
   it('marks not ready when WebSocket closes', async () => {
@@ -512,5 +530,86 @@ describe('useE2EChat', () => {
     // Both decryptions fail (wrong bytes) — hook must stay ready and not crash
     expect(result.current.isReady).toBe(true)
     expect(result.current.messages).toHaveLength(0)
+  })
+
+  it('getSafetyNumber returns a 60-digit code for a peer with published prekeys', async () => {
+    setupMocks()
+    const peerKP = await generateKeyPair()
+    keyStore.set('quinn', exportKey(peerKP.publicKey))
+    await seedPreKeyBundle(preKeyStore, 'quinn')
+
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'rita', serverUrl: 'http://localhost:3000' })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    const sn = await result.current.getSafetyNumber('quinn')
+    expect(sn).toMatch(/^(\d{5} ){11}\d{5}$/)
+
+    // Non-consuming: quinn's one-time prekey pool is untouched.
+    expect(preKeyStore.get('quinn:test-device')!.oneTimePreKeys).toHaveLength(1)
+  })
+
+  it('getSafetyNumber returns null for an unknown peer', async () => {
+    setupMocks()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'sam', serverUrl: 'http://localhost:3000' })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    expect(await result.current.getSafetyNumber('nobody-here')).toBeNull()
+  })
+
+  it('surfaces a fatal error and stops reconnecting when auth is rejected (close 4001)', async () => {
+    setupMocks()
+    const onError = vi.fn()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'bad-key', userId: 'tom', serverUrl: 'http://localhost:3000', onError })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    await act(async () => { mockWs.simulateClose(4001) })
+
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(result.current.isReady).toBe(false)
+    // A rejected key must NOT trigger an endless reconnect loop.
+    expect(result.current.isConnecting).toBe(false)
+  })
+
+  it('encryptForStorage / decryptFromStorage round-trips a message at rest', async () => {
+    setupMocks()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'wendy', serverUrl: 'http://localhost:3000' })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    const message = {
+      id: 's1', conversationId: 'bob', from: 'wendy', to: 'bob',
+      text: 'at rest 🔐', timestamp: 1700000000000,
+    }
+    const rec = await result.current.encryptForStorage(message)
+    expect(rec.id).toBe('s1')
+    expect(rec.conversationId).toBe('bob')
+    expect(JSON.stringify(rec)).not.toContain('at rest')
+
+    const back = await result.current.decryptFromStorage(rec)
+    expect(back).toEqual(message)
+  })
+
+  it('reports server-originated error frames via onError without crashing', async () => {
+    setupMocks()
+    const onError = vi.fn()
+    const { result } = renderHook(() =>
+      useE2EChat({ apiKey: 'test-key', userId: 'uma', serverUrl: 'http://localhost:3000', onError })
+    )
+    await waitFor(() => expect(result.current.isReady).toBe(true), { timeout: 3000 })
+
+    await act(async () => {
+      mockWs.simulateMessage(JSON.stringify({ type: 'error', message: 'rate limited' }))
+      await new Promise((r) => setTimeout(r, 50))
+    })
+
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('rate limited') }))
+    expect(result.current.error).toBeNull()
   })
 })

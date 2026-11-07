@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   generateKeyPair,
   exportKey,
@@ -7,23 +7,56 @@ import {
   DecryptionFailedError,
   DoubleRatchet,
   generateOneTimePreKeys,
+  generateSafetyNumber,
+  identityPublicToX25519,
+  packMessagePayload,
+  unpackMessagePayload,
+  encryptForStorage as encryptForStorageCore,
+  decryptFromStorage as decryptFromStorageCore,
   x3dhInitiate,
   x3dhRespond,
 } from '@encra/core'
-import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage } from '@encra/core'
+import type { KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage, StoredMessageRecord } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
+  resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
+  loadOrCreateStorageRootKey,
+  enqueueOutbox, loadOutbox, removeOutbox,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
 
+export type { StoredMessageRecord }
+
+/**
+ * Delivery status of a SENT message (undefined for received messages):
+ * - `queued`  — accepted while offline; will send on reconnect
+ * - `sending` — being delivered to the relay
+ * - `sent`    — handed to the relay (not a recipient read receipt)
+ * - `failed`  — delivery failed; stays queued and retries on reconnect
+ */
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
+
 export interface Message {
+  /** Stable, sender-generated id — identical across every device the message reaches. */
+  id: string
+  /**
+   * The peer this message's conversation is with, from THIS user's point of
+   * view (the other party in a 1:1 thread). Group messages by this to render
+   * separate conversations.
+   */
+  conversationId: string
+  /** Sender userId. */
   from: string
+  /** Recipient userId. */
+  to: string
   text: string
   timestamp: number
+  /** Delivery status for messages YOU sent; undefined for received messages. */
+  status?: MessageStatus
 }
 
 export interface WireEvent {
@@ -60,12 +93,32 @@ export interface UseE2EChatOptions {
 }
 
 export interface UseE2EChatResult {
+  /** All messages across every conversation, in arrival order. */
   messages: Message[]
+  /** Messages grouped by `conversationId` (the peer), for rendering one thread at a time. */
+  conversations: Record<string, Message[]>
   /** True when the WebSocket is open and the user is registered. */
   isReady: boolean
   /** True during the initial connection or a reconnect attempt. */
   isConnecting: boolean
-  sendMessage: (to: string, text: string) => Promise<void>
+  /** Encrypt and deliver `text` to `to` (and the sender's own devices). Resolves to the message id. */
+  sendMessage: (to: string, text: string) => Promise<string>
+  /**
+   * Compute the conversation safety number with `peerId` — a 60-digit code that
+   * is identical on both sides when no man-in-the-middle is present. Show it to
+   * both users to verify out-of-band. Resolves to `null` if the peer has not
+   * published prekeys yet.
+   */
+  getSafetyNumber: (peerId: string) => Promise<string | null>
+  /**
+   * Encrypt a message for at-rest storage in YOUR database. The returned record
+   * keeps `id`/`conversationId`/`timestamp` queryable and everything else
+   * ciphertext, under a per-conversation key that never leaves this device.
+   * Persist the record, then re-hydrate a page at a time with `decryptFromStorage`.
+   */
+  encryptForStorage: (message: Message) => Promise<StoredMessageRecord>
+  /** Decrypt a record produced by `encryptForStorage` back into a `Message`. */
+  decryptFromStorage: (record: StoredMessageRecord) => Promise<Message>
   error: Error | null
 }
 
@@ -96,6 +149,31 @@ const PEER_KEY_TTL_MS  = 5 * 60 * 1_000
 const OTP_POOL_SIZE    = 100
 /** Replenish the one-time prekey pool when it drops to this many or fewer. */
 const OTP_LOW_WATER    = 20
+
+/** Generate a stable, unique message id (UUID when available). */
+function newMessageId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** The conversation peer for a message, from `me`'s point of view. */
+function conversationFor(me: string, from: string, to: string): string {
+  return from === me ? to : from
+}
+
+/** Normalise a possibly-legacy stored message into a full `Message` (back-compat). */
+function normalizeStored(m: Partial<Message> & { from: string; text: string; timestamp: number }, me: string): Message {
+  const to = m.to ?? (m.from === me ? '' : me)
+  return {
+    id:             m.id ?? newMessageId(),
+    conversationId: m.conversationId ?? conversationFor(me, m.from, to),
+    from:           m.from,
+    to,
+    text:           m.text,
+    timestamp:      m.timestamp,
+  }
+}
 
 /**
  * React hook for sending and receiving end-to-end encrypted messages.
@@ -145,6 +223,32 @@ export function useE2EChat({
   const peerKeyCacheRef     = useRef<Map<string, DeviceKey[]>>(new Map())
   const peerKeyCacheTimeRef = useRef<Map<string, number>>(new Map())
   const socketRef           = useRef<WebSocket | null>(null)
+  /**
+   * Per-sender-device inbound processing chains. Incoming frames for the same
+   * `${from}:${fromDeviceId}` are processed strictly one at a time: decrypting a
+   * Double Ratchet advances shared chain-key state, so two `decrypt()` calls
+   * interleaving on one ratchet instance (which happens when async message
+   * handlers overlap during a burst) would corrupt the chain and lose messages.
+   * Different senders still run in parallel.
+   */
+  const inboundChainsRef    = useRef<Map<string, Promise<void>>>(new Map())
+  /** Ids of messages already in state — for deduping re-delivered/self-synced copies. */
+  const seenIdsRef          = useRef<Set<string>>(new Set())
+  /** Serializes outbox flushes; `flushOutboxRef` lets the WS 'open' handler call the latest flush. */
+  const flushingRef         = useRef(false)
+  const flushOutboxRef      = useRef<() => void>(() => {})
+
+  /** Append a message if its id hasn't been seen, capping and persisting history. */
+  const addMessage = useCallback((m: Message): void => {
+    if (seenIdsRef.current.has(m.id)) return
+    seenIdsRef.current.add(m.id)
+    setMessages((prev) => {
+      const next   = [...prev, m]
+      const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
+      void saveMessages(userId, capped)
+      return capped
+    })
+  }, [userId])
 
   // Stable refs so callbacks can change without restarting the effect
   const onErrorRef       = useRef(onError)
@@ -240,6 +344,10 @@ export function useE2EChat({
       publicKey:  importKey(prekeys.identityPub),
       privateKey: importKey(prekeys.identityPriv),
     }
+    // Rotate the signed prekey if it has aged out (forward secrecy). The old one
+    // is retained so sessions opened against it still work; `publishPreKeys`
+    // below then advertises whichever signed prekey is now current.
+    if (!created) await rotateSignedPreKeyIfStale(userId, prekeys)
     // Publish the full one-time prekey pool only when we just created it.
     // On restore, re-assert identity + signed prekey but don't re-publish
     // existing one-time prekeys — some may already be reserved by senders.
@@ -264,6 +372,34 @@ export function useE2EChat({
       return (await res.json()) as PreKeyBundle
     },
     [apiKey, httpBase]
+  )
+
+  /**
+   * Compute the conversation safety number with `peerId`. Fetches the peer's
+   * identity key WITHOUT consuming a one-time prekey, then combines it with our
+   * own identity key via `generateSafetyNumber` (symmetric — both sides get the
+   * same code). Returns null if the peer hasn't published prekeys yet.
+   */
+  const getSafetyNumber = useCallback(
+    async (peerId: string): Promise<string | null> => {
+      const myIdentity = identityRef.current
+      if (!myIdentity) return null
+
+      const devices = await fetchPeerDeviceKeys(peerId).catch(() => [] as DeviceKey[])
+      if (devices.length === 0) return null
+
+      const res = await fetch(
+        `${httpBase}/v1/prekeys/${encodeURIComponent(peerId)}/${encodeURIComponent(devices[0]!.deviceId)}?consumeOneTime=false`,
+        { headers: { Authorization: `Bearer ${apiKey}` } },
+      )
+      if (!res.ok) return null
+      const bundle = (await res.json()) as { identityKey: string }
+
+      const myIdX    = identityPublicToX25519(myIdentity.publicKey)
+      const theirIdX = identityPublicToX25519(importKey(bundle.identityKey))
+      return generateSafetyNumber(myIdX, theirIdX)
+    },
+    [apiKey, httpBase, fetchPeerDeviceKeys]
   )
 
   /** Top the one-time prekey pool back up to OTP_POOL_SIZE and publish the new keys. */
@@ -367,14 +503,14 @@ export function useE2EChat({
         )
       }
 
-      if (prekey.signedPreKeyId !== pk.signedPreKey.keyId) {
+      // Resolve the signed prekey the sender used — this may be the current one
+      // or a retained previous one (if we rotated after the sender fetched our
+      // bundle but before this message arrived). Only truly-gone keys fail.
+      const signedPair = resolveSignedPreKeyPair(pk, prekey.signedPreKeyId)
+      if (!signedPair) {
         throw new DecryptionFailedError(
-          `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${pk.signedPreKey.keyId}).`,
+          `Signed prekey ${prekey.signedPreKeyId} is not available (current is ${pk.signedPreKey.keyId}, no retained match).`,
         )
-      }
-      const signedPair: KeyPair = {
-        publicKey:  importKey(pk.signedPreKey.pub),
-        privateKey: importKey(pk.signedPreKey.priv),
       }
       let oneTimePair: KeyPair | null = null
       if (prekey.oneTimePreKeyId !== null) {
@@ -410,6 +546,49 @@ export function useE2EChat({
       }, delay)
     }
 
+    /**
+     * Decrypt and store one inbound frame. Runs inside a per-sender-device
+     * serialization chain (see `inboundChainsRef`) so ratchet state is never
+     * advanced by two overlapping decrypts.
+     */
+    async function handleInboundMessage(msg: WireMessage): Promise<void> {
+      try {
+        const ratchet = await getOrInitReceiverRatchet(msg.from!, msg.fromDeviceId!, msg.prekey)
+        const body    = await ratchet.decrypt({
+          encHeader:  importKey(msg.encHeader!),
+          ciphertext: importKey(msg.ciphertext!),
+          nonce:      importKey(msg.nonce!),
+        })
+        await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
+        // We've heard from this peer device — stop attaching our prekey message.
+        pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
+        if (!cancelled) {
+          // The id and conversation peer travel INSIDE the ciphertext, so every
+          // copy (recipient + the sender's own synced devices) agrees on them.
+          const { id, to, text, ts } = unpackMessagePayload(body)
+          const from = msg.from!
+          const peer = to ?? (from === userId ? '' : userId)
+          addMessage({
+            id:             id ?? newMessageId(),
+            conversationId: conversationFor(userId, from, peer),
+            from,
+            to:             peer,
+            text,
+            timestamp:      ts ?? Date.now(),
+          })
+        }
+      } catch (err) {
+        // Surface EVERY receive error. Previously only DecryptionFailedError was
+        // reported and all other failures (e.g. "Prekeys not initialised", a
+        // rotated signed prekey, a missing one-time prekey) were swallowed
+        // silently, hiding real breakage from the app.
+        const e = err instanceof DecryptionFailedError
+          ? new DecryptionFailedError(`Decryption failed for message from '${msg.from}'.`)
+          : err instanceof Error ? err : new Error(String(err))
+        onErrorRef.current?.(e)
+      }
+    }
+
     function connectWS() {
       ws = new WebSocket(`${wsBase}/v1/relay`)
       socketRef.current = ws
@@ -418,14 +597,21 @@ export function useE2EChat({
         ws!.send(JSON.stringify({ type: 'auth', token: apiKey }))
         ws!.send(JSON.stringify({ type: 'register', userId, deviceId: deviceIdRef.current }))
         retryCount = 0
-        if (!cancelled) { setIsReady(true); setIsConnecting(false) }
+        if (!cancelled) { setIsReady(true); setIsConnecting(false); flushOutboxRef.current() }
       })
 
-      ws.addEventListener('message', async (event) => {
+      ws.addEventListener('message', (event) => {
         let msg: WireMessage
         try {
           msg = JSON.parse(event.data as string) as WireMessage
         } catch { return }
+
+        // Server-originated error frames are recoverable — report, don't crash.
+        if (msg.type === 'error') {
+          const m = (msg as { message?: string }).message
+          onErrorRef.current?.(new Error(m ? `Server: ${m}` : 'Server error.'))
+          return
+        }
 
         if (
           msg.type !== 'message' ||
@@ -443,41 +629,35 @@ export function useE2EChat({
           timestamp:  Date.now(),
         })
 
-        try {
-          const ratchet = await getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
-          const text = await ratchet.decrypt({
-            encHeader:  importKey(msg.encHeader),
-            ciphertext: importKey(msg.ciphertext),
-            nonce:      importKey(msg.nonce),
-          })
-          await saveRatchet(userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
-          // We've heard from this peer device — stop attaching our prekey message.
-          pendingPrekeyRef.current.delete(`${msg.from}:${msg.fromDeviceId}`)
-          if (!cancelled) {
-            setMessages((prev) => {
-              const next   = [...prev, { from: msg.from!, text, timestamp: Date.now() }]
-              const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
-              void saveMessages(userId, capped)
-              return capped
-            })
-          }
-        } catch (err) {
-          if (err instanceof DecryptionFailedError) {
-            const e = new DecryptionFailedError(`Decryption failed for message from '${msg.from}'.`)
-            onErrorRef.current?.(e)
-          }
-        }
+        // Chain this frame behind any in-flight decrypt for the same sender
+        // device so decryptions never interleave on one ratchet instance.
+        const chainKey = `${msg.from}:${msg.fromDeviceId}`
+        const prev     = inboundChainsRef.current.get(chainKey) ?? Promise.resolve()
+        const next     = prev.then(() => handleInboundMessage(msg)).catch(() => {})
+        inboundChainsRef.current.set(chainKey, next)
       })
 
       ws.addEventListener('error', () => {
         if (!cancelled) onErrorRef.current?.(new Error('WebSocket connection error.'))
       })
 
-      ws.addEventListener('close', () => {
-        if (!cancelled) {
-          setIsReady(false)
-          scheduleReconnect()
+      ws.addEventListener('close', (event) => {
+        if (cancelled) return
+        setIsReady(false)
+        const code = (event as CloseEvent | undefined)?.code
+        // 4001 = auth rejected (bad/expired API key); 4003 = registration timeout.
+        // Reconnecting can't fix a rejected key, so stop the loop and surface a
+        // fatal error instead of retrying forever.
+        if (code === 4001 || code === 4003) {
+          setIsConnecting(false)
+          setError(new Error(
+            code === 4001
+              ? 'Authentication failed: the API key was rejected. Check your apiKey.'
+              : 'Registration timed out.',
+          ))
+          return
         }
+        scheduleReconnect()
       })
     }
 
@@ -503,9 +683,13 @@ export function useE2EChat({
           await saveKeyPair(userId, { pub: exportKey(kp.publicKey), priv: exportKey(kp.privateKey) })
         }
 
-        // Restore message history before opening the WebSocket
-        const storedMsgs = await loadMessages(userId)
-        if (!cancelled && storedMsgs.length > 0) setMessages(storedMsgs)
+        // Restore message history before opening the WebSocket (normalising any
+        // legacy records that predate ids/conversations, and seeding the dedup set).
+        const storedMsgs = (await loadMessages(userId)).map((m) => normalizeStored(m, userId))
+        if (!cancelled && storedMsgs.length > 0) {
+          seenIdsRef.current = new Set(storedMsgs.map((m) => m.id))
+          setMessages(storedMsgs)
+        }
 
         if (cancelled) return
 
@@ -551,73 +735,158 @@ export function useE2EChat({
       pendingPrekeyRef.current.clear()
       peerKeyCacheRef.current.clear()
       peerKeyCacheTimeRef.current.clear()
+      inboundChainsRef.current.clear()
     }
-  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys])
+  }, [apiKey, userId, httpBase, wsBase, getOrInitReceiverRatchet, initPreKeys, addMessage])
 
   /**
-   * Encrypts `text` and delivers it to every registered device of `to`.
-   * Each device gets its own Double Ratchet envelope so messages decrypt
-   * independently regardless of which device the recipient opens them on.
-   *
-   * @param to   - Recipient user ID.
-   * @param text - Plaintext message to send.
-   * @throws {Error} If the WebSocket is not connected or the recipient has no keys.
+   * Encrypt an already-packed message `body` for one route target device and
+   * push it over the socket. `routePeerId` is the delivery target (the recipient,
+   * or our own userId for self-sync); the conversation peer is encoded inside
+   * `body`, so self-synced copies still land in the right thread.
    */
-  const sendMessage = useCallback(
-    async (to: string, text: string): Promise<void> => {
-      const socket = socketRef.current
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        throw new Error('WebSocket is not connected. Wait for isReady to be true.')
-      }
+  const sendToDevice = useCallback(
+    async (socket: WebSocket, routePeerId: string, deviceId: string, body: string): Promise<void> => {
+      const ratchet = await getOrInitSenderRatchet(routePeerId, deviceId)
+      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(body)
+      await saveRatchet(userId, `s:${routePeerId}:${deviceId}`, ratchet.export())
 
-      // Fetch all of the recipient's registered devices
-      const peerDevices = await fetchPeerDeviceKeys(to)
-      if (peerDevices.length === 0) {
-        throw new Error(`No devices found for '${to}'. Make sure they have registered.`)
-      }
+      const pending = pendingPrekeyRef.current.get(`${routePeerId}:${deviceId}`)
+      const ctB64 = exportKey(ciphertext)
+      const nB64  = exportKey(nonce)
+      const ehB64 = exportKey(encHeader)
 
-      // Send one encrypted message per recipient device
-      for (const device of peerDevices) {
-        const ratchet = await getOrInitSenderRatchet(to, device.deviceId)
-        const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
-        await saveRatchet(userId, `s:${to}:${device.deviceId}`, ratchet.export())
+      socket.send(JSON.stringify({
+        type:       'message',
+        to:         routePeerId,
+        toDeviceId: deviceId,
+        ciphertext: ctB64,
+        nonce:      nB64,
+        encHeader:  ehB64,
+        ...(pending && { prekey: pending }),
+      }))
 
-        // Attach the X3DH prekey message until we hear back from this device, so
-        // the recipient can establish the session even if earlier frames were lost.
-        const pending = pendingPrekeyRef.current.get(`${to}:${device.deviceId}`)
-
-        const ctB64 = exportKey(ciphertext)
-        const nB64  = exportKey(nonce)
-        const ehB64 = exportKey(encHeader)
-
-        socket.send(JSON.stringify({
-          type:       'message',
-          to,
-          toDeviceId: device.deviceId,
-          ciphertext: ctB64,
-          nonce:      nB64,
-          encHeader:  ehB64,
-          ...(pending && { prekey: pending }),
-        }))
-
-        onWireMessageRef.current?.({
-          direction:  'sent',
-          ciphertext: ctB64,
-          nonce:      nB64,
-          timestamp:  Date.now(),
-        })
-      }
-
-      // Add sent message to local state once (not once per device)
-      setMessages((prev) => {
-        const next   = [...prev, { from: userId, text, timestamp: Date.now() }]
-        const capped = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
-        void saveMessages(userId, capped)
-        return capped
-      })
+      onWireMessageRef.current?.({ direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
     },
-    [userId, fetchPeerDeviceKeys, getOrInitSenderRatchet]
+    [userId, getOrInitSenderRatchet]
   )
 
-  return { messages, isReady, isConnecting, sendMessage, error }
+  /** Update a sent message's delivery status in place, persisting the change. */
+  const setMessageStatus = useCallback((id: string, status: MessageStatus): void => {
+    setMessages((prev) => {
+      let changed = false
+      const next = prev.map((m) => {
+        if (m.id === id && m.status !== status) { changed = true; return { ...m, status } }
+        return m
+      })
+      if (changed) void saveMessages(userId, next)
+      return changed ? next : prev
+    })
+  }, [userId])
+
+  /** Deliver one queued message: fan out to the recipient's devices + our own. */
+  const deliverMessage = useCallback(
+    async (item: { id: string; to: string; text: string; ts: number }): Promise<void> => {
+      const socket = socketRef.current
+      if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error('Not connected.')
+      const peerDevices = await fetchPeerDeviceKeys(item.to)
+      if (peerDevices.length === 0) throw new Error(`No devices found for '${item.to}'.`)
+      const body = packMessagePayload({ id: item.id, to: item.to, text: item.text, ts: item.ts })
+      for (const device of peerDevices) {
+        await sendToDevice(socket, item.to, device.deviceId, body)
+      }
+      // Self-device sync (best-effort) — deliver to the sender's own other devices.
+      try {
+        const myDevices = await fetchPeerDeviceKeys(userId)
+        for (const device of myDevices) {
+          if (device.deviceId === deviceIdRef.current) continue
+          await sendToDevice(socket, userId, device.deviceId, body)
+        }
+      } catch (err) {
+        onErrorRef.current?.(err instanceof Error ? err : new Error('Self-device sync failed.'))
+      }
+    },
+    [userId, fetchPeerDeviceKeys, sendToDevice]
+  )
+
+  /**
+   * Flush the persisted outbox oldest-first (serialized). Re-loads after each
+   * message so items queued mid-flush are still delivered; stops at the first
+   * failure, which stays queued and retries on the next reconnect.
+   */
+  const flushOutbox = useCallback(async (): Promise<void> => {
+    if (flushingRef.current) return
+    flushingRef.current = true
+    try {
+      for (;;) {
+        const socket = socketRef.current
+        if (!socket || socket.readyState !== WebSocket.OPEN) break
+        const item = (await loadOutbox(userId))[0]   // oldest queued
+        if (!item) break
+        setMessageStatus(item.id, 'sending')
+        try {
+          await deliverMessage(item)
+          await removeOutbox(userId, item.id)
+          setMessageStatus(item.id, 'sent')
+        } catch (err) {
+          setMessageStatus(item.id, 'failed')   // left queued; retried on reconnect
+          onErrorRef.current?.(err instanceof Error ? err : new Error('Send failed.'))
+          break
+        }
+      }
+    } finally {
+      flushingRef.current = false
+    }
+  }, [userId, deliverMessage, setMessageStatus])
+  // Keep the ref current so the WS 'open' handler flushes with the latest closure.
+  flushOutboxRef.current = flushOutbox
+
+  /**
+   * Queue `text` for delivery to `to`. Resolves to the message id immediately and
+   * NEVER throws for being offline: the message is shown optimistically with a
+   * `status`, persisted to the outbox, and delivered now (if connected) or on the
+   * next reconnect. Track delivery via `message.status`.
+   */
+  const sendMessage = useCallback(
+    async (to: string, text: string): Promise<string> => {
+      const id     = newMessageId()
+      const ts     = Date.now()
+      const socket = socketRef.current
+      const online = !!socket && socket.readyState === WebSocket.OPEN
+      addMessage({ id, conversationId: to, from: userId, to, text, timestamp: ts, status: online ? 'sending' : 'queued' })
+      await enqueueOutbox({ userId, id, to, text, ts })
+      await flushOutbox()   // delivers now when connected; no-op (stays queued) when offline
+      return id
+    },
+    [userId, addMessage, flushOutbox]
+  )
+
+  // ── At-rest storage (persist history in the developer's own database) ───────
+  const encryptForStorage = useCallback(
+    async (message: Message): Promise<StoredMessageRecord> => {
+      const key = await loadOrCreateStorageRootKey(userId)
+      return encryptForStorageCore(message, key)
+    },
+    [userId]
+  )
+
+  const decryptFromStorage = useCallback(
+    async (record: StoredMessageRecord): Promise<Message> => {
+      const key = await loadOrCreateStorageRootKey(userId)
+      return decryptFromStorageCore(record, key)
+    },
+    [userId]
+  )
+
+  // Group messages by conversation peer so apps can render one thread at a time.
+  const conversations = useMemo(() => {
+    const grouped: Record<string, Message[]> = {}
+    for (const m of messages) (grouped[m.conversationId] ??= []).push(m)
+    return grouped
+  }, [messages])
+
+  return {
+    messages, conversations, isReady, isConnecting,
+    sendMessage, getSafetyNumber, encryptForStorage, decryptFromStorage, error,
+  }
 }

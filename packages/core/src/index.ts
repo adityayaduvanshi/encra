@@ -9,7 +9,7 @@ export type { EncryptedMessage } from './crypto/encrypt.js'
 export { encryptField, decryptField, generateFieldKey } from './crypto/field.js'
 export type { EncryptedField } from './crypto/field.js'
 
-export { generateFingerprint } from './crypto/fingerprint.js'
+export { generateFingerprint, generateSafetyNumber } from './crypto/fingerprint.js'
 
 export { DoubleRatchet, MAX_SKIP_KEYS, RATCHET_VERSION } from './crypto/ratchet.js'
 export type { MessageHeader, RatchetMessage, RatchetStateExport } from './crypto/ratchet.js'
@@ -45,5 +45,16 @@ export {
   decryptPresence,
 } from './crypto/presence.js'
 export type { PresenceStatus, PresencePayload, EncryptedPresence } from './crypto/presence.js'
+
+export { packMessagePayload, unpackMessagePayload } from './message.js'
+export type { MessageEnvelope, DecodedMessage } from './message.js'
+
+export {
+  generateStorageRootKey,
+  deriveConversationKey,
+  encryptForStorage,
+  decryptFromStorage,
+} from './storage.js'
+export type { ChatMessage, StoredMessageRecord } from './storage.js'
 
 export { InvalidKeyError, DecryptionFailedError, KeyNotFoundError } from './errors.js'

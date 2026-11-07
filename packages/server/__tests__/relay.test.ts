@@ -88,19 +88,15 @@ function makePool(): { pool: Pool; keys: Map<string, string>; queue: QueueRow[] 
         return { rows: [], rowCount: 1 } as unknown as QueryResult
       }
 
-      // DELETE FROM message_queue WHERE recipient_id=$1 AND recipient_device_id=$2
-      // RETURNING id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name
-      if (s.startsWith('DELETE FROM MESSAGE_QUEUE')) {
+      // SELECT id, sender_id, sender_device_id, ciphertext, nonce, enc_header, prekey, sender_name
+      //   FROM message_queue WHERE recipient_id=$1 AND recipient_device_id=$2 ORDER BY id
+      // (flush now reads first, then deletes only what it actually delivered)
+      if (s.startsWith('SELECT ID, SENDER_ID') && s.includes('FROM MESSAGE_QUEUE')) {
         const recipientId       = params[0] as string
         const recipientDeviceId = params[1] as string
         const pending           = queue.filter(
           (m) => m.recipient_id === recipientId && m.recipient_device_id === recipientDeviceId,
         )
-        const remaining = queue.filter(
-          (m) => !(m.recipient_id === recipientId && m.recipient_device_id === recipientDeviceId),
-        )
-        queue.length = 0
-        queue.push(...remaining)
         return {
           rows:     pending.map((m) => ({
             id:               m.id,
@@ -114,6 +110,16 @@ function makePool(): { pool: Pool; keys: Map<string, string>; queue: QueueRow[] 
           })),
           rowCount: pending.length,
         } as unknown as QueryResult
+      }
+
+      // DELETE FROM message_queue WHERE id = ANY($1::int[])
+      if (s.startsWith('DELETE FROM MESSAGE_QUEUE')) {
+        const ids       = (params[0] as number[]) ?? []
+        const remaining = queue.filter((m) => !ids.includes(m.id))
+        const removed   = queue.length - remaining.length
+        queue.length = 0
+        queue.push(...remaining)
+        return { rows: [], rowCount: removed } as unknown as QueryResult
       }
 
       return { rows: [], rowCount: 0 } as unknown as QueryResult

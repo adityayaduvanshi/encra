@@ -7,6 +7,7 @@
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",
-    "build": "npm run build --workspaces --if-present"
+    "build": "npm run build --workspaces --if-present",
+    "demo": "npm run build -w @encra/core && npm run build -w @encra/client && npm --prefix examples/demo install && npm --prefix examples/demo run dev"
   }
 }

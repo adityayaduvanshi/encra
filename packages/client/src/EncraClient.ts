@@ -6,6 +6,12 @@ import {
   DecryptionFailedError,
   DoubleRatchet,
   generateOneTimePreKeys,
+  generateSafetyNumber,
+  identityPublicToX25519,
+  packMessagePayload,
+  unpackMessagePayload,
+  encryptForStorage as encryptForStorageCore,
+  decryptFromStorage as decryptFromStorageCore,
   buildPreKeyBundle,
   x3dhInitiate,
   x3dhRespond,
@@ -15,27 +21,46 @@ import {
 } from '@encra/core'
 import type {
   KeyPair, IdentityKeyPair, PreKeyBundle, PreKeyMessage,
-  PresencePayload, PresenceStatus,
+  PresencePayload, PresenceStatus, StoredMessageRecord,
 } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
   loadRatchet,   saveRatchet,
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
+  resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
+  loadOrCreateStorageRootKey,
+  enqueueOutbox, loadOutbox, removeOutbox,
   loadGhostMode, saveGhostMode,
   loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
 
-export type { PresencePayload, PresenceStatus }
+export type { PresencePayload, PresenceStatus, StoredMessageRecord }
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
+/**
+ * Delivery status of a SENT message (undefined for received messages):
+ * `queued` (offline, will send on reconnect) → `sending` → `sent` (handed to the
+ * relay, not a read receipt) / `failed` (stays queued, retries on reconnect).
+ */
+export type MessageStatus = 'queued' | 'sending' | 'sent' | 'failed'
+
 export interface Message {
-  from:      string
-  text:      string
-  timestamp: number
+  /** Stable, sender-generated id — identical across every device the message reaches. */
+  id:             string
+  /** The conversation peer, from THIS user's point of view (group by this to render threads). */
+  conversationId: string
+  /** Sender userId. */
+  from:           string
+  /** Recipient userId. */
+  to:             string
+  text:           string
+  timestamp:      number
+  /** Delivery status for messages YOU sent; undefined for received messages. */
+  status?:        MessageStatus
 }
 
 /**
@@ -108,6 +133,7 @@ interface EventMap {
   connecting:   []
   disconnected: []
   message:      [msg: Message]
+  status:       [event: { id: string; status: MessageStatus }]
   error:        [err: Error]
   wire:         [event: WireEvent]
   presence:     [event: { from: string; fromDeviceId: string; payload: PresencePayload }]
@@ -145,6 +171,34 @@ const OTP_POOL_SIZE      = 100
 /** Replenish the one-time prekey pool when it drops to this many or fewer. */
 const OTP_LOW_WATER      = 20
 
+/** Generate a stable, unique message id (UUID when available). */
+function newMessageId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/** The conversation peer for a message, from `me`'s point of view. */
+function conversationFor(me: string, from: string, to: string): string {
+  return from === me ? to : from
+}
+
+/** Normalise a possibly-legacy stored message into a full `Message` (back-compat). */
+function normalizeStored(
+  m: Partial<Message> & { from: string; text: string; timestamp: number },
+  me: string,
+): Message {
+  const to = m.to ?? (m.from === me ? '' : me)
+  return {
+    id:             m.id ?? newMessageId(),
+    conversationId: m.conversationId ?? conversationFor(me, m.from, to),
+    from:           m.from,
+    to,
+    text:           m.text,
+    timestamp:      m.timestamp,
+  }
+}
+
 /** Maximum file size accepted by `encryptFile` (50 MB). */
 export const MAX_FILE_BYTES = 50 * 1024 * 1024
 
@@ -181,6 +235,15 @@ export class EncraClient {
   private _ratchets:         Map<string, DoubleRatchet>            = new Map()
   /** Pending X3DH prekey messages, keyed `${peerId}:${deviceId}` (sender side). */
   private _pendingPrekey:    Map<string, PreKeyMessage>            = new Map()
+  /**
+   * Per-sender-device inbound processing chains. Frames for the same
+   * `${from}:${fromDeviceId}` are decrypted strictly one at a time so two
+   * overlapping `decrypt()` calls can never advance one ratchet's chain-key
+   * state concurrently (which corrupts the session under bursty traffic).
+   */
+  private _inboundChains:    Map<string, Promise<void>>            = new Map()
+  /** Ids of messages already in state — dedupes re-delivered/self-synced copies. */
+  private _seenIds:          Set<string>                           = new Set()
   private _peerKeyCache:     Map<string, DeviceKey[]>              = new Map()
   private _peerKeyCacheTime: Map<string, number>                   = new Map()
   // Presence: directional X3DH session keys + the prekey to attach outbound.
@@ -193,6 +256,10 @@ export class EncraClient {
   private _retryTimer:   ReturnType<typeof setTimeout>|null = null
   private _cancelled:    boolean                       = false
   private _connected:    boolean                       = false
+  /** True while the outbox is being flushed (serializes flushes). */
+  private _flushing:     boolean                       = false
+  /** True when the app called goOffline() — suppresses sending + auto-reconnect. */
+  private _manualOffline: boolean                      = false
 
   private readonly _listeners = new Map<string, Listener<keyof EventMap>[]>()
 
@@ -216,6 +283,16 @@ export class EncraClient {
   get isConnecting(): boolean    { return this._isConnecting }
   get error():        Error|null { return this._error }
   get messages():     Message[]  { return this._messages }
+  /** Messages grouped by conversation peer (`conversationId`). */
+  get conversations(): Record<string, Message[]> {
+    const grouped: Record<string, Message[]> = {}
+    for (const m of this._messages) (grouped[m.conversationId] ??= []).push(m)
+    return grouped
+  }
+  /** Messages in the conversation with `peerId`, in arrival order. */
+  conversation(peerId: string): Message[] {
+    return this._messages.filter((m) => m.conversationId === peerId)
+  }
   /** This device's stable ID (available after `connect()` resolves). */
   get deviceId():     string | null { return this._deviceId }
   /** True if ghost mode is active — presence broadcasts are suppressed. */
@@ -262,6 +339,7 @@ export class EncraClient {
     this._prekeys      = null
     this._ratchets.clear()
     this._pendingPrekey.clear()
+    this._inboundChains.clear()
     this._peerKeyCache.clear()
     this._peerKeyCacheTime.clear()
     this._sendPresenceKeys.clear()
@@ -272,39 +350,155 @@ export class EncraClient {
   }
 
   /**
-   * Encrypt `text` and send it to all registered devices of `to`.
-   * Throws if the WebSocket is not open.
+   * Queue `text` for delivery to `to`. Resolves to the message id immediately and
+   * NEVER throws for being offline: the message is shown optimistically with a
+   * `status`, persisted to the outbox, and delivered now (if connected) or on the
+   * next reconnect. Track delivery via `message.status` and the `status` event.
    */
-  async sendMessage(to: string, text: string): Promise<void> {
-    if (!this._socket || this._socket.readyState !== WebSocket.OPEN) {
-      throw new Error('Not connected. Wait for the "ready" event before sending.')
-    }
+  async sendMessage(to: string, text: string): Promise<string> {
+    const id     = newMessageId()
+    const ts     = Date.now()
+    const online = !!this._socket && this._socket.readyState === WebSocket.OPEN && !this._manualOffline
 
-    const peerDevices = await this._fetchPeerDeviceKeys(to)
+    // Optimistic echo + durable outbox entry (survives reloads / offline).
+    this._addMessage({ id, conversationId: to, from: this._userId, to, text, timestamp: ts, status: online ? 'sending' : 'queued' })
+    await enqueueOutbox({ userId: this._userId, id, to, text, ts })
 
+    await this._flushOutbox()   // delivers now when connected; stays queued when offline
+    return id
+  }
+
+  /** Deliver one queued message: fan out to the recipient's devices + our own. */
+  private async _deliverMessage(item: { id: string; to: string; text: string; ts: number }): Promise<void> {
+    const peerDevices = await this._fetchPeerDeviceKeys(item.to)
+    if (peerDevices.length === 0) throw new Error(`No devices found for '${item.to}'.`)
+    const body = packMessagePayload({ id: item.id, to: item.to, text: item.text, ts: item.ts })
     for (const device of peerDevices) {
-      const ratchet     = await this._getOrInitSenderRatchet(to, device.deviceId)
-      const { encHeader, ciphertext, nonce } = await ratchet.encrypt(text)
-      await saveRatchet(this._userId, `s:${to}:${device.deviceId}`, ratchet.export())
-
-      // Attach the X3DH prekey message until we hear back from this device, so
-      // the recipient can establish the session even if earlier frames were lost.
-      const pending = this._pendingPrekey.get(`${to}:${device.deviceId}`)
-
-      const ctB64  = exportKey(ciphertext)
-      const nB64   = exportKey(nonce)
-      const ehB64  = exportKey(encHeader)
-
-      this._socket.send(JSON.stringify({
-        type: 'message', to, toDeviceId: device.deviceId,
-        ciphertext: ctB64, nonce: nB64, encHeader: ehB64,
-        ...(pending && { prekey: pending }),
-      }))
-
-      this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
+      await this._sendToDevice(item.to, device.deviceId, body)
     }
+    // Self-device sync (best-effort): deliver to the sender's own other devices.
+    try {
+      const myDevices = await this._fetchPeerDeviceKeys(this._userId)
+      for (const device of myDevices) {
+        if (device.deviceId === this._deviceId) continue
+        await this._sendToDevice(this._userId, device.deviceId, body)
+      }
+    } catch (err) {
+      this._emit('error', err instanceof Error ? err : new Error('Self-device sync failed.'))
+    }
+  }
 
-    this._addMessage({ from: this._userId, text, timestamp: Date.now() })
+  /**
+   * Flush the persisted outbox in order. Serialized; stops at the first failure,
+   * which stays queued and retries on the next reconnect.
+   */
+  private async _flushOutbox(): Promise<void> {
+    if (this._flushing) return
+    this._flushing = true
+    try {
+      for (;;) {
+        if (!this._socket || this._socket.readyState !== WebSocket.OPEN || this._manualOffline) break
+        const item = (await loadOutbox(this._userId))[0]   // oldest queued
+        if (!item) break
+        this._setMessageStatus(item.id, 'sending')
+        try {
+          await this._deliverMessage(item)
+          await removeOutbox(this._userId, item.id)
+          this._setMessageStatus(item.id, 'sent')
+        } catch (err) {
+          this._setMessageStatus(item.id, 'failed')   // left queued; retried on reconnect
+          this._emit('error', err instanceof Error ? err : new Error('Send failed.'))
+          break
+        }
+      }
+    } finally {
+      this._flushing = false
+    }
+  }
+
+  /** Update a sent message's delivery status in place and notify listeners. */
+  private _setMessageStatus(id: string, status: MessageStatus): void {
+    const msg = this._messages.find((m) => m.id === id)
+    if (!msg || msg.status === status) return
+    msg.status = status
+    void saveMessages(this._userId, this._messages)
+    this._emit('status', { id, status })
+  }
+
+  /**
+   * Stop sending and auto-reconnecting (the socket is closed). Messages sent
+   * while offline are queued and flushed by {@link goOnline}. Useful to let users
+   * compose offline, or to demo the outbox.
+   */
+  goOffline(): void {
+    this._manualOffline = true
+    this._socket?.close()
+    this._setReady(false)
+  }
+
+  /** Resume: reconnect the relay and flush anything queued while offline. */
+  goOnline(): void {
+    if (!this._manualOffline) return
+    this._manualOffline = false
+    if (!this._cancelled) this._connectWS()
+  }
+
+  /**
+   * Encrypt an already-packed `body` for one route target device and push it over
+   * the socket. `routePeerId` is the delivery target (the recipient, or our own
+   * userId for self-sync); the conversation peer is encoded inside `body`.
+   */
+  private async _sendToDevice(routePeerId: string, deviceId: string, body: string): Promise<void> {
+    const ratchet = await this._getOrInitSenderRatchet(routePeerId, deviceId)
+    const { encHeader, ciphertext, nonce } = await ratchet.encrypt(body)
+    await saveRatchet(this._userId, `s:${routePeerId}:${deviceId}`, ratchet.export())
+
+    const pending = this._pendingPrekey.get(`${routePeerId}:${deviceId}`)
+    const ctB64   = exportKey(ciphertext)
+    const nB64    = exportKey(nonce)
+    const ehB64   = exportKey(encHeader)
+
+    this._socket!.send(JSON.stringify({
+      type: 'message', to: routePeerId, toDeviceId: deviceId,
+      ciphertext: ctB64, nonce: nB64, encHeader: ehB64,
+      ...(pending && { prekey: pending }),
+    }))
+
+    this._emit('wire', { direction: 'sent', ciphertext: ctB64, nonce: nB64, timestamp: Date.now() })
+  }
+
+  /**
+   * Compute the conversation safety number with `peerId` — a 60-digit code that
+   * matches on both sides when there is no man-in-the-middle. Fetches the peer's
+   * identity key without consuming a one-time prekey and combines it with our
+   * own. Resolves to `null` if the peer has not published prekeys yet.
+   */
+  async getSafetyNumber(peerId: string): Promise<string | null> {
+    if (!this._identity) return null
+    const devices = await this._fetchPeerDeviceKeys(peerId).catch(() => [] as DeviceKey[])
+    if (devices.length === 0) return null
+    const bundle = await this._fetchPresenceBundle(peerId, devices[0]!.deviceId)
+    if (!bundle) return null
+    const myIdX    = identityPublicToX25519(this._identity.publicKey)
+    const theirIdX = identityPublicToX25519(importKey(bundle.identityKey))
+    return generateSafetyNumber(myIdX, theirIdX)
+  }
+
+  /**
+   * Encrypt a message for at-rest storage in YOUR database. The record keeps
+   * `id`/`conversationId`/`timestamp` queryable and everything else ciphertext,
+   * under a per-conversation key that never leaves this device. Persist it, then
+   * re-hydrate a page at a time with `decryptFromStorage`.
+   */
+  async encryptForStorage(message: Message): Promise<StoredMessageRecord> {
+    const key = await loadOrCreateStorageRootKey(this._userId)
+    return encryptForStorageCore(message, key)
+  }
+
+  /** Decrypt a record produced by `encryptForStorage` back into a `Message`. */
+  async decryptFromStorage(record: StoredMessageRecord): Promise<Message> {
+    const key = await loadOrCreateStorageRootKey(this._userId)
+    return decryptFromStorageCore(record, key)
   }
 
   /**
@@ -609,14 +803,11 @@ export class EncraClient {
     peerId: string, fromDeviceId: string, prekey: PreKeyMessage,
   ): Promise<Uint8Array> {
     if (!this._identity || !this._prekeys) throw new Error('Prekeys not initialised.')
-    if (prekey.signedPreKeyId !== this._prekeys.signedPreKey.keyId) {
+    const signedPair = resolveSignedPreKeyPair(this._prekeys, prekey.signedPreKeyId)
+    if (!signedPair) {
       throw new DecryptionFailedError(
-        `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${this._prekeys.signedPreKey.keyId}).`,
+        `Signed prekey ${prekey.signedPreKeyId} is not available (current is ${this._prekeys.signedPreKey.keyId}, no retained match).`,
       )
-    }
-    const signedPair: KeyPair = {
-      publicKey:  importKey(this._prekeys.signedPreKey.pub),
-      privateKey: importKey(this._prekeys.signedPreKey.priv),
     }
     // Presence X3DH never uses a one-time prekey (3-DH variant).
     const keys = await x3dhRespond(this._identity, signedPair, null, prekey)
@@ -687,6 +878,8 @@ export class EncraClient {
   private _setConnecting(v: boolean) { this._isConnecting = v; if (v) this._emit('connecting') }
 
   private _addMessage(msg: Message): void {
+    if (this._seenIds.has(msg.id)) return   // dedupe re-delivered / self-synced copies
+    this._seenIds.add(msg.id)
     const next = [...this._messages, msg]
     this._messages = next.length > MAX_MESSAGES ? next.slice(-MAX_MESSAGES) : next
     void saveMessages(this._userId, this._messages)
@@ -799,6 +992,10 @@ export class EncraClient {
       publicKey:  importKey(prekeys.identityPub),
       privateKey: importKey(prekeys.identityPriv),
     }
+    // Rotate the signed prekey if it has aged out (forward secrecy). The old one
+    // is retained so sessions opened against it still work; `_publishPreKeys`
+    // below advertises whichever signed prekey is now current.
+    if (!created) await rotateSignedPreKeyIfStale(this._userId, prekeys)
     // Publish the full one-time prekey pool only when we just created it. On
     // restore, re-assert identity + signed prekey (idempotent upserts) but don't
     // re-publish existing one-time prekeys — some may already be reserved.
@@ -858,14 +1055,13 @@ export class EncraClient {
   /** Resolve the local private prekeys a prekey message refers to (responder side). */
   private _resolveResponderKeys(prekey: PreKeyMessage): { signedPair: KeyPair; oneTimePair: KeyPair | null } {
     const pk = this._prekeys!
-    if (prekey.signedPreKeyId !== pk.signedPreKey.keyId) {
+    // May be the current signed prekey or a retained previous one (if we rotated
+    // after the sender fetched our bundle). Only a truly-gone key fails.
+    const signedPair = resolveSignedPreKeyPair(pk, prekey.signedPreKeyId)
+    if (!signedPair) {
       throw new DecryptionFailedError(
-        `Signed prekey ${prekey.signedPreKeyId} is no longer available (current is ${pk.signedPreKey.keyId}).`,
+        `Signed prekey ${prekey.signedPreKeyId} is not available (current is ${pk.signedPreKey.keyId}, no retained match).`,
       )
-    }
-    const signedPair: KeyPair = {
-      publicKey:  importKey(pk.signedPreKey.pub),
-      privateKey: importKey(pk.signedPreKey.priv),
     }
 
     let oneTimePair: KeyPair | null = null
@@ -933,6 +1129,7 @@ export class EncraClient {
       if (!this._cancelled) {
         this._setReady(true)
         this._setConnecting(false)
+        void this._flushOutbox()   // send anything queued while offline
       }
     })
 
@@ -955,6 +1152,13 @@ export class EncraClient {
         return
       }
 
+      // Server-originated error frames are recoverable — report, don't crash.
+      if (msg.type === 'error') {
+        const m = (msg as { message?: string }).message
+        this._emit('error', new Error(m ? `Server: ${m}` : 'Server error.'))
+        return
+      }
+
       if (msg.type !== 'message' || !msg.from || !msg.fromDeviceId || !msg.ciphertext || !msg.nonce || !msg.encHeader) return
 
       this._emit('wire', {
@@ -964,39 +1168,78 @@ export class EncraClient {
         timestamp:  Date.now(),
       })
 
-      try {
-        const ratchet = await this._getOrInitReceiverRatchet(msg.from, msg.fromDeviceId, msg.prekey)
-        const text    = await ratchet.decrypt({
-          encHeader:  importKey(msg.encHeader),
-          ciphertext: importKey(msg.ciphertext),
-          nonce:      importKey(msg.nonce),
-        })
-        await saveRatchet(this._userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
-        // We've heard from this peer device — stop attaching our prekey message.
-        this._pendingPrekey.delete(`${msg.from}:${msg.fromDeviceId}`)
-        if (!this._cancelled) {
-          this._addMessage({ from: msg.from, text, timestamp: Date.now() })
-        }
-      } catch (err) {
-        if (err instanceof DecryptionFailedError) {
-          this._emit('error', new DecryptionFailedError(
-            `Decryption failed for message from '${msg.from}'.`
-          ))
-        }
-      }
+      // Chain this frame behind any in-flight decrypt for the same sender device
+      // so decryptions never interleave on one ratchet instance.
+      const chainKey = `${msg.from}:${msg.fromDeviceId}`
+      const prev     = this._inboundChains.get(chainKey) ?? Promise.resolve()
+      const next     = prev.then(() => this._handleInboundMessage(msg)).catch(() => {})
+      this._inboundChains.set(chainKey, next)
     })
 
     ws.addEventListener('error', () => {
       if (!this._cancelled) this._emit('error', new Error('WebSocket connection error.'))
     })
 
-    ws.addEventListener('close', () => {
-      if (!this._cancelled) {
-        this._setReady(false)
-        this._emit('disconnected')
-        this._scheduleReconnect()
+    ws.addEventListener('close', (event) => {
+      if (this._cancelled) return
+      this._setReady(false)
+      this._emit('disconnected')
+      if (this._manualOffline) return   // goOffline() closed it on purpose; don't reconnect
+      const code = (event as CloseEvent | undefined)?.code
+      // 4001 = auth rejected (bad/expired API key); 4003 = registration timeout.
+      // Reconnecting can't fix a rejected key, so stop looping and surface it.
+      if (code === 4001 || code === 4003) {
+        this._setConnecting(false)
+        this._error = new Error(
+          code === 4001
+            ? 'Authentication failed: the API key was rejected. Check your apiKey.'
+            : 'Registration timed out.',
+        )
+        this._emit('error', this._error)
+        return
       }
+      this._scheduleReconnect()
     })
+  }
+
+  /**
+   * Decrypt and store one inbound frame. Runs inside a per-sender-device
+   * serialization chain (see `_inboundChains`) so ratchet state is never
+   * advanced by two overlapping decrypts.
+   */
+  private async _handleInboundMessage(msg: WireMessage): Promise<void> {
+    try {
+      const ratchet = await this._getOrInitReceiverRatchet(msg.from!, msg.fromDeviceId!, msg.prekey)
+      const body    = await ratchet.decrypt({
+        encHeader:  importKey(msg.encHeader!),
+        ciphertext: importKey(msg.ciphertext!),
+        nonce:      importKey(msg.nonce!),
+      })
+      await saveRatchet(this._userId, `r:${msg.from}:${msg.fromDeviceId}`, ratchet.export())
+      // We've heard from this peer device — stop attaching our prekey message.
+      this._pendingPrekey.delete(`${msg.from}:${msg.fromDeviceId}`)
+      if (!this._cancelled) {
+        // id + conversation peer travel inside the ciphertext, so every copy agrees.
+        const { id, to, text, ts } = unpackMessagePayload(body)
+        const from = msg.from!
+        const peer = to ?? (from === this._userId ? '' : this._userId)
+        this._addMessage({
+          id:             id ?? newMessageId(),
+          conversationId: conversationFor(this._userId, from, peer),
+          from,
+          to:             peer,
+          text,
+          timestamp:      ts ?? Date.now(),
+        })
+      }
+    } catch (err) {
+      // Surface EVERY receive error. Previously only DecryptionFailedError was
+      // reported; all other failures were swallowed silently.
+      const e = err instanceof DecryptionFailedError
+        ? new DecryptionFailedError(`Decryption failed for message from '${msg.from}'.`)
+        : err instanceof Error ? err : new Error(String(err))
+      this._emit('error', e)
+    }
   }
 
   private async _init(): Promise<void> {
@@ -1023,8 +1266,12 @@ export class EncraClient {
     this._deviceId = await getOrCreateDeviceId(this._userId)
 
     // Restore message history
-    const history = await loadMessages(this._userId)
-    if (history.length > 0) this._messages = history
+    // Normalise any legacy records that predate ids/conversations, and seed dedup.
+    const history = (await loadMessages(this._userId)).map((m) => normalizeStored(m, this._userId))
+    if (history.length > 0) {
+      this._messages = history
+      this._seenIds  = new Set(history.map((m) => m.id))
+    }
 
     // Restore ghost-mode preference
     this._ghostMode = await loadGhostMode(this._userId)

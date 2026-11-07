@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeAll, afterEach } from 'vitest'
 import { EncraClient, MAX_FILE_BYTES } from '../src/EncraClient.js'
-import type { EncryptedFile, EncryptedFields } from '../src/EncraClient.js'
+import type { EncryptedFile, EncryptedFields, Message } from '../src/EncraClient.js'
 import * as ratchetStore from '../src/ratchetStore.js'
 import { sodiumReady, generateKeyPair, exportKey } from '@encra/core'
 
@@ -240,7 +240,7 @@ describe('EncraClient', () => {
     client.disconnect()
   })
 
-  it('throws when sendMessage is called while disconnected', async () => {
+  it('queues (does not throw) when sendMessage is called while disconnected', async () => {
     setupMocks()
     const client = new EncraClient({ apiKey: 'test-key', userId: 'frank', serverUrl: 'http://localhost:3000' })
 
@@ -248,7 +248,11 @@ describe('EncraClient', () => {
     await new Promise((r) => setTimeout(r, 100))
     mockWs.close()
 
-    await expect(client.sendMessage('bob', 'hi')).rejects.toThrow('Not connected')
+    // Previously this threw 'Not connected'; now it's accepted, shown
+    // optimistically, and queued for delivery on reconnect.
+    const id = await client.sendMessage('bob', 'hi')
+    expect(typeof id).toBe('string')
+    expect(client.messages.some((m) => m.id === id)).toBe(true)
     client.disconnect()
   })
 
@@ -399,6 +403,87 @@ describe('EncraClient', () => {
     await new Promise((r) => setTimeout(r, 100))
 
     expect(bobReceived).toEqual(['hello bob 🔐'])
+    cleanup()
+  })
+
+  it('assigns a stable id, groups by conversation, and does not duplicate on re-delivery', async () => {
+    const [alice, bob, cleanup] = await makeConnectedPair('conv-alice', 'conv-bob')
+    const bobMsgs: Message[] = []
+    bob.on('message', (m) => bobMsgs.push(m))
+
+    const aliceSocket = socketFor('conv-alice')!
+    const bobSocket   = socketFor('conv-bob')!
+
+    const id = await alice.sendMessage('conv-bob', 'hi bob')
+    expect(typeof id).toBe('string')
+
+    // Sender side: the message is grouped under the recipient, with from/to/id.
+    const aliceThread = alice.conversation('conv-bob')
+    expect(aliceThread.map((m) => m.text)).toEqual(['hi bob'])
+    expect(aliceThread[0]!.id).toBe(id)
+    expect(aliceThread[0]!.from).toBe('conv-alice')
+    expect(aliceThread[0]!.to).toBe('conv-bob')
+    expect(Object.keys(alice.conversations)).toEqual(['conv-bob'])
+
+    // Relay the frame to Bob — then deliver it a SECOND time.
+    const frame = aliceSocket.sentMessages.find((m) => {
+      const p = JSON.parse(m) as { type: string; to?: string }
+      return p.type === 'message' && p.to === 'conv-bob'
+    })!
+    const sent = JSON.parse(frame) as Record<string, unknown>
+    const wire = JSON.stringify({
+      type: 'message', from: 'conv-alice', fromDeviceId: TEST_DEVICE_ID,
+      ciphertext: sent['ciphertext'], nonce: sent['nonce'], encHeader: sent['encHeader'], prekey: sent['prekey'],
+    })
+    bobSocket.simulateMessage(wire)
+    await new Promise((r) => setTimeout(r, 100))
+    bobSocket.simulateMessage(wire)  // re-delivery must not surface a duplicate
+    await new Promise((r) => setTimeout(r, 100))
+
+    // Receiver side: exactly one message, same id, grouped under the sender.
+    expect(bobMsgs).toHaveLength(1)
+    expect(bobMsgs[0]!.id).toBe(id)
+    expect(bobMsgs[0]!.text).toBe('hi bob')
+    expect(bobMsgs[0]!.conversationId).toBe('conv-alice')
+    expect(bob.conversation('conv-alice')).toHaveLength(1)
+    cleanup()
+  })
+
+  it('queues while offline (status "queued") and sends on reconnect (status "sent")', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('ob-alice', 'ob-bob')
+
+    alice.goOffline()
+    const id = await alice.sendMessage('ob-bob', 'offline msg')
+    // Accepted + shown optimistically, but queued — nothing delivered yet.
+    expect(alice.messages.find((m) => m.id === id)?.status).toBe('queued')
+
+    const statuses: string[] = []
+    alice.on('status', (e) => { if (e.id === id) statuses.push(e.status) })
+
+    alice.goOnline()
+    await new Promise((r) => setTimeout(r, 400))   // reconnect + flush
+
+    expect(alice.messages.find((m) => m.id === id)?.status).toBe('sent')
+    expect(statuses).toContain('sent')
+    cleanup()
+  })
+
+  it('encryptForStorage / decryptFromStorage round-trips a message at rest', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('store-a', 'store-b')
+    const message: Message = {
+      id: 'x1', conversationId: 'store-b', from: 'store-a', to: 'store-b',
+      text: 'persist me 🔐', timestamp: 1700000000000,
+    }
+
+    const rec = await alice.encryptForStorage(message)
+    // Queryable metadata stays plaintext; content is hidden.
+    expect(rec.id).toBe('x1')
+    expect(rec.conversationId).toBe('store-b')
+    expect(rec.timestamp).toBe(1700000000000)
+    expect(JSON.stringify(rec)).not.toContain('persist me')
+
+    const back = await alice.decryptFromStorage(rec)
+    expect(back).toEqual(message)
     cleanup()
   })
 
