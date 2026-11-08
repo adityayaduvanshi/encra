@@ -468,6 +468,35 @@ describe('EncraClient', () => {
     cleanup()
   })
 
+  it('pins a peer identity on first contact without warning (TOFU)', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('idc2-alice', 'idc2-bob')
+    const changes: unknown[] = []
+    alice.on('identitychange', (e) => changes.push(e))
+
+    await alice.sendMessage('idc2-bob', 'hi')      // first contact → establishes session
+    await new Promise((r) => setTimeout(r, 150))
+
+    expect(changes).toHaveLength(0)
+    expect(typeof (await alice.pinnedIdentity('idc2-bob', TEST_DEVICE_ID))).toBe('string')
+    cleanup()
+  })
+
+  it('emits "identitychange" when a peer device presents a different identity', async () => {
+    const [alice, , cleanup] = await makeConnectedPair('idc-alice', 'idc-bob')
+    const changes: Array<{ peerId: string; deviceId: string }> = []
+    alice.on('identitychange', (e) => changes.push(e))
+
+    // Pin a DIFFERENT identity for idc-bob's device first, so the real bundle
+    // looks changed when the session is established (simulated MITM / key swap).
+    await ratchetStore.pinIdentity('idc-alice', 'idc-bob', TEST_DEVICE_ID, 'tampered-identity-key')
+
+    await alice.sendMessage('idc-bob', 'hi')       // establishes session → checks identity
+    await new Promise((r) => setTimeout(r, 150))
+
+    expect(changes).toContainEqual({ peerId: 'idc-bob', deviceId: TEST_DEVICE_ID })
+    cleanup()
+  })
+
   it('encryptForStorage / decryptFromStorage round-trips a message at rest', async () => {
     const [alice, , cleanup] = await makeConnectedPair('store-a', 'store-b')
     const message: Message = {

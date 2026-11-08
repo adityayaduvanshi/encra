@@ -117,10 +117,14 @@ interface EncraSchema extends DBSchema {
     key:   string        // `${userId}:${messageId}`
     value: StoredOutboxItem
   }
+  identities: {
+    key:   string        // `${userId}:${peerId}:${deviceId}`
+    value: string        // base64 Ed25519 identity public key pinned on first contact
+  }
 }
 
 const DB_NAME    = 'encra-v1'
-const DB_VERSION = 7
+const DB_VERSION = 8
 
 let dbPromise: Promise<IDBPDatabase<EncraSchema>> | null = null
 
@@ -140,6 +144,7 @@ function getDB(): Promise<IDBPDatabase<EncraSchema>> {
         if (!db.objectStoreNames.contains('settings')) db.createObjectStore('settings')
         if (!db.objectStoreNames.contains('storagekeys')) db.createObjectStore('storagekeys')
         if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox')
+        if (!db.objectStoreNames.contains('identities')) db.createObjectStore('identities')
       },
     })
   }
@@ -168,6 +173,11 @@ export async function saveRatchet(userId: string, peerKey: string, state: Ratche
   try {
     await (await getDB()).put('ratchets', state, `${userId}:${peerKey}`)
   } catch { /* non-fatal: ratchet still works in-memory */ }
+}
+
+/** Delete a stored ratchet so the next message re-establishes the session. */
+export async function deleteRatchet(userId: string, peerKey: string): Promise<void> {
+  try { await (await getDB()).delete('ratchets', `${userId}:${peerKey}`) } catch { /* non-fatal */ }
 }
 
 export async function loadPreKeys(userId: string): Promise<StoredPreKeys | undefined> {
@@ -471,4 +481,21 @@ export async function loadOutbox(userId: string): Promise<StoredOutboxItem[]> {
 export async function removeOutbox(userId: string, id: string): Promise<void> {
   try { await (await getDB()).delete('outbox', `${userId}:${id}`) }
   catch { memOutbox.delete(`${userId}:${id}`) }
+}
+
+// ── Pinned peer identities (trust-on-first-use + change detection) ─────────────
+
+/** In-memory fallback (and in-session detection) when IndexedDB is unavailable. */
+const memIdentities = new Map<string, string>()
+
+/** The identity key we first saw (and trusted) for a peer device, or undefined. */
+export async function loadPinnedIdentity(userId: string, peerId: string, deviceId: string): Promise<string | undefined> {
+  const key = `${userId}:${peerId}:${deviceId}`
+  try { return (await getDB()).get('identities', key) } catch { return memIdentities.get(key) }
+}
+
+/** Pin (or re-pin) the identity key for a peer device. */
+export async function pinIdentity(userId: string, peerId: string, deviceId: string, identityKey: string): Promise<void> {
+  const key = `${userId}:${peerId}:${deviceId}`
+  try { await (await getDB()).put('identities', identityKey, key) } catch { memIdentities.set(key, identityKey) }
 }

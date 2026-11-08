@@ -1,6 +1,9 @@
 {
   "name": "@encra/core",
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Signal-level E2E encryption primitives — X25519, XSalsa20-Poly1305, Double Ratchet",
   "license": "Apache-2.0",
   "author": "Encra (https://encra.dev)",

@@ -1,5 +1,6 @@
 import { EncraClient } from '@encra/client'
 import type { Message, StoredMessageRecord } from '@encra/client'
+import { pinIdentity } from '@encra/store'   // demo-only: to simulate an identity swap
 
 /** POST one at-rest record into the "developer's DB" (the mock server's app DB). */
 async function saveToAppDb(userId: string, record: StoredMessageRecord): Promise<void> {
@@ -44,6 +45,9 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
   const storedEl  = section.querySelector<HTMLSpanElement>('.stored')!
   const rehydrate = section.querySelector<HTMLButtonElement>('.rehydrate')!
   const offlineBtn = section.querySelector<HTMLButtonElement>('.offline')!
+  const mitmBtn    = section.querySelector<HTMLButtonElement>('.mitm')!
+  const warnBox    = section.querySelector<HTMLDivElement>('.warn')!
+  const warnText   = section.querySelector<HTMLSpanElement>('.warntext')!
 
   let loadedOnce = false
   let offline = false
@@ -119,12 +123,31 @@ function mountPanel(section: HTMLElement): { client: EncraClient; userId: string
     if (st) { st.className = `st ${status}`; st.textContent = STATUS_GLYPH[status] ?? '' }
   })
 
+  // Identity-change warning — a peer device presented a different identity key
+  // than the one pinned on first contact (possible man-in-the-middle).
+  client.on('identitychange', ({ peerId, deviceId }) => {
+    warnText.textContent = `${peerId}'s identity key changed (device ${deviceId.slice(0, 8)}). ` +
+      `Re-verify the safety number before trusting new messages.`
+    warnBox.hidden = false
+  })
+
   // Offline toggle — demonstrates the outbox: go offline, type (messages queue
   // with ⏳), go online, watch them flush (✓).
   offlineBtn.addEventListener('click', () => {
     offline = !offline
     if (offline) { client.goOffline(); offlineBtn.textContent = 'Go online' }
     else { client.goOnline(); offlineBtn.textContent = 'Go offline' }
+  })
+
+  // Simulate a MITM / key swap: tamper the pinned identity for the peer, forget
+  // the session, and send — the re-established session detects the mismatch.
+  mitmBtn.addEventListener('click', async () => {
+    const peerPanel = panels.find((p) => p.userId === peerId)
+    const peerDeviceId = peerPanel?.client.deviceId
+    if (!peerDeviceId) return
+    await pinIdentity(userId, peerId, peerDeviceId, 'simulated-swapped-identity-key')
+    await client.forgetSession(peerId)
+    await client.sendMessage(peerId, '(probe after simulated identity swap)')
   })
 
   // Every message (sent echo + received) is shown AND persisted to the app DB as

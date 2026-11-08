@@ -25,12 +25,13 @@ import type {
 } from '@encra/core'
 import {
   loadKeyPair,   saveKeyPair,
-  loadRatchet,   saveRatchet,
+  loadRatchet,   saveRatchet, deleteRatchet,
   loadMessages,  saveMessages,
   savePreKeys,   loadOrCreatePreKeys,
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
   loadOrCreateStorageRootKey,
   enqueueOutbox, loadOutbox, removeOutbox,
+  loadPinnedIdentity, pinIdentity,
   loadGhostMode, saveGhostMode,
   loadPresenceSession, savePresenceSession,
   getOrCreateDeviceId,
@@ -134,6 +135,8 @@ interface EventMap {
   disconnected: []
   message:      [msg: Message]
   status:       [event: { id: string; status: MessageStatus }]
+  /** A peer device's identity key changed from the one pinned on first contact (possible MITM). */
+  identitychange: [event: { peerId: string; deviceId: string }]
   error:        [err: Error]
   wire:         [event: WireEvent]
   presence:     [event: { from: string; fromDeviceId: string; payload: PresencePayload }]
@@ -482,6 +485,45 @@ export class EncraClient {
     const myIdX    = identityPublicToX25519(this._identity.publicKey)
     const theirIdX = identityPublicToX25519(importKey(bundle.identityKey))
     return generateSafetyNumber(myIdX, theirIdX)
+  }
+
+  /**
+   * Trust-on-first-use pin + change detection for a peer device's identity key.
+   * Returns `'new'` on first contact (pins it), `'same'` when unchanged, or
+   * `'changed'` when the device presents a different identity than the one first
+   * pinned — a possible man-in-the-middle. On a change it emits `identitychange`
+   * and re-pins, so the warning fires once per change (not every session).
+   */
+  private async _checkPeerIdentity(peerId: string, deviceId: string, identityKey: string): Promise<'new' | 'same' | 'changed'> {
+    const pinned = await loadPinnedIdentity(this._userId, peerId, deviceId)
+    if (pinned === undefined) { await pinIdentity(this._userId, peerId, deviceId, identityKey); return 'new' }
+    if (pinned === identityKey) return 'same'
+    await pinIdentity(this._userId, peerId, deviceId, identityKey)
+    this._emit('identitychange', { peerId, deviceId })
+    return 'changed'
+  }
+
+  /** The identity key pinned for a peer device on first contact (base64), or null. */
+  async pinnedIdentity(peerId: string, deviceId: string): Promise<string | null> {
+    return (await loadPinnedIdentity(this._userId, peerId, deviceId)) ?? null
+  }
+
+  /**
+   * Forget the local session(s) with a peer so the next message re-runs the X3DH
+   * handshake (and re-checks the peer's identity). Pass a `deviceId` to target one
+   * device, or omit to forget all of them. Useful to recover a broken session.
+   */
+  async forgetSession(peerId: string, deviceId?: string): Promise<void> {
+    for (const key of [...this._ratchets.keys()]) {
+      const match = deviceId
+        ? key === `s:${peerId}:${deviceId}` || key === `r:${peerId}:${deviceId}`
+        : key.startsWith(`s:${peerId}:`) || key.startsWith(`r:${peerId}:`)
+      if (match) {
+        this._ratchets.delete(key)
+        this._pendingPrekey.delete(key.replace(/^[sr]:/, ''))
+        await deleteRatchet(this._userId, key)
+      }
+    }
   }
 
   /**
@@ -930,6 +972,7 @@ export class EncraClient {
     // New outbound session: fetch the peer device's prekey bundle and run X3DH.
     // x3dhInitiate verifies the signed-prekey signature and aborts on mismatch.
     const bundle = await this._fetchPreKeyBundle(peerId, deviceId)
+    await this._checkPeerIdentity(peerId, deviceId, bundle.identityKey)   // TOFU + change detection
     const init   = await x3dhInitiate(this._identity, bundle)
     const ratchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
     this._ratchets.set(ratchetKey, ratchet)
@@ -964,6 +1007,7 @@ export class EncraClient {
       )
     }
 
+    await this._checkPeerIdentity(peerId, fromDeviceId, prekey.identityKey)   // TOFU + change detection
     const { signedPair, oneTimePair } = this._resolveResponderKeys(prekey)
     const keys    = await x3dhRespond(this._identity, signedPair, oneTimePair, prekey)
     const ratchet = await DoubleRatchet.initReceiver(keys, signedPair)

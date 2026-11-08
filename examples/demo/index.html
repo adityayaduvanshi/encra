@@ -55,7 +55,12 @@
         background: var(--bg); border: 1px solid var(--line); color: var(--text);
         border-radius: 8px; padding: 4px 10px; font-size: 11px; font-weight: 500;
       }
-      .storebar .older[hidden] { display: none; }
+      .warn {
+        margin: 0 12px; padding: 8px 12px; border-radius: 10px;
+        background: rgba(255,90,90,.14); border: 1px solid rgba(255,90,90,.45);
+        color: #ffb3b3; font-size: 12px;
+      }
+      .warn[hidden] { display: none; }
       button {
         background: var(--accent); color: white; border: 0; border-radius: 10px;
         padding: 10px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
@@ -87,8 +92,9 @@
           <div class="who"><span class="dot"></span> Alice</div>
           <div class="meta">device: <span class="device">…</span></div>
         </div>
+        <div class="warn" hidden>⚠️ <span class="warntext"></span></div>
         <div class="log"></div>
-        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button> <button class="mitm" type="button">Simulate identity change</button></div>
         <form class="compose"><input placeholder="Message to Bob…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
 
@@ -97,8 +103,9 @@
           <div class="who"><span class="dot"></span> Bob</div>
           <div class="meta">device: <span class="device">…</span></div>
         </div>
+        <div class="warn" hidden>⚠️ <span class="warntext"></span></div>
         <div class="log"></div>
-        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button></div>
+        <div class="storebar">💾 <span class="stored">0</span> in encrypted DB · <button class="rehydrate" type="button">Reload from DB</button> <button class="offline" type="button">Go offline</button> <button class="mitm" type="button">Simulate identity change</button></div>
         <form class="compose"><input placeholder="Message to Alice…" autocomplete="off" disabled /><button type="submit" disabled>Send</button></form>
       </section>
     </div>
