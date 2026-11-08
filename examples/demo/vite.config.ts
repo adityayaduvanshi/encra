@@ -48,6 +48,8 @@ export default defineConfig({
     alias: {
       '@encra/client': fileURLToPath(new URL('../../packages/client/src/index.ts', import.meta.url)),
       '@encra/core':   fileURLToPath(new URL('../../packages/core/src/index.ts', import.meta.url)),
+      // Demo-only: lets the "Simulate identity change" button tamper a pinned key.
+      '@encra/store':  fileURLToPath(new URL('../../packages/client/src/ratchetStore.ts', import.meta.url)),
     },
   },
   // The mock relay also mounts the developer-DB routes under /app/* (at-rest history).

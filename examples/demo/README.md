@@ -64,6 +64,9 @@ a pagination problem, not a crypto one.
 - Message ids + conversations, and at-rest history (`encryptForStorage` / `decryptFromStorage`)
 - Outbound queue + send status: hit **Go offline**, type (messages show ⏳ queued),
   then **Go online** — they flush and turn ✓ sent. Nothing is lost offline.
+- Identity-change (MITM) warning: a peer's identity key is pinned on first contact;
+  if it ever changes you get an `identitychange` event. **Simulate identity change**
+  tampers the pin and shows the ⚠️ banner (prompt to re-verify the safety number).
 
 > ⚠️ The mock relay (`mock-relay.ts`) is for local demos only. It has **no auth**
 > and stores everything in process memory. Use `@encra/server` for anything real.

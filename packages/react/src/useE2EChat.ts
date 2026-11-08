@@ -25,6 +25,7 @@ import {
   resolveSignedPreKeyPair, rotateSignedPreKeyIfStale,
   loadOrCreateStorageRootKey,
   enqueueOutbox, loadOutbox, removeOutbox,
+  loadPinnedIdentity, pinIdentity,
   getOrCreateDeviceId,
   type StoredPreKeys,
 } from './ratchetStore.js'
@@ -90,6 +91,12 @@ export interface UseE2EChatOptions {
   onError?: (err: Error) => void
   /** Called on every encrypted send/receive with the raw wire data. Useful for debugging. */
   onWireMessage?: (event: WireEvent) => void
+  /**
+   * Called when a peer device's identity key changes from the one pinned on
+   * first contact — a possible man-in-the-middle. Prompt the user to re-verify
+   * the safety number (`getSafetyNumber`).
+   */
+  onIdentityChange?: (event: { peerId: string; deviceId: string }) => void
 }
 
 export interface UseE2EChatResult {
@@ -207,6 +214,7 @@ export function useE2EChat({
   serverUrl = ENCRA_SERVER_URL,
   onError,
   onWireMessage,
+  onIdentityChange,
 }: UseE2EChatOptions): UseE2EChatResult {
   const [messages,     setMessages]     = useState<Message[]>([])
   const [isReady,      setIsReady]      = useState(false)
@@ -251,10 +259,12 @@ export function useE2EChat({
   }, [userId])
 
   // Stable refs so callbacks can change without restarting the effect
-  const onErrorRef       = useRef(onError)
-  const onWireMessageRef = useRef(onWireMessage)
+  const onErrorRef          = useRef(onError)
+  const onWireMessageRef    = useRef(onWireMessage)
+  const onIdentityChangeRef = useRef(onIdentityChange)
   useEffect(() => { onErrorRef.current = onError },            [onError])
   useEffect(() => { onWireMessageRef.current = onWireMessage }, [onWireMessage])
+  useEffect(() => { onIdentityChangeRef.current = onIdentityChange }, [onIdentityChange])
 
   const httpBase = serverUrl.replace(/\/$/, '')
   const wsBase   = httpBase.replace(/^http/, 'ws')
@@ -431,6 +441,22 @@ export function useE2EChat({
   )
 
   /**
+   * Trust-on-first-use pin + change detection for a peer device's identity key.
+   * Pins on first contact; on a later change (possible MITM) re-pins and fires
+   * `onIdentityChange` so the app can prompt a safety-number re-verification.
+   */
+  const checkPeerIdentity = useCallback(
+    async (peerId: string, deviceId: string, identityKey: string): Promise<void> => {
+      const pinned = await loadPinnedIdentity(userId, peerId, deviceId)
+      if (pinned === undefined) { await pinIdentity(userId, peerId, deviceId, identityKey); return }
+      if (pinned === identityKey) return
+      await pinIdentity(userId, peerId, deviceId, identityKey)
+      onIdentityChangeRef.current?.({ peerId, deviceId })
+    },
+    [userId]
+  )
+
+  /**
    * Returns the sender ratchet for a specific peer device, restoring it from
    * IndexedDB if available or initialising a new one on first contact.
    *
@@ -459,6 +485,7 @@ export function useE2EChat({
       // X3DH. x3dhInitiate verifies the signed-prekey signature and aborts on
       // mismatch (MITM guard).
       const bundle  = await fetchPreKeyBundle(peerId, deviceId)
+      await checkPeerIdentity(peerId, deviceId, bundle.identityKey)   // TOFU + change detection
       const init    = await x3dhInitiate(myIdentity, bundle)
       const ratchet = await DoubleRatchet.initSender(init.sessionKeys, init.signedPreKeyPublic)
       ratchetsRef.current.set(key, ratchet)
@@ -467,7 +494,7 @@ export function useE2EChat({
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId, fetchPreKeyBundle]
+    [userId, fetchPreKeyBundle, checkPeerIdentity]
   )
 
   /**
@@ -503,6 +530,8 @@ export function useE2EChat({
         )
       }
 
+      await checkPeerIdentity(peerId, fromDeviceId, prekey.identityKey)   // TOFU + change detection
+
       // Resolve the signed prekey the sender used — this may be the current one
       // or a retained previous one (if we rotated after the sender fetched our
       // bundle but before this message arrived). Only truly-gone keys fail.
@@ -527,7 +556,7 @@ export function useE2EChat({
       await saveRatchet(userId, key, ratchet.export())
       return ratchet
     },
-    [userId, consumeOneTimePreKey]
+    [userId, consumeOneTimePreKey, checkPeerIdentity]
   )
 
   useEffect(() => {
